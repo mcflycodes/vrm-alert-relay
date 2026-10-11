@@ -351,9 +351,10 @@ def test_untrusted_sanitizing_is_bounded() -> None:
 @given(st.text(max_size=300))
 def test_untrusted_text_never_keeps_a_link(text: str) -> None:
     shown = sanitize_untrusted(text, FIELD_LIMITS["label"])
-    assert "://" not in shown
-    assert LINKY.search(shown) is None
-    assert BARE_SCHEME.search(shown) is None
+    folded = _folded(shown)
+    assert "://" not in folded
+    assert LINKY.search(folded) is None
+    assert BARE_SCHEME.search(folded) is None
     assert len(shown) <= FIELD_LIMITS["label"]
 
 
@@ -369,3 +370,66 @@ def test_link_shaped_labels_never_keep_a_link(parts: list[str]) -> None:
     assert "://" not in shown
     assert LINKY.search(shown) is None
     assert BARE_SCHEME.search(shown) is None
+
+
+# Lookalike punctuation in untrusted fields -------------------------------------
+
+FULLWIDTH_COLON, FULLWIDTH_SOLIDUS, FULLWIDTH_STOP = "\uff1a", "\uff0f", "\uff0e"
+IDEOGRAPHIC_STOP, HALFWIDTH_IDEOGRAPHIC_STOP, SMALL_STOP = "\u3002", "\uff61", "\ufe52"
+
+
+@pytest.mark.parametrize(
+    ("text", "shown"),
+    [
+        (
+            f"https{FULLWIDTH_COLON}{FULLWIDTH_SOLIDUS}{FULLWIDTH_SOLIDUS}evil{FULLWIDTH_STOP}com",
+            "hxxps[:]//evil[.]com",
+        ),
+        (f"evil{IDEOGRAPHIC_STOP}example{IDEOGRAPHIC_STOP}test", "evil[.]example[.]test"),
+        (f"evil{HALFWIDTH_IDEOGRAPHIC_STOP}com", "evil[.]com"),
+        (f"evil{FULLWIDTH_STOP}com", "evil[.]com"),
+        (f"www{SMALL_STOP}evil{SMALL_STOP}com", "www[.]evil[.]com"),
+        ("\uff11\uff19\uff12\uff0e\uff10\uff0e\uff12\uff0e\uff11", "192[.]0[.]2[.]1"),
+        (f"tel{FULLWIDTH_COLON}+12025550199", "tel[:]+12025550199"),
+        ("Freezer \u2103", "Freezer \u00b0C"),
+    ],
+)
+def test_lookalike_punctuation_is_folded_before_neutralizing(text: str, shown: str) -> None:
+    assert sanitize_untrusted(text, 64) == shown
+    fields = TemplateFields(kind=NotificationKind.ESCALATED, label=text)
+    assert Template("{label}").render(fields) == shown
+
+
+LOOKALIKE_PARTS = [
+    "http",
+    "s",
+    "evil",
+    "com",
+    "www",
+    "tel",
+    "1",
+    ".",
+    ":",
+    "/",
+    FULLWIDTH_COLON,
+    FULLWIDTH_SOLIDUS,
+    FULLWIDTH_STOP,
+    IDEOGRAPHIC_STOP,
+    HALFWIDTH_IDEOGRAPHIC_STOP,
+    SMALL_STOP,
+    "\uff45",
+    " ",
+]
+
+
+def _folded(text: str) -> str:
+    return unicodedata.normalize("NFKC", text).replace(IDEOGRAPHIC_STOP, ".")
+
+
+@given(st.lists(st.sampled_from(LOOKALIKE_PARTS), max_size=40))
+def test_lookalike_links_never_survive(parts: list[str]) -> None:
+    shown = sanitize_untrusted("".join(parts), FIELD_LIMITS["label"])
+    folded = _folded(shown)
+    assert "://" not in folded
+    assert LINKY.search(folded) is None
+    assert BARE_SCHEME.search(folded) is None

@@ -159,11 +159,23 @@ def neutralize_links(text: str) -> str:
     return _EDGE_DOTS.sub(_DOT, text)
 
 
+# NFKC folds fullwidth and small forms (U+FF0E, U+FF1A, U+FF0F, U+FE52, ...)
+# to ASCII, and U+FF61 to U+3002, but leaves the
+# ideographic full stop, which IDNA also treats as a label separator.
+_IDEOGRAPHIC_DOTS: Final = str.maketrans({"\u3002": "."})
+
+
 def sanitize_untrusted(text: str, limit: int) -> str:
     """:func:`sanitize_field` for data from outside the configuration, such as
-    VRM labels, with links neutralized (see :func:`neutralize_links`)."""
-    cleaned = sanitize_field(text[: limit * _PRESCAN_FACTOR], limit * _PRESCAN_FACTOR)
-    return sanitize_field(neutralize_links(cleaned), limit)
+    VRM labels, with links neutralized (see :func:`neutralize_links`).
+
+    The text is NFKC-normalized and ideographic full stops become ``.`` first,
+    so lookalike punctuation (fullwidth colon, solidus and full stop, U+FF61,
+    U+3002) is detected and neutralized like its ASCII form.
+    """
+    head = sanitize_field(text[: limit * _PRESCAN_FACTOR], limit * _PRESCAN_FACTOR)
+    folded = unicodedata.normalize("NFKC", head).translate(_IDEOGRAPHIC_DOTS)
+    return sanitize_field(neutralize_links(sanitize_field(folded, limit * _PRESCAN_FACTOR)), limit)
 
 
 _UNTRUSTED_FIELDS: Final = frozenset({"label", "unit"})

@@ -35,7 +35,7 @@ A field the notification does not carry is shown as `n/a` (`{unit}` is left empt
 
 - Substitution is a single pass: a value that contains `{rule}` is inserted as the literal text `{rule}`.
 - Every value is stripped of control, format and line-separator characters, has its whitespace collapsed, and is cut to a per-field limit (64 characters for labels and names) before it is inserted.
-- `{label}` and `{unit}` can come from VRM data and are treated as untrusted: links in them are made visibly non-clickable. `https://evil.example.test/x` is shown as `hxxps[:]//evil[.]example[.]test/x`, `tel:` and similar schemes as `tel[:]`, and the dots of domain names and IP addresses as `[.]`. Text you write in a template is left as it is.
+- `{label}` and `{unit}` can come from VRM data and are treated as untrusted: links in them are made visibly non-clickable. `https://evil.example.test/x` is shown as `hxxps[:]//evil[.]example[.]test/x`, `tel:` and similar schemes as `tel[:]`, and the dots of domain names and IP addresses as `[.]`. Fullwidth and other lookalike forms of these characters (for example the ideographic full stop) are first folded to their plain forms, so they are caught too. Text you write in a template is left as it is.
 - The rendered text is at most 480 characters. Providers may shorten it further; SMS is limited to 160.
 - A template produces only text. Recipients and destinations come only from the configuration; nothing in a template, a label or a provider response can add or change one.
 
