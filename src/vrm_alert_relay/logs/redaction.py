@@ -631,25 +631,37 @@ def _last_unescaped(text: str, quote_char: str, end: int) -> int | None:
 
 
 def _next_unescaped(text: str, quote_char: str, start: int) -> int:
-    """Index of the first certainly unescaped ``quote_char`` from ``start``, or -1."""
+    """Index of the first certainly unescaped ``quote_char`` from ``start``.
+
+    -1 when there is none, or when ``_MAX_QUOTE_CANDIDATES`` quotes in a row
+    are escaped or undecidable.
+    """
     index = text.find(quote_char, start)
-    while index != -1 and _escaped(text, index) is not False:
+    for _ in range(_MAX_QUOTE_CANDIDATES):
+        if index == -1 or _escaped(text, index) is False:
+            return index
         index = text.find(quote_char, index + 1)
-    return index
+    return -1
 
 
 def _after_open_bare_value(text: str, position: int) -> int:
     """Move past a bare value whose key ends before the value run around ``position``.
 
     Covers separators that run across lines (``token=`` then a newline),
-    which :func:`_after_line_construct` cannot see.
+    which :func:`_after_line_construct` cannot see. The run is searched back
+    to the start of its line; a run whose start is not found within
+    ``_MAX_LINE_SCAN`` characters is undecidable and the start moves to the
+    next line.
     """
-    region_start = max(position - _CUT_CONTEXT, 0)
     if position > 0 and not _BARE_STOP_RE.match(text, position - 1):
-        stop = _BARE_STOP_RE.search(text[region_start:position][::-1])
-        if stop is None:
-            return position
-        value = position - stop.start()
+        lookback = max(position - _MAX_LINE_SCAN, 0)
+        stop = _BARE_STOP_RE.search(text[lookback:position][::-1])
+        if stop is not None:
+            value = position - stop.start()
+        elif lookback == 0:
+            value = 0
+        else:
+            return _next_line(text, position)
     else:
         value = position
     region_start = max(value - _CUT_CONTEXT, 0)

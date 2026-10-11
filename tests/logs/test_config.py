@@ -242,6 +242,32 @@ def test_tail_truncation_inside_long_sensitive_value_does_not_leak(
     assert FAKE_FRAGMENT not in output["exc"]
 
 
+MULTILINE_VALUE = "SENSITIVEVALUEZq" * 700
+
+
+@pytest.mark.parametrize(("ending", "kept"), [(" END", ""), ("\nEND", "END")])
+@pytest.mark.parametrize("newline", ["\n", "\r", "\r\n"], ids=["lf", "cr", "crlf"])
+@pytest.mark.parametrize("offset", [None, 1023, 1024, 1025, 8191, 8192, 8193])
+def test_tail_truncation_after_multiline_separator_does_not_leak(
+    offset: int | None, newline: str, ending: str, kept: str
+) -> None:
+    """The value line is longer than the line scan, so text after it on the
+    same line is withheld; text on the next line is kept."""
+    opener = "trace token=" + newline
+    text = opener + MULTILINE_VALUE + ending
+    if offset is None:
+        formatter = JsonFormatter(registry=SecretRegistry())
+    else:
+        limit = len(text) - len(opener) - offset
+        formatter = JsonFormatter(registry=SecretRegistry(), max_exception_length=limit)
+    record = logging.LogRecord("t", logging.ERROR, __file__, 1, "failed", None, None)
+    record.exc_text = text
+    output = formatter.format(record)
+    assert "SENSITIVE" not in output
+    assert FAKE_FRAGMENT not in output
+    assert json.loads(output)["exc"] == TRUNCATED + kept
+
+
 def test_exc_text_without_exc_info(registry: SecretRegistry) -> None:
     formatter = JsonFormatter(registry=registry)
     record = logging.LogRecord("t", logging.ERROR, __file__, 1, "cached", None, None)
@@ -350,7 +376,7 @@ def test_hostile_str_and_repr_redacted(tricky_stream: io.StringIO) -> None:
     log.info("str %s", hostile)
     log.info("repr %r", hostile)
     log.info("extra", extra={"obj": hostile, "nested": {"items": [hostile]}})
-    log.info(hostile)  # type: ignore[arg-type]
+    log.info(hostile)
     records = lines(tricky_stream)
     assert records[0]["msg"] == f'str {{"detail": "{REDACTED}"}}'
     assert records[1]["msg"] == f"repr HostileStr('{REDACTED}', {REDACTED})"

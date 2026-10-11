@@ -417,6 +417,145 @@ def test_worker_start_failures_release_their_slots(
     resolver.close()
 
 
+def test_job_construction_failure_takes_no_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = transport_module._Lookup
+    failures = DNS_WORKERS
+
+    def failing(host: str, port: int) -> transport_module._Lookup:
+        nonlocal failures
+        if failures:
+            failures -= 1
+            raise MemoryError("fictitious allocation failure")
+        return real(host, port)
+
+    monkeypatch.setattr(transport_module, "_Lookup", failing)
+    resolver = transport_module._BoundedResolver(lambda host, port: [address()])
+    for _ in range(DNS_WORKERS):
+        with pytest.raises(MemoryError, match="fictitious"):
+            resolver.lookup("relay.example.com", 443, 1.0)
+    assert resolver.lookup("relay.example.com", 443, 1.0) == [address()]
+    resolver.close()
+
+
+def test_worker_started_before_start_raises_is_kept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[threading.Thread] = []
+    raised = False
+
+    class LateFailingThread(threading.Thread):
+        def start(self) -> None:
+            nonlocal raised
+            created.append(self)
+            super().start()
+            if not raised:
+                raised = True
+                raise KeyboardInterrupt
+
+    monkeypatch.setattr(threading, "Thread", LateFailingThread)
+    resolver = transport_module._BoundedResolver(lambda host, port: [address()])
+    with pytest.raises(KeyboardInterrupt):
+        resolver.lookup("relay.example.com", 443, 1.0)
+    assert resolver._workers == created
+    assert created[0].is_alive()
+    assert resolver.lookup("relay.example.com", 443, 1.0) == [address()]
+    assert len(created) == DNS_WORKERS
+    assert resolver._slots._value == DNS_WORKERS
+    resolver.close()
+
+
+class InterruptingQueue:
+    """Job queue that raises KeyboardInterrupt once a job has been handed over."""
+
+    def __init__(
+        self, inner: Any, *, deliver: bool, after: Callable[[], object]
+    ) -> None:
+        self.inner = inner
+        self.deliver = deliver
+        self.after = after
+        self.held: list[Any] = []
+        self.armed = True
+
+    def put(self, item: Any) -> None:
+        if not self.armed or item is None:
+            self.inner.put(item)
+            return
+        self.armed = False
+        if self.deliver:
+            self.inner.put(item)
+        else:
+            self.held.append(item)
+        self.after()
+        raise KeyboardInterrupt
+
+    def get(self) -> Any:
+        return self.inner.get()
+
+
+def _wait_for_free_slots(resolver: transport_module._BoundedResolver) -> None:
+    deadline = monotonic() + 2.0
+    while resolver._slots._value < DNS_WORKERS and monotonic() < deadline:
+        time.sleep(0.005)
+
+
+def test_interrupt_after_handover_to_waiting_worker_releases_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def resolve(host: str, port: int) -> Sequence[AddressInfo]:
+        if host == "slow.example.com":
+            started.set()
+            release.wait(2.0)
+        return [address()]
+
+    resolver = transport_module._BoundedResolver(resolve)
+    jobs = InterruptingQueue(
+        resolver._jobs, deliver=True, after=lambda: started.wait(2.0)
+    )
+    monkeypatch.setattr(resolver, "_jobs", jobs)
+    with pytest.raises(KeyboardInterrupt):
+        resolver.lookup("slow.example.com", 443, 1.0)
+    assert resolver._slots._value == DNS_WORKERS - 1
+    release.set()
+    _wait_for_free_slots(resolver)
+    assert resolver._slots._value == DNS_WORKERS
+    assert all(worker.is_alive() for worker in resolver._workers)
+    for _ in range(DNS_WORKERS + 1):
+        assert resolver.lookup("relay.example.com", 443, 1.0) == [address()]
+    resolver.close()
+
+
+def test_interrupt_before_a_worker_takes_the_job_releases_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def resolve(host: str, port: int) -> Sequence[AddressInfo]:
+        calls.append(host)
+        return [address()]
+
+    resolver = transport_module._BoundedResolver(resolve)
+    jobs = InterruptingQueue(resolver._jobs, deliver=False, after=lambda: None)
+    monkeypatch.setattr(resolver, "_jobs", jobs)
+    with pytest.raises(KeyboardInterrupt):
+        resolver.lookup("abandoned.example.com", 443, 1.0)
+    assert resolver._slots._value == DNS_WORKERS
+    (abandoned,) = jobs.held
+    jobs.inner.put(abandoned)
+    for _ in range(DNS_WORKERS + 1):
+        assert resolver.lookup("relay.example.com", 443, 1.0) == [address()]
+    assert all(worker.is_alive() for worker in resolver._workers)
+    resolver.close()
+    for worker in resolver._workers:
+        worker.join(2.0)
+    assert "abandoned.example.com" not in calls
+    assert resolver._slots._value == DNS_WORKERS
+
+
 def test_resolver_workers_are_daemon_threads_that_stop_on_close() -> None:
     resolver = transport_module._BoundedResolver(lambda host, port: [address()])
     resolver.lookup("relay.example.com", 443, 1.0)

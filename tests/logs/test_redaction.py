@@ -3,8 +3,8 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import random
 import time
+from collections.abc import Callable, Sequence
 from typing import Any
 from urllib.parse import quote, quote_plus
 
@@ -327,10 +327,12 @@ def test_many_backslashes_use_non_backtracking_matcher() -> None:
     )
     registry = SecretRegistry()
     registry.register(secret)
+    pattern = redaction_module._compile_matcher(secret).pattern.pattern
+    assert pattern.count("(?>") == len(secret)
+    assert "(?:" not in pattern
     hostile = ("fict" + "\\" * 5000 + "x") * 4
-    started = time.monotonic()
-    redact_secrets(hostile, registry)
-    assert time.monotonic() - started < 0.5
+    assert registry._state.lattice.detect(hostile) == ([], False)
+    assert redact_secrets(hostile, registry) == hostile
 
 
 def test_known_limitation_escape_heavy_secret_in_mixed_spelling_is_missed() -> None:
@@ -379,13 +381,21 @@ def test_known_limitation_fully_byte_encoded_safe_ascii_is_missed() -> None:
 
 
 def test_backtracking_is_bounded_for_hostile_input() -> None:
+    """A secret within the backtracking budget is never regex-matched on hostile text.
+
+    The per-secret regex may backtrack on runs of ``\\``; it only runs for
+    secrets the linear-time lattice detects, and the lattice does not detect
+    this one in text that does not contain it, so the cost is the lattice's.
+    """
     secret = "fict" + "\\" * MAX_AMBIGUOUS_CHARACTERS + "pass"
     registry = SecretRegistry()
     registry.register(secret)
     hostile = ("fict" + "\\" * 5000 + "x") * 4
-    started = time.monotonic()
+    detected, literal = registry._state.lattice.detect(hostile)
+    assert (detected, literal) == ([], False)
+    assert not any(form in hostile for form in registry._state.exact)
     assert redact_secrets(hostile, registry) == hostile
-    assert time.monotonic() - started < 0.5
+    assert not contains_secret(hostile, registry)
 
 
 def test_register_rejects_non_string() -> None:
@@ -771,6 +781,32 @@ def test_tail_start_moves_past_values_after_multiline_separators() -> None:
     assert kept(quoted, len(quoted) - 9) == " after"
 
 
+def test_bare_value_without_a_line_start_in_reach_is_undecidable() -> None:
+    line = "Zq" * redaction_module._MAX_LINE_SCAN
+    text = "token=\n" + line + "\nnext"
+    position = len("token=\n") + len(line) - 10
+    assert redaction_module._after_open_bare_value(text, position) == text.index("next")
+    assert redaction_module._after_open_bare_value(line, len(line) - 10) == len(line)
+
+
+def test_forward_quote_scan_is_bounded_by_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+    escaped = redaction_module._escaped
+
+    def counting(text: str, index: int) -> bool | None:
+        nonlocal calls
+        calls += 1
+        return escaped(text, index)
+
+    monkeypatch.setattr(redaction_module, "_escaped", counting)
+    text = 'password="\n' + "A" * 1500 + '\\"' * 20_000
+    result = redact_text(
+        text, registry=SecretRegistry(), max_length=len(text) - 1200, keep="tail"
+    )
+    assert result == TRUNCATED
+    assert 0 < calls <= 2 * redaction_module._MAX_QUOTE_CANDIDATES
+
+
 def test_tail_start_withholds_after_too_many_moves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -788,12 +824,26 @@ def test_tail_truncation_inside_long_values_is_fast() -> None:
     assert time.perf_counter() - start < 2.0
 
 
+class _Sample:
+    """Reproducible pseudo-random choices for generated test data (a 64-bit LCG)."""
+
+    def __init__(self, seed: int) -> None:
+        self._state = seed
+
+    def randint(self, low: int, high: int) -> int:
+        self._state = (self._state * 6364136223846793005 + 1442695040888963407) % 2**64
+        return low + (self._state >> 33) % (high - low + 1)
+
+    def choice[T](self, items: Sequence[T]) -> T:
+        return items[self.randint(0, len(items) - 1)]
+
+
 def test_detection_finds_every_regex_match() -> None:
-    rng = random.Random(20261011)  # noqa: S311 - reproducible test data
+    rng = _Sample(20261011)
     alphabet = "ab\\%u0+ é/\U0001f600"
     for _ in range(300):
         secret = "".join(rng.choice(alphabet) for _ in range(rng.randint(6, 10)))
-        forms = [
+        forms: list[Callable[[str], str]] = [
             lambda char: char,
             lambda char: "".join(f"%{byte:02X}" for byte in char.encode("utf-8")),
             lambda char: json.dumps(char)[1:-1],
@@ -838,7 +888,7 @@ def test_matching_cost_is_bounded_with_full_registry() -> None:
 
 
 def test_structured_values(registry: SecretRegistry) -> None:
-    value: dict[str, Any] = {
+    value: dict[object, Any] = {
         "api_password": "plain-but-keyed",
         "headers": {"Authorization": "Bearer abc", "Accept": "application/json"},
         "items": [{"token": "t1"}, {"name": f"uses {CANARY}"}],

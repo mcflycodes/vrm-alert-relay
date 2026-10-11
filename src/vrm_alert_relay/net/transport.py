@@ -197,7 +197,15 @@ def _ip_literal(host: str, port: int) -> Sequence[AddressInfo] | None:
 
 
 class _Lookup:
-    __slots__ = ("addresses", "done", "error", "host", "port")
+    """One name resolution, and which side owns its resolver slot.
+
+    The caller holds the slot until the job is claimed: by a worker that
+    takes it to resolve, or by the caller that abandons it after a failure
+    while handing it over. Only the side that claims the job frees the slot,
+    so it is freed exactly once.
+    """
+
+    __slots__ = ("_claim", "_claimed", "addresses", "done", "error", "host", "port")
 
     def __init__(self, host: str, port: int) -> None:
         self.host = host
@@ -205,6 +213,16 @@ class _Lookup:
         self.done = threading.Event()
         self.addresses: list[AddressInfo] = []
         self.error: BaseException | None = None
+        self._claim = threading.Lock()
+        self._claimed = False
+
+    def claim(self) -> bool:
+        """Take ownership of the slot; False if the other side already has it."""
+        with self._claim:
+            if self._claimed:
+                return False
+            self._claimed = True
+            return True
 
 
 class _BoundedResolver:
@@ -212,11 +230,12 @@ class _BoundedResolver:
 
     A lookup takes one of ``DNS_WORKERS`` slots before it is handed to a
     worker, and the worker frees the slot when the resolver returns; a job
-    that cannot be queued, for example because a worker fails to start, frees
-    its slot at once. A lookup that outlives its deadline therefore keeps its
-    slot, so stalled lookups can occupy at most ``DNS_WORKERS`` threads; while
-    they do, new lookups fail immediately. Workers are daemon threads, so a resolver call that
-    never returns does not keep the interpreter from exiting.
+    that fails while being handed over, for example because a worker fails to
+    start, frees its slot at once (see :class:`_Lookup`). A lookup that
+    outlives its deadline therefore keeps its slot, so stalled lookups can
+    occupy at most ``DNS_WORKERS`` threads; while they do, new lookups fail
+    immediately. Workers are daemon threads, so a resolver call that never
+    returns does not keep the interpreter from exiting.
     """
 
     def __init__(self, resolve: Resolver) -> None:
@@ -234,23 +253,18 @@ class _BoundedResolver:
         literal = _ip_literal(host, port)
         if literal is not None:
             return literal
+        job = _Lookup(host, port)
         if not self._slots.acquire(blocking=False):
             raise _CoreDnsTimeout("all resolver workers are busy")
-        job = _Lookup(host, port)
         try:
             with self._lock:
                 if self._closed:
                     raise httpcore.ConnectError("resolver is closed")
-                while len(self._workers) < DNS_WORKERS:
-                    worker = threading.Thread(
-                        target=self._work, name="vrm-alert-relay-dns", daemon=True
-                    )
-                    worker.start()
-                    self._workers.append(worker)
+                self._start_workers()
                 self._jobs.put(job)
         except BaseException:
-            # Until the job is queued no worker will free the slot.
-            self._slots.release()
+            if job.claim():
+                self._slots.release()
             raise
         if not job.done.wait(wait):
             raise _CoreDnsTimeout("name resolution timed out")
@@ -260,8 +274,28 @@ class _BoundedResolver:
             raise job.error
         return job.addresses
 
+    def _start_workers(self) -> None:
+        """Start missing workers; called with ``self._lock`` held.
+
+        A worker is recorded before it is started, and forgotten again only
+        if it is not running after ``start()`` fails.
+        """
+        while len(self._workers) < DNS_WORKERS:
+            worker = threading.Thread(
+                target=self._work, name="vrm-alert-relay-dns", daemon=True
+            )
+            self._workers.append(worker)
+            try:
+                worker.start()
+            except BaseException:
+                if not worker.is_alive():
+                    self._workers.remove(worker)
+                raise
+
     def _work(self) -> None:
         while (job := self._jobs.get()) is not None:
+            if not job.claim():
+                continue
             try:
                 job.addresses = list(self._resolve(job.host, job.port))
             except BaseException as exc:  # noqa: BLE001 - re-raised by lookup()
