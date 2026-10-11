@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
+from itertools import pairwise
 from typing import Final, TypeAlias, cast
 
 MAX_LEVELS: Final = 128
@@ -13,7 +14,6 @@ MAX_TEXT_LENGTH: Final = 256
 MAX_COUNTER: Final = 2**63 - 1
 
 LevelTime: TypeAlias = tuple[str, datetime]
-LevelCount: TypeAlias = tuple[str, int]
 
 
 class Direction(StrEnum):
@@ -95,7 +95,7 @@ class RuleSpec:
         if not _valid_name(self.rule_id):
             raise ValueError("rule_id must be a non-empty bounded string")
         if not isinstance(self.direction, Direction):
-            raise ValueError("direction must be a Direction")
+            raise ValueError("direction must be a Direction")  # noqa: TRY004
         if (
             not isinstance(self.levels, tuple)
             or not self.levels
@@ -108,15 +108,9 @@ class RuleSpec:
             raise ValueError("level names must be unique")
         thresholds = [float(level.threshold) for level in self.levels]
         if self.direction is Direction.RISING:
-            ordered = all(
-                left < right
-                for left, right in zip(thresholds, thresholds[1:], strict=False)
-            )
+            ordered = all(left < right for left, right in pairwise(thresholds))
         else:
-            ordered = all(
-                left > right
-                for left, right in zip(thresholds, thresholds[1:], strict=False)
-            )
+            ordered = all(left > right for left, right in pairwise(thresholds))
         if not ordered:
             raise ValueError(
                 "thresholds must be strictly ordered by increasing severity"
@@ -130,7 +124,7 @@ class RuleSpec:
         ):
             raise ValueError("clear_after_samples must be at least 1")
         if not isinstance(self.recovery_notify, bool):
-            raise ValueError("recovery_notify must be a bool")
+            raise ValueError("recovery_notify must be a bool")  # noqa: TRY004
         if (
             not isinstance(self.reminder_max, int)
             or isinstance(self.reminder_max, bool)
@@ -144,7 +138,7 @@ class RuleSpec:
         )
         for name, duration, allow_zero in durations:
             if not isinstance(duration, timedelta):
-                raise ValueError(f"{name} must be a timedelta")
+                raise ValueError(f"{name} must be a timedelta")  # noqa: TRY004
             if duration < timedelta(0) or (not allow_zero and duration == timedelta(0)):
                 qualifier = "non-negative" if allow_zero else "positive"
                 raise ValueError(f"{name} must be {qualifier}")
@@ -183,15 +177,20 @@ class RuleState:
     last_evaluated_sample_time: datetime | None = None
     stale: bool = False
     stale_cycle: int = 0
-    stale_started_at: datetime | None = None
     reminder_count: int = 0
     last_episode_notification_time: datetime | None = None
     episode_started_at: datetime | None = None
+    episode_announced: bool = False
+    episode_notified_levels: tuple[str, ...] = ()
+    pending_escalation: str | None = None
+    pending_recovery_levels: tuple[str, ...] = ()
+    pending_recovery_started_at: datetime | None = None
+    escalation_ordinal: int = 0
     rule_direction: Direction | None = None
     level_order: tuple[str, ...] = ()
     needs_rederive: bool = False
     level_notification_times: tuple[LevelTime, ...] = ()
-    level_escalation_counts: tuple[LevelCount, ...] = ()
+    level_recovery_times: tuple[LevelTime, ...] = ()
     suppressed_escalations: int = 0
 
     def __post_init__(self) -> None:
@@ -205,17 +204,26 @@ class RuleState:
     def _validate(self) -> None:
         if self.active_level is not None and not _valid_name(self.active_level):
             raise InvalidRuleStateError("active_level must be a bounded level name")
+        if self.pending_escalation is not None and not _valid_name(
+            self.pending_escalation
+        ):
+            raise InvalidRuleStateError(
+                "pending_escalation must be a bounded level name"
+            )
         for name in (
             "episode",
             "clear_count",
             "stale_cycle",
             "reminder_count",
+            "escalation_ordinal",
             "suppressed_escalations",
         ):
             if not _valid_counter(getattr(self, name)):
                 raise InvalidRuleStateError(f"{name} is outside safe bounds")
-        if not isinstance(self.stale, bool) or not isinstance(
-            self.needs_rederive, bool
+        if (
+            not isinstance(self.stale, bool)
+            or not isinstance(self.needs_rederive, bool)
+            or not isinstance(self.episode_announced, bool)
         ):
             raise InvalidRuleStateError("state flags must be bools")
         if self.rule_direction is not None and not isinstance(
@@ -232,9 +240,9 @@ class RuleState:
         for name in (
             "newest_sample_time",
             "last_evaluated_sample_time",
-            "stale_started_at",
             "last_episode_notification_time",
             "episode_started_at",
+            "pending_recovery_started_at",
         ):
             value = getattr(self, name)
             if value is not None and (
@@ -243,42 +251,56 @@ class RuleState:
                 raise InvalidRuleStateError(f"{name} must be an aware datetime or null")
         if self.newest_value is not None and not _finite_number(self.newest_value):
             raise InvalidRuleStateError("newest_value must be finite or null")
-        if len(self.level_notification_times) > MAX_LEVELS:
-            raise InvalidRuleStateError("too many level notification times")
-        if len(self.level_escalation_counts) > MAX_LEVELS:
-            raise InvalidRuleStateError("too many level escalation counts")
-        self._validate_level_times()
-        self._validate_level_counts()
+        self._validate_level_times(
+            self.level_notification_times, "level notification times"
+        )
+        self._validate_level_times(self.level_recovery_times, "level recovery times")
+        self._validate_names(self.episode_notified_levels, "episode_notified_levels")
+        self._validate_names(self.pending_recovery_levels, "pending_recovery_levels")
+        if self.active_level is not None and self.episode < 1:
+            raise InvalidRuleStateError("an active level requires a positive episode")
         if self.active_level is None and self.clear_count != 0:
             raise InvalidRuleStateError("normal state cannot have a clear_count")
         if self.reminder_count and self.active_level is None:
             raise InvalidRuleStateError("normal state cannot have reminders")
+        if self.pending_escalation is not None and self.active_level is None:
+            raise InvalidRuleStateError("normal state cannot have a pending escalation")
+        if self.episode_announced and self.active_level is None:
+            raise InvalidRuleStateError("normal state cannot have an announced episode")
+        if self.pending_recovery_levels and self.active_level is not None:
+            raise InvalidRuleStateError("active state cannot have a pending recovery")
+        if self.pending_recovery_levels and self.episode < 1:
+            raise InvalidRuleStateError(
+                "a pending recovery requires a positive episode"
+            )
+        if bool(self.pending_recovery_levels) != (
+            self.pending_recovery_started_at is not None
+        ):
+            raise InvalidRuleStateError("pending recovery fields must be set together")
 
-    def _validate_level_times(self) -> None:
+    @staticmethod
+    def _validate_names(values: object, field: str) -> None:
+        if (
+            not isinstance(values, tuple)
+            or len(values) > MAX_LEVELS
+            or any(not _valid_name(name) for name in values)
+            or len(set(values)) != len(values)
+        ):
+            raise InvalidRuleStateError(f"{field} must contain unique bounded names")
+
+    @staticmethod
+    def _validate_level_times(values: object, field: str) -> None:
+        if not isinstance(values, tuple) or len(values) > MAX_LEVELS:
+            raise InvalidRuleStateError(f"too many {field}")
         names: set[str] = set()
-        for item in self.level_notification_times:
+        for item in values:
             if not isinstance(item, tuple) or len(item) != 2:
-                raise InvalidRuleStateError("invalid level notification entry")
+                raise InvalidRuleStateError(f"invalid {field} entry")
             name, timestamp = item
             if not _valid_name(name) or name in names:
-                raise InvalidRuleStateError("invalid or duplicate notification level")
+                raise InvalidRuleStateError(f"invalid or duplicate {field} level")
             if not isinstance(timestamp, datetime) or not _is_aware(timestamp):
-                raise InvalidRuleStateError("notification time must be aware")
-            names.add(name)
-
-    def _validate_level_counts(self) -> None:
-        names: set[str] = set()
-        for item in self.level_escalation_counts:
-            if not isinstance(item, tuple) or len(item) != 2:
-                raise InvalidRuleStateError("invalid level escalation entry")
-            name, count = item
-            if (
-                not _valid_name(name)
-                or name in names
-                or not _valid_counter(count)
-                or count == 0
-            ):
-                raise InvalidRuleStateError("invalid or duplicate escalation count")
+                raise InvalidRuleStateError(f"{field} timestamp must be aware")
             names.add(name)
 
     def to_dict(self) -> dict[str, object]:
@@ -288,7 +310,7 @@ class RuleState:
             return value.isoformat() if value is not None else None
 
         return {
-            "version": 1,
+            "version": 2,
             "active_level": self.active_level,
             "episode": self.episode,
             "clear_count": self.clear_count,
@@ -297,12 +319,19 @@ class RuleState:
             "last_evaluated_sample_time": encode_time(self.last_evaluated_sample_time),
             "stale": self.stale,
             "stale_cycle": self.stale_cycle,
-            "stale_started_at": encode_time(self.stale_started_at),
             "reminder_count": self.reminder_count,
             "last_episode_notification_time": encode_time(
                 self.last_episode_notification_time
             ),
             "episode_started_at": encode_time(self.episode_started_at),
+            "episode_announced": self.episode_announced,
+            "episode_notified_levels": list(self.episode_notified_levels),
+            "pending_escalation": self.pending_escalation,
+            "pending_recovery_levels": list(self.pending_recovery_levels),
+            "pending_recovery_started_at": encode_time(
+                self.pending_recovery_started_at
+            ),
+            "escalation_ordinal": self.escalation_ordinal,
             "rule_direction": (
                 self.rule_direction.value if self.rule_direction is not None else None
             ),
@@ -312,8 +341,9 @@ class RuleState:
                 [name, timestamp.isoformat()]
                 for name, timestamp in self.level_notification_times
             ],
-            "level_escalation_counts": [
-                [name, count] for name, count in self.level_escalation_counts
+            "level_recovery_times": [
+                [name, timestamp.isoformat()]
+                for name, timestamp in self.level_recovery_times
             ],
             "suppressed_escalations": self.suppressed_escalations,
         }
@@ -332,25 +362,30 @@ class RuleState:
             "last_evaluated_sample_time",
             "stale",
             "stale_cycle",
-            "stale_started_at",
             "reminder_count",
             "last_episode_notification_time",
             "episode_started_at",
+            "episode_announced",
+            "episode_notified_levels",
+            "pending_escalation",
+            "pending_recovery_levels",
+            "pending_recovery_started_at",
+            "escalation_ordinal",
             "rule_direction",
             "level_order",
             "needs_rederive",
             "level_notification_times",
-            "level_escalation_counts",
+            "level_recovery_times",
             "suppressed_escalations",
         }
         if not isinstance(data, dict) or len(data) != len(keys) or set(data) != keys:
             raise InvalidRuleStateError(
-                "state must contain exactly the version 1 fields"
+                "state must contain exactly the version 2 fields"
             )
         if (
             not isinstance(data["version"], int)
             or isinstance(data["version"], bool)
-            or data["version"] != 1
+            or data["version"] != 2
         ):
             raise InvalidRuleStateError("unsupported state version")
 
@@ -368,12 +403,8 @@ class RuleState:
                 raise InvalidRuleStateError(f"{name} must be timezone-aware")
             return value
 
-        notification_times = cls._decode_pairs(
-            data["level_notification_times"], decode_values_as_times=True
-        )
-        escalation_counts = cls._decode_pairs(
-            data["level_escalation_counts"], decode_values_as_times=False
-        )
+        notification_times = cls._decode_pairs(data["level_notification_times"])
+        recovery_times = cls._decode_pairs(data["level_recovery_times"])
         raw_direction = data["rule_direction"]
         if raw_direction is None:
             direction = None
@@ -388,6 +419,24 @@ class RuleState:
         if not isinstance(raw_level_order, list) or len(raw_level_order) > MAX_LEVELS:
             raise InvalidRuleStateError("level_order must be a bounded list")
         level_order = tuple(raw_level_order)
+        raw_episode_levels = data["episode_notified_levels"]
+        if (
+            not isinstance(raw_episode_levels, list)
+            or len(raw_episode_levels) > MAX_LEVELS
+        ):
+            raise InvalidRuleStateError(
+                "episode_notified_levels must be a bounded list"
+            )
+        episode_levels = tuple(raw_episode_levels)
+        raw_pending_recovery = data["pending_recovery_levels"]
+        if (
+            not isinstance(raw_pending_recovery, list)
+            or len(raw_pending_recovery) > MAX_LEVELS
+        ):
+            raise InvalidRuleStateError(
+                "pending_recovery_levels must be a bounded list"
+            )
+        pending_recovery_levels = tuple(raw_pending_recovery)
         return cls(
             active_level=cast(str | None, data["active_level"]),
             episode=cast(int, data["episode"]),
@@ -397,46 +446,44 @@ class RuleState:
             last_evaluated_sample_time=decode_time("last_evaluated_sample_time"),
             stale=cast(bool, data["stale"]),
             stale_cycle=cast(int, data["stale_cycle"]),
-            stale_started_at=decode_time("stale_started_at"),
             reminder_count=cast(int, data["reminder_count"]),
             last_episode_notification_time=decode_time(
                 "last_episode_notification_time"
             ),
             episode_started_at=decode_time("episode_started_at"),
+            episode_announced=cast(bool, data["episode_announced"]),
+            episode_notified_levels=cast(tuple[str, ...], episode_levels),
+            pending_escalation=cast(str | None, data["pending_escalation"]),
+            pending_recovery_levels=cast(tuple[str, ...], pending_recovery_levels),
+            pending_recovery_started_at=decode_time("pending_recovery_started_at"),
+            escalation_ordinal=cast(int, data["escalation_ordinal"]),
             rule_direction=direction,
             level_order=cast(tuple[str, ...], level_order),
             needs_rederive=cast(bool, data["needs_rederive"]),
-            level_notification_times=cast(tuple[LevelTime, ...], notification_times),
-            level_escalation_counts=cast(tuple[LevelCount, ...], escalation_counts),
+            level_notification_times=notification_times,
+            level_recovery_times=recovery_times,
             suppressed_escalations=cast(int, data["suppressed_escalations"]),
         )
 
     @staticmethod
     def _decode_pairs(
-        raw: object, *, decode_values_as_times: bool
-    ) -> tuple[tuple[str, datetime] | tuple[str, int], ...]:
+        raw: object,
+    ) -> tuple[tuple[str, datetime], ...]:
         if not isinstance(raw, list) or len(raw) > MAX_LEVELS:
             raise InvalidRuleStateError("state history must be a bounded list")
-        result: list[tuple[str, datetime] | tuple[str, int]] = []
+        result: list[tuple[str, datetime]] = []
         for item in raw:
             if not isinstance(item, list) or len(item) != 2 or not _valid_name(item[0]):
                 raise InvalidRuleStateError("invalid state history entry")
             name = cast(str, item[0])
             value = item[1]
-            if decode_values_as_times:
-                if not isinstance(value, str) or len(value) > 64:
-                    raise InvalidRuleStateError("invalid notification timestamp")
-                try:
-                    timestamp = datetime.fromisoformat(value)
-                except ValueError as exc:
-                    raise InvalidRuleStateError(
-                        "invalid notification timestamp"
-                    ) from exc
-                if not _is_aware(timestamp):
-                    raise InvalidRuleStateError("notification timestamp must be aware")
-                result.append((name, timestamp))
-            else:
-                if not _valid_counter(value) or value == 0:
-                    raise InvalidRuleStateError("invalid escalation count")
-                result.append((name, cast(int, value)))
+            if not isinstance(value, str) or len(value) > 64:
+                raise InvalidRuleStateError("invalid notification timestamp")
+            try:
+                timestamp = datetime.fromisoformat(value)
+            except ValueError as exc:
+                raise InvalidRuleStateError("invalid notification timestamp") from exc
+            if not _is_aware(timestamp):
+                raise InvalidRuleStateError("notification timestamp must be aware")
+            result.append((name, timestamp))
         return tuple(result)

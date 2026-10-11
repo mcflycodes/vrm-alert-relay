@@ -1,11 +1,15 @@
 """Property tests for alert event invariants."""
 
+# ruff: noqa: S101
+
 from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 
-from hypothesis import given, settings, strategies as st
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from vrm_alert_relay.engine import (
     Direction,
@@ -112,22 +116,59 @@ def test_event_ids_are_unique_and_bounded_invariants_hold(
         for event in events
         if event.kind in (EventKind.STALE, EventKind.RESTORED)
     ]
-    assert all(
-        left is not right
-        for left, right in zip(stale_flow, stale_flow[1:], strict=False)
-    )
+    assert all(left is not right for left, right in pairwise(stale_flow))
     if stale_flow:
         assert stale_flow[0] is EventKind.STALE
 
-    escalation_times: dict[tuple[int, str | None], list[datetime]] = defaultdict(list)
+    escalation_times: dict[str | None, list[datetime]] = defaultdict(list)
     for event, clock in zip(events, clocks, strict=True):
         if event.kind is EventKind.ESCALATED:
-            escalation_times[(event.episode, event.level)].append(clock)
+            escalation_times[event.level].append(clock)
     for times in escalation_times.values():
         assert all(
-            later - earlier >= rule.cooldown
-            for earlier, later in zip(times, times[1:], strict=False)
+            later - earlier >= rule.cooldown for earlier, later in pairwise(times)
         )
+
+
+@settings(max_examples=200, deadline=None, derandomize=True)
+@given(
+    st.lists(
+        st.tuples(
+            st.integers(min_value=1, max_value=20),
+            st.booleans(),
+        ),
+        min_size=1,
+        max_size=80,
+    )
+)
+def test_cooldown_bounds_events_in_every_sliding_window(
+    steps: list[tuple[int, bool]],
+) -> None:
+    cooldown = timedelta(minutes=15)
+    rule = RuleSpec(
+        "fictitious-cooldown-window",
+        Direction.RISING,
+        (LevelSpec("critical", 10.0),),
+        cooldown=cooldown,
+        stale_after=timedelta(days=2),
+    )
+    state = RuleState()
+    now = BASE
+    event_times: dict[EventKind, list[datetime]] = defaultdict(list)
+    for advance, active in steps:
+        now += timedelta(minutes=advance)
+        state, events = evaluate(
+            rule,
+            state,
+            Sample(10.0 if active else 9.0, now),
+            now,
+        )
+        for event in events:
+            if event.kind in (EventKind.ESCALATED, EventKind.RECOVERED):
+                event_times[event.kind].append(now)
+
+    for times in event_times.values():
+        assert all(later - earlier >= cooldown for earlier, later in pairwise(times))
 
 
 @settings(max_examples=150, deadline=None, derandomize=True)

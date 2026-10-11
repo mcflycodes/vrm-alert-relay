@@ -1,5 +1,7 @@
 """Validation and serialization tests for engine domain types."""
 
+# ruff: noqa: S101
+
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -96,17 +98,20 @@ def populated_state() -> RuleState:
         last_evaluated_sample_time=BASE,
         stale=True,
         stale_cycle=3,
-        stale_started_at=BASE - timedelta(minutes=3),
         reminder_count=2,
         last_episode_notification_time=BASE + timedelta(minutes=1),
         episode_started_at=BASE - timedelta(minutes=2),
+        episode_announced=True,
+        episode_notified_levels=("warning", "critical"),
+        pending_escalation="critical",
+        escalation_ordinal=2,
         rule_direction=Direction.RISING,
         level_order=("warning", "critical"),
         level_notification_times=(
             ("critical", BASE + timedelta(minutes=1)),
             ("warning", BASE),
         ),
-        level_escalation_counts=(("critical", 2), ("warning", 1)),
+        level_recovery_times=(("warning", BASE - timedelta(minutes=3)),),
         suppressed_escalations=4,
     )
 
@@ -118,11 +123,34 @@ def test_state_round_trips_through_json_compatible_dict() -> None:
     assert RuleState.from_dict(RuleState().to_dict()) == RuleState()
     assert isinstance(encoded["level_notification_times"], list)
 
+    pending = RuleState(
+        episode=8,
+        pending_recovery_levels=("critical",),
+        pending_recovery_started_at=BASE,
+        level_recovery_times=(("critical", BASE),),
+    )
+    assert RuleState.from_dict(pending.to_dict()) == pending
+
+
+def test_schema_version_is_bumped_and_old_state_is_rejected() -> None:
+    encoded = RuleState().to_dict()
+    assert encoded["version"] == 2
+    encoded["version"] = 1
+    with pytest.raises(InvalidRuleStateError, match="version"):
+        RuleState.from_dict(encoded)
+
+
+def test_persisted_active_level_requires_positive_episode() -> None:
+    encoded = populated_state().to_dict()
+    encoded["episode"] = 0
+    with pytest.raises(InvalidRuleStateError, match="positive episode"):
+        RuleState.from_dict(encoded)
+
 
 @pytest.mark.parametrize(
     ("field", "bad_value"),
     [
-        ("version", 2),
+        ("version", 1),
         ("version", 1.0),
         ("version", True),
         ("active_level", 1),
@@ -137,16 +165,21 @@ def test_state_round_trips_through_json_compatible_dict() -> None:
         ("last_evaluated_sample_time", 4),
         ("stale", 1),
         ("stale_cycle", -1),
-        ("stale_started_at", "bad"),
         ("reminder_count", -1),
         ("last_episode_notification_time", "bad"),
         ("episode_started_at", "bad"),
+        ("episode_announced", 1),
+        ("episode_notified_levels", "bad"),
+        ("pending_escalation", 1),
+        ("pending_recovery_levels", "bad"),
+        ("pending_recovery_started_at", "bad"),
+        ("escalation_ordinal", -1),
         ("rule_direction", "sideways"),
         ("rule_direction", 1),
         ("level_order", "bad"),
         ("needs_rederive", 1),
         ("level_notification_times", "bad"),
-        ("level_escalation_counts", "bad"),
+        ("level_recovery_times", "bad"),
         ("suppressed_escalations", -1),
     ],
 )
@@ -165,10 +198,11 @@ def test_corrupt_scalar_state_is_rejected(field: str, bad_value: object) -> None
         ("level_notification_times", [["warning", 1]]),
         ("level_notification_times", [["warning", "bad"]]),
         ("level_notification_times", [["warning", "2030-01-01T00:00:00"]]),
-        ("level_escalation_counts", [["warning"]]),
-        ("level_escalation_counts", [["", 1]]),
-        ("level_escalation_counts", [["warning", 0]]),
-        ("level_escalation_counts", [["warning", True]]),
+        ("episode_notified_levels", [""]),
+        ("episode_notified_levels", ["warning", "warning"]),
+        ("pending_recovery_levels", [""]),
+        ("pending_recovery_levels", ["warning", "warning"]),
+        ("level_recovery_times", [["warning"]]),
     ],
 )
 def test_corrupt_history_state_is_rejected(field: str, bad_value: object) -> None:
@@ -198,14 +232,27 @@ def test_state_rejects_missing_extra_and_non_mapping_inputs() -> None:
         {"episode": -1},
         {"stale": 1},
         {"needs_rederive": 1},
+        {"episode_announced": 1},
         {"rule_direction": "rising"},
         {"level_order": ("same", "same")},
+        {"episode_notified_levels": ("same", "same")},
+        {"pending_escalation": "warning"},
+        {"pending_escalation": ""},
+        {"pending_recovery_levels": ("warning",)},
+        {"pending_recovery_started_at": BASE},
+        {
+            "active_level": "warning",
+            "episode": 1,
+            "pending_recovery_levels": ("warning",),
+            "pending_recovery_started_at": BASE,
+        },
+        {"active_level": "warning"},
         {"newest_sample_time": datetime(2030, 1, 1)},
         {"newest_value": float("inf")},
         {"clear_count": 1},
         {"reminder_count": 1},
         {"level_notification_times": (("warning", datetime(2030, 1, 1)),)},
-        {"level_escalation_counts": (("warning", 0),)},
+        {"level_recovery_times": (("warning", datetime(2030, 1, 1)),)},
     ],
 )
 def test_direct_state_construction_is_validated(kwargs: dict[str, object]) -> None:
@@ -215,21 +262,19 @@ def test_direct_state_construction_is_validated(kwargs: dict[str, object]) -> No
 
 def test_state_history_is_bounded() -> None:
     encoded = RuleState().to_dict()
-    encoded["level_escalation_counts"] = [[f"level-{index}", 1] for index in range(129)]
+    encoded["episode_notified_levels"] = [f"level-{index}" for index in range(129)]
     with pytest.raises(InvalidRuleStateError, match="bounded"):
         RuleState.from_dict(encoded)
 
 
 def test_direct_state_history_validation_covers_shape_duplicates_and_bounds() -> None:
     too_many_times = tuple((f"level-{index}", BASE) for index in range(129))
-    too_many_counts = tuple((f"level-{index}", 1) for index in range(129))
     invalid_states: list[dict[str, object]] = [
         {"level_notification_times": None},
         {"level_notification_times": too_many_times},
-        {"level_escalation_counts": too_many_counts},
+        {"episode_notified_levels": tuple(f"level-{index}" for index in range(129))},
         {"level_notification_times": (("warning",),)},
         {"level_notification_times": (("warning", BASE), ("warning", BASE))},
-        {"level_escalation_counts": (("warning",),)},
     ]
     for kwargs in invalid_states:
         with pytest.raises(InvalidRuleStateError):
