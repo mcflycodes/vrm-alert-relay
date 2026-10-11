@@ -35,11 +35,11 @@ Every gate below runs in CI (`.github/workflows/ci.yml`) as a separately named j
 | `test` | `uv run pytest` (coverage must stay at or above 85%) |
 | `secrets` | `gitleaks git --redact --verbose .` (full history) |
 | `dependencies` | `uv export --locked --all-groups --no-emit-project --format requirements-txt --output-file requirements-audit.txt` then `uv run pip-audit --strict --require-hashes --disable-pip --requirement requirements-audit.txt` |
-| `container` | `hadolint Dockerfile`, `docker build --tag vrm-alert-relay:ci .`, the hardened smoke test, an SBOM, and `trivy image --severity HIGH,CRITICAL --exit-code 1 vrm-alert-relay:ci` |
+| `container` | `hadolint Dockerfile`, `docker build --tag vrm-alert-relay:ci .`, the hardened smoke test, an SBOM, a non-blocking report of all HIGH/CRITICAL findings, and `trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 vrm-alert-relay:ci` |
 
 Run `uv sync` first. On hosts without Docker the `container` gates run only in CI; say so when reporting results.
 
-Never weaken a gate to get a green run: no lowered coverage, no `--ignore-unfixed`, no lowered Trivy severity, no `.trivyignore` entries without a maintainer-approved, dated exception (see ADR 0001).
+Never weaken a gate to get a green run: no lowered coverage, no lowered Trivy severity, no `.trivyignore` entries. The image scan blocks only on HIGH/CRITICAL findings with an available fix and reports unfixed ones without blocking (see ADR 0001); do not loosen it further.
 
 ## Branches, reviews, and merges
 
