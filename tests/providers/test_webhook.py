@@ -176,7 +176,7 @@ def test_header_name_is_validated(http: SafeHttpClient, name: str) -> None:
         (422, SendStatus.FAILED, False),
         (429, SendStatus.FAILED, True),
         (500, SendStatus.AMBIGUOUS, True),
-        (308, SendStatus.FAILED, False),
+        (308, SendStatus.AMBIGUOUS, True),
     ],
 )
 def test_statuses(
@@ -227,3 +227,9 @@ def test_plain_message_is_accepted(provider: WebhookPostProvider, transport: Stu
     transport.json({})
     provider.send(Message("dlv_plain", "hello"), HOOK)
     assert json_body(transport.requests[0])["kind"] is None
+
+
+def test_payload_neutralizes_links_in_the_unit() -> None:
+    fields = TemplateFields(kind=NotificationKind.ESCALATED, unit="https://evil.example.test")
+    payload = webhook_payload(DetailedMessage("dlv_x", "t", fields))
+    assert payload["unit"] == "hxxps[:]//evil[…"

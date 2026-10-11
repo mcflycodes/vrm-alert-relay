@@ -12,6 +12,7 @@ has no way to name a recipient, a provider or a destination.
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -43,8 +44,10 @@ __all__ = [
     "Template",
     "TemplateFields",
     "fields_for_event",
+    "neutralize_links",
     "render_notification",
     "sanitize_field",
+    "sanitize_untrusted",
 ]
 
 MAX_RENDERED_LENGTH: Final = 480
@@ -99,10 +102,11 @@ class TemplateFields:
     level: str | None = None
     value: float | None = None
     unit: str | None = None
+    """May come from VRM data: untrusted, so links in it are neutralized."""
     installation: str | None = None
     measurement: str | None = None
     label: str | None = None
-    """A display label from VRM data: untrusted."""
+    """A display label from VRM data: untrusted, so links in it are neutralized."""
     time: datetime | None = None
     count: int | None = None
 
@@ -121,6 +125,48 @@ def sanitize_field(text: str, limit: int) -> str:
     if len(collapsed) > limit:
         return collapsed[: limit - 1].rstrip() + _ELLIPSIS
     return collapsed
+
+
+_HTTP_SCHEME: Final = re.compile(r"(?i)(h)tt(ps?)(?=://)")
+_BARE_SCHEME: Final = re.compile(
+    r"(?i)\b(mailto|tel|sms|smsto|callto|facetime|javascript|vbscript|data|file|geo|intent|market):"
+)
+_DOMAIN: Final = re.compile(r"[\w-]+(?:\.[\w-]+)*\.[^\W\d_]{2,}")
+_IPV4: Final = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
+_EDGE_DOTS: Final = re.compile(r"^\.(?=[^\W\d_]{2})|(?<=\w)\.$")
+_DOT: Final = "[.]"
+
+
+def _defang_dots(match: re.Match[str]) -> str:
+    return match.group(0).replace(".", _DOT)
+
+
+def neutralize_links(text: str) -> str:
+    """Make URLs, domains and IP addresses in ``text`` visibly non-clickable.
+
+    ``https://evil.example.test/x`` becomes ``hxxps[:]//evil[.]example[.]test/x``:
+    every ``://`` becomes ``[:]//`` (``http`` becoming ``hxxp``), a colon after
+    a scheme such as ``tel`` or ``mailto`` becomes ``[:]``, and the dots of
+    domain-like tokens (a final label of two or more letters), dotted IPv4
+    addresses and a leading ``.com``-like or trailing dot become ``[.]``, so
+    a domain cannot be formed by placing two fields side by side. Other text
+    is unchanged.
+    """
+    text = _HTTP_SCHEME.sub(r"\1xx\2", text).replace("://", "[:]//")
+    text = _BARE_SCHEME.sub(r"\1[:]", text)
+    text = _DOMAIN.sub(_defang_dots, text)
+    text = _IPV4.sub(_defang_dots, text)
+    return _EDGE_DOTS.sub(_DOT, text)
+
+
+def sanitize_untrusted(text: str, limit: int) -> str:
+    """:func:`sanitize_field` for data from outside the configuration, such as
+    VRM labels, with links neutralized (see :func:`neutralize_links`)."""
+    cleaned = sanitize_field(text[: limit * _PRESCAN_FACTOR], limit * _PRESCAN_FACTOR)
+    return sanitize_field(neutralize_links(cleaned), limit)
+
+
+_UNTRUSTED_FIELDS: Final = frozenset({"label", "unit"})
 
 
 def _format_value(value: float) -> str:
@@ -186,7 +232,8 @@ class Template:
                 parts.append(segment.text)
             else:
                 limit = FIELD_LIMITS[segment.name]
-                parts.append(sanitize_field(_field_text(fields, segment.name), limit))
+                clean = sanitize_untrusted if segment.name in _UNTRUSTED_FIELDS else sanitize_field
+                parts.append(clean(_field_text(fields, segment.name), limit))
         return sanitize_field("".join(parts), max_length)
 
     def __repr__(self) -> str:

@@ -46,7 +46,7 @@ from vrm_alert_relay.logs.redaction import SecretRegistry, register_secret
 from vrm_alert_relay.net import Endpoint, HttpError
 from vrm_alert_relay.providers._http import DELIVERED, FAILED, result_for_error
 from vrm_alert_relay.providers.messages import DetailedMessage
-from vrm_alert_relay.templates import FIELD_LIMITS, sanitize_field
+from vrm_alert_relay.templates import FIELD_LIMITS, sanitize_field, sanitize_untrusted
 
 if TYPE_CHECKING:
     from vrm_alert_relay.config import Recipient, Secret
@@ -62,6 +62,7 @@ MAX_RESPONSE_BYTES: Final = 64 * 1024
 
 _HEADER_NAME: Final = TypeAdapter(HeaderName)
 _TEXT_FIELDS: Final = ("rule", "level", "unit", "installation", "measurement")
+_UNTRUSTED_FIELDS: Final = frozenset({"unit"})
 _log = logging.getLogger(__name__)
 
 type JsonScalar = str | int | float | None
@@ -69,7 +70,10 @@ type JsonScalar = str | int | float | None
 
 def _bounded(fields: TemplateFields, name: str) -> str | None:
     value: str | None = getattr(fields, name)
-    return None if value is None else sanitize_field(value, FIELD_LIMITS[name])
+    if value is None:
+        return None
+    clean = sanitize_untrusted if name in _UNTRUSTED_FIELDS else sanitize_field
+    return clean(value, FIELD_LIMITS[name])
 
 
 def webhook_payload(message: Message) -> dict[str, JsonScalar]:

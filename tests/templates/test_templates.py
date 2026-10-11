@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from datetime import UTC, datetime, timedelta, timezone
 
@@ -22,9 +23,11 @@ from vrm_alert_relay.templates import (
     TemplateFields,
     TemplateSyntaxError,
     fields_for_event,
+    neutralize_links,
     parse_template,
     render_notification,
     sanitize_field,
+    sanitize_untrusted,
 )
 from vrm_alert_relay.templates.syntax import Literal, Placeholder
 
@@ -281,3 +284,88 @@ def test_any_template_parses_or_raises_syntax_error(source: str) -> None:
         return
     assert template.placeholders <= frozenset(FIELD_NAMES)
     assert len(template.render(FIELDS)) <= MAX_RENDERED_LENGTH
+
+
+# Links in untrusted fields -----------------------------------------------------
+
+LINKY = re.compile(r"[\w-]+(?:\.[\w-]+)*\.[^\W\d_]{2,}|\d{1,3}(?:\.\d{1,3}){3}")
+BARE_SCHEME = re.compile(
+    r"(?i)\b(?:mailto|tel|sms|smsto|callto|facetime|javascript|vbscript|data|file|geo|intent|market):"
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "shown"),
+    [
+        ("https://evil.example.test/x", "hxxps[:]//evil[.]example[.]test/x"),
+        ("HTTP://Evil.Example.Test", "HxxP[:]//Evil[.]Example[.]Test"),
+        ("ftp://files.example.test", "ftp[:]//files[.]example[.]test"),
+        ("visit www.evil.example now", "visit www[.]evil[.]example now"),
+        ("call tel:+12025550199", "call tel[:]+12025550199"),
+        ("mailto:someone@evil.example", "mailto[:]someone@evil[.]example"),
+        ("javascript:alert(1)", "javascript[:]alert(1)"),
+        ("gateway 192.0.2.10 down", "gateway 192[.]0[.]2[.]10 down"),
+        ("evil.", "evil[.]"),
+        (".com", "[.]com"),
+        ("bücher.example", "bücher[.]example"),
+        ("Freezer temperature", "Freezer temperature"),
+        ("Battery 12.5 V, SoC 80%", "Battery 12.5 V, SoC 80%"),
+        ("e.g. v1.2", "e.g. v1.2"),
+        ("Time: 12:30", "Time: 12:30"),
+    ],
+)
+def test_neutralize_links(text: str, shown: str) -> None:
+    assert neutralize_links(text) == shown
+
+
+def test_untrusted_label_and_unit_lose_their_links() -> None:
+    fields = TemplateFields(
+        kind=NotificationKind.ESCALATED,
+        label="Pay at https://evil.example.test/x",
+        unit=".com",
+        value=1.0,
+    )
+    text = Template("{label} {value}{unit}").render(fields)
+    assert text == "Pay at hxxps[:]//evil[.]example[.]test/x 1[.]com"
+    adjacent = TemplateFields(kind=NotificationKind.ESCALATED, label="evil.", unit="com")
+    assert Template("{label}{unit}").render(adjacent) == "evil[.]com"
+
+
+def test_operator_template_text_is_unchanged() -> None:
+    fields = TemplateFields(kind=NotificationKind.ESCALATED, label="Freezer", rule="freezer")
+    template = Template("See https://status.example.test for {rule}: {label}")
+    assert template.render(fields) == "See https://status.example.test for freezer: Freezer"
+
+
+def test_trusted_fields_are_not_rewritten() -> None:
+    fields = TemplateFields(kind=NotificationKind.ESCALATED, measurement="tsT", rule="a.bc")
+    assert Template("{rule} {label}").render(fields) == "a.bc tsT"
+
+
+def test_untrusted_sanitizing_is_bounded() -> None:
+    shown = sanitize_untrusted("a.bc " * 1_000_000, 64)
+    assert len(shown) <= 64
+    assert shown.endswith("…")
+
+
+@given(st.text(max_size=300))
+def test_untrusted_text_never_keeps_a_link(text: str) -> None:
+    shown = sanitize_untrusted(text, FIELD_LIMITS["label"])
+    assert "://" not in shown
+    assert LINKY.search(shown) is None
+    assert BARE_SCHEME.search(shown) is None
+    assert len(shown) <= FIELD_LIMITS["label"]
+
+
+@given(
+    st.lists(
+        st.sampled_from(["http", "s", "://", ".", "www", "evil", "com", "tel", ":", "1", " ", "é"]),
+        max_size=40,
+    )
+)
+def test_link_shaped_labels_never_keep_a_link(parts: list[str]) -> None:
+    fields = TemplateFields(kind=NotificationKind.ESCALATED, label="".join(parts))
+    shown = Template("{label}").render(fields)
+    assert "://" not in shown
+    assert LINKY.search(shown) is None
+    assert BARE_SCHEME.search(shown) is None

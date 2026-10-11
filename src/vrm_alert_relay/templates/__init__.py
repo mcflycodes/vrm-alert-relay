@@ -13,8 +13,10 @@ from vrm_alert_relay.templates.render import (
     Template,
     TemplateFields,
     fields_for_event,
+    neutralize_links,
     render_notification,
     sanitize_field,
+    sanitize_untrusted,
 )
 from vrm_alert_relay.templates.syntax import (
     FIELD_NAMES,
@@ -35,7 +37,9 @@ __all__ = [
     "TemplateFields",
     "TemplateSyntaxError",
     "fields_for_event",
+    "neutralize_links",
     "parse_template",
     "render_notification",
     "sanitize_field",
+    "sanitize_untrusted",
 ]
