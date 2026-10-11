@@ -288,7 +288,7 @@ def test_join_rejects_non_str_int_segments(segment: object) -> None:
         ("a" * 64 + ".example", False),
     ],
 )
-def test_host_validation(host: str, valid: bool) -> None:  # noqa: FBT001  # parametrized expectation
+def test_host_validation(host: str, valid: bool) -> None:  # parametrized expectation
     assert endpoint_module._valid_host(host) is valid
 
 

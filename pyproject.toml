@@ -96,6 +96,8 @@ select = [
     "SLF001",  # tests reach into private state to assert on it
     "TRY003",  # fakes raise ad-hoc errors with descriptive messages
     "TRY301",  # tests raise inside try to capture real tracebacks
+    "DTZ001",  # naive datetimes are deliberate test inputs (rejection cases, hypothesis bounds)
+    "FBT001",  # pytest.mark.parametrize injects bool arguments by name
 ]
 
 [tool.mypy]
