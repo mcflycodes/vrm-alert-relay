@@ -1,0 +1,4 @@
+failure-threshold: info
+trustedRegistries:
+  - gcr.io
+  - ghcr.io

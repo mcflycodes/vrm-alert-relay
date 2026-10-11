@@ -15,16 +15,28 @@ The project is intended for use cases where a single threshold notification is n
 - Stale-data and polling-failure detection
 - Persistent state across restarts
 - Multiple installations, devices, and measurements
-- Pluggable notification providers, beginning with VoIP.ms SMS
+- Pluggable notification providers: VoIP.ms SMS, Home Assistant, and a generic webhook to start
 - Dry-run mode and container deployment
 
 ## Status
 
 VRM Alert Relay is in initial development. It is not yet ready to monitor production systems.
 
+## Development
+
+The service is written in Python 3.13 and packaged as a distroless, non-root container image. With [uv](https://docs.astral.sh/uv/) installed:
+
+```sh
+uv sync
+uv run vrm-alert-relay --version
+uv run pytest
+```
+
+The current build is a placeholder: it logs that it is running in dry-run mode and exits. See [CONTRIBUTING.md](CONTRIBUTING.md) for all checks, [docs/requirements.md](docs/requirements.md) for the v1 requirements, and [docs/adr/](docs/adr/) for design decisions.
+
 ## Security and privacy
 
-Abuse prevention and deployment privacy are core design requirements. Sending will be disabled by default, recipients will be explicitly allow-listed, and layered rate limits will constrain providers, recipients, and rules. The project will not collect telemetry.
+Abuse prevention and deployment privacy are core design requirements. Sending will be disabled by default, recipients will be explicitly allow-listed, and a global rate limit, per-rule cooldowns, and bounded critical reminders will constrain message volume. The project will not collect telemetry.
 
 Public examples and tests use fictitious identifiers. Operators supply their own installations, devices, rules, providers, and recipients through deployment configuration; none are built into the software.
 
