@@ -22,6 +22,18 @@ The project is intended for use cases where a single threshold notification is n
 
 VRM Alert Relay is in initial development. It is not yet ready to monitor production systems.
 
+## Development
+
+The service is written in Python 3.13 and packaged as a distroless, non-root container image. With [uv](https://docs.astral.sh/uv/) installed:
+
+```sh
+uv sync
+uv run vrm-alert-relay --version
+uv run pytest
+```
+
+The current build is a placeholder: it logs that it is running in dry-run mode and exits. See [CONTRIBUTING.md](CONTRIBUTING.md) for all checks, [docs/requirements.md](docs/requirements.md) for the v1 requirements, and [docs/adr/](docs/adr/) for design decisions.
+
 ## Security and privacy
 
 Abuse prevention and deployment privacy are core design requirements. Sending will be disabled by default, recipients will be explicitly allow-listed, and layered rate limits will constrain providers, recipients, and rules. The project will not collect telemetry.
