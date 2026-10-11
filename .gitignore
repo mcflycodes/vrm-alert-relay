@@ -20,6 +20,7 @@ scratchpad/
 /state/
 relay-state.sqlite3
 relay-state.sqlite3-*
+relay-state.sqlite3.*
 relay-state.journal
 relay-state.journal.*
 relay-state.lock

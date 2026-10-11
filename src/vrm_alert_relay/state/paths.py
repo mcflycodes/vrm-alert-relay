@@ -1,8 +1,10 @@
 """Safe handling of the state directory and the files in it.
 
 Every state file is opened without following symlinks, must be a regular
-file, and is kept at mode 0600. A state directory that is a symlink or not a
-directory is refused; a group- or world-writable one only draws a warning.
+file, and is kept at mode 0600; a file that cannot be restricted to 0600 is
+not used. A state directory that is a symlink or not a directory is refused;
+a group- or world-writable one only draws a warning. A refused path makes
+that storage unavailable; the relay keeps alerting (ADR 0002).
 """
 
 from __future__ import annotations
@@ -11,19 +13,24 @@ import errno
 import logging
 import os
 import stat
-from typing import TYPE_CHECKING, Final
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from pathlib import Path
+from typing import Final
 
 __all__ = [
     "SIDECAR_SUFFIXES",
+    "FileIdentity",
     "StateLockedError",
     "UnsafeStateError",
     "check_directory",
+    "check_identity",
+    "identity_of",
+    "open_descriptors",
     "open_private",
     "secure_existing",
 ]
+
+type FileIdentity = tuple[int, int]
+"""A file's (device, inode)."""
 
 logger = logging.getLogger(__name__)
 
@@ -84,12 +91,9 @@ def open_private(path: Path, flags: int) -> int:
 def _tighten(descriptor: int) -> None:
     try:
         os.fchmod(descriptor, PRIVATE_MODE)
-    except OSError:
-        # A read-only volume cannot be changed; reading from it is still safe.
-        logger.warning(
-            "could not restrict a state file to mode 0600",
-            extra={"event": "state.file_permissive"},
-        )
+    except OSError as exc:
+        # Others may read or change this file: it is not used for state.
+        raise UnsafeStateError("a state file could not be restricted to mode 0600") from exc  # noqa: TRY003  # per-check validation message
 
 
 def secure_existing(path: Path) -> None:
@@ -99,3 +103,35 @@ def secure_existing(path: Path) -> None:
     except FileNotFoundError:
         return
     os.close(descriptor)
+
+
+def identity_of(descriptor: int) -> FileIdentity:
+    info = os.fstat(descriptor)
+    return (info.st_dev, info.st_ino)
+
+
+def check_identity(path: Path, expected: FileIdentity) -> None:
+    """Raise :class:`UnsafeStateError` unless ``path`` is still the file validated earlier."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError as exc:
+        raise UnsafeStateError(f"state file {path.name} was replaced") from exc  # noqa: TRY003  # per-check validation message
+    if stat.S_ISLNK(info.st_mode) or (info.st_dev, info.st_ino) != expected:
+        raise UnsafeStateError(f"state file {path.name} was replaced")  # noqa: TRY003  # per-check validation message
+
+
+def open_descriptors() -> dict[int, FileIdentity] | None:
+    """The process's open regular files by descriptor, or None where ``/proc`` is unavailable."""
+    try:
+        names = [entry.name for entry in Path("/proc/self/fd").iterdir()]
+    except OSError:
+        return None
+    found: dict[int, FileIdentity] = {}
+    for name in names:
+        try:
+            info = os.fstat(int(name))
+        except (OSError, ValueError):
+            continue  # Closed since listing, or the listing's own descriptor.
+        if stat.S_ISREG(info.st_mode):
+            found[int(name)] = (info.st_dev, info.st_ino)
+    return found

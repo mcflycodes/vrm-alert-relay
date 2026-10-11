@@ -431,19 +431,20 @@ def test_durable_accounting_recovers_at_the_next_run(
     clock = FakeClock()
     switch = FailSwitch()
     provider = FakeProvider()
-    store = flaky_store(tmp_path, switch, journal_max_bytes=1)
-    engine = make_engine(store, clock=clock, voipms=provider)
+    engine = make_engine(flaky_store(tmp_path, switch), clock=clock, voipms=provider)
     switch.on = True
-    (tmp_path / "relay-state.journal.1").mkdir()  # rotation is impossible
+    (tmp_path / "relay-state.journal").mkdir()  # the journal is unusable too
     engine.accept_cycle(rule_states={}, notifications=[rule_note(1)])
-    (tmp_path / "relay-state.journal").write_bytes(b"x\n")
-    engine.run_due()
+    report = engine.run_due()
+    assert (report.sent, report.sent_unrecorded) == (0, 2)  # alert and notice, sent anyway (R1)
     assert engine.health().durable_accounting is False
+    (tmp_path / "relay-state.journal").rmdir()
     switch.on = False
     with caplog.at_level(logging.WARNING, logger="vrm_alert_relay.delivery"):
         engine.run_due()
     assert "delivery.durable_accounting_restored" in logged(caplog)
-    assert provider.texts() == [engine_module.STORAGE_NOTICE_TEXT, "Freezer warming"]
+    assert engine.health().durable_accounting is True
+    assert provider.texts() == ["Freezer warming", engine_module.STORAGE_NOTICE_TEXT]
 
 
 def test_journal_recovers_durability_after_a_failure(
@@ -458,8 +459,10 @@ def test_journal_recovers_durability_after_a_failure(
     engine.accept_cycle(rule_states={}, notifications=[rule_note(1)])
     engine.run_due()
     (tmp_path / "relay-state.journal").rmdir()
+    engine.accept_cycle(rule_states={}, notifications=[rule_note(2)])
     with caplog.at_level(logging.WARNING, logger="vrm_alert_relay.delivery"):
-        engine.run_due()
+        report = engine.run_due()
+    assert (report.sent, report.sent_unrecorded) == (1, 0)
     assert "delivery.durable_accounting_restored" in logged(caplog)
     assert provider.texts()[-1] == "Freezer warming"
 
@@ -473,8 +476,8 @@ def test_storage_notice_needs_a_system_recipient(tmp_path: Path) -> None:
     switch.on = True
     (tmp_path / "relay-state.journal").mkdir()
     engine.accept_cycle(rule_states={}, notifications=[direct_note(1, "owner_sms")])
-    assert engine.run_due().storage_notice_sent is False
-    assert provider.sent == []
+    assert engine.run_due().storage_notice is None
+    assert provider.texts() == ["Test notification"]  # the alert itself still goes out
 
 
 def test_storage_notice_waits_for_capacity(tmp_path: Path) -> None:
@@ -486,11 +489,10 @@ def test_storage_notice_waits_for_capacity(tmp_path: Path) -> None:
     # White box: durability was lost while every slot of the cap is taken.
     engine._durable = False
     engine._live = RateLimiter(1, 10, [(clock.mono, ("evt_x", "owner_sms", 1))])
-    switch_off = engine.run_due  # flush succeeds, so durability recovers first
     engine._store.flush = lambda changes, now: False  # type: ignore[method-assign]
-    assert switch_off().storage_notice_sent is False
+    assert engine.run_due().storage_notice is None
     clock.advance(timedelta(hours=1, seconds=1))
-    assert engine.run_due().storage_notice_sent is True
+    assert engine.run_due().storage_notice is SendStatus.DELIVERED
     assert provider.texts() == [engine_module.STORAGE_NOTICE_TEXT]
 
 
@@ -507,7 +509,7 @@ def test_storage_notice_to_a_dry_run_system_recipient(tmp_path: Path) -> None:
     switch.on = True
     (tmp_path / "relay-state.journal").mkdir()
     engine.accept_cycle(rule_states={}, notifications=[rule_note(1)])
-    assert engine.run_due().storage_notice_sent is True
+    assert engine.run_due().storage_notice is SendStatus.DELIVERED
     assert dry.texts() == [engine_module.STORAGE_NOTICE_TEXT]
     assert engine.health().dry_run_sent_last_hour == 1
 

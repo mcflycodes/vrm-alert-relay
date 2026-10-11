@@ -30,10 +30,10 @@ from vrm_alert_relay.state import (
     DeliveryStatus,
     JournalEntry,
     SchemaTooNewError,
+    Snapshot,
     StateLockedError,
     StateStore,
     SuppressionState,
-    UnsafeStateError,
     migrate,
 )
 from vrm_alert_relay.state import store as store_module
@@ -160,10 +160,20 @@ def test_second_store_on_the_same_directory_is_refused(opened: StateStore, tmp_p
     with pytest.raises(StateLockedError):
         StateStore(tmp_path).load(BASE)
     other = StateStore(tmp_path)
-    assert not other.journal((JournalEntry(record(1), attempt=True),))
+    assert not other.journal((JournalEntry(record(1), attempt=True),), BASE)
     assert other.error == "StateLockedError: another relay process is using the state directory"
     opened.close()
     store, _ = reopen(tmp_path)
+    store.close()
+
+
+def _refused(store: StateStore, snapshot: Snapshot, reason: str) -> None:
+    """An unsafe path makes storage unavailable; the relay is not stopped (ADR 0002)."""
+    assert not snapshot.complete
+    assert not store.healthy
+    assert store.error is not None
+    assert reason in store.error
+    assert not store.flush(Changes(deliveries=(record(1),)), BASE)
     store.close()
 
 
@@ -171,14 +181,15 @@ def test_symlinked_state_directory_is_refused(tmp_path: Path) -> None:
     real = tmp_path / "real"
     real.mkdir()
     (tmp_path / "link").symlink_to(real)
-    with pytest.raises(UnsafeStateError, match="symlink"):
-        StateStore(tmp_path / "link").load(BASE)
+    store = StateStore(tmp_path / "link")
+    _refused(store, store.load(BASE), "symlink")
+    assert list(real.iterdir()) == []
 
 
 def test_state_directory_that_is_a_file_is_refused(tmp_path: Path) -> None:
     (tmp_path / "file").write_text("")
-    with pytest.raises(UnsafeStateError, match="not a directory"):
-        StateStore(tmp_path / "file").load(BASE)
+    store = StateStore(tmp_path / "file")
+    _refused(store, store.load(BASE), "ot a directory")
 
 
 @pytest.mark.parametrize(
@@ -189,14 +200,24 @@ def test_symlinked_state_files_are_refused(tmp_path: Path, name: str) -> None:
     target = tmp_path / "elsewhere"
     target.write_text("")
     (tmp_path / name).symlink_to(target)
-    with pytest.raises(UnsafeStateError, match="symlink"):
-        StateStore(tmp_path).load(BASE)
+    store = StateStore(tmp_path)
+    snapshot = store.load(BASE)
+    assert target.read_text() == ""
+    if name == JOURNAL_FILENAME:
+        # The database still works; the history is incomplete until the journal is readable.
+        assert not snapshot.complete
+        assert store.error is not None
+        assert "symlink" in store.error
+        store.close()
+        return
+    _refused(store, snapshot, "symlink")
 
 
 def test_non_regular_database_is_refused(tmp_path: Path) -> None:
     os.mkfifo(tmp_path / DB_FILENAME)
-    with pytest.raises(UnsafeStateError, match="not a regular file"):
-        StateStore(tmp_path).load(BASE)
+    store = StateStore(tmp_path)
+    _refused(store, store.load(BASE), "not a regular file")
+    assert stat.S_ISFIFO((tmp_path / DB_FILENAME).lstat().st_mode)
 
 
 def test_unsafe_path_at_runtime_is_a_storage_failure(opened: StateStore, tmp_path: Path) -> None:
@@ -241,6 +262,7 @@ def test_everything_round_trips_across_a_reopen(tmp_path: Path) -> None:
             next_attempt_at=BASE + timedelta(minutes=1),
             last_attempt_at=BASE,
             provider_message_id="provider-id-9",
+            covers=4,
         ),
     )
     attempts = (
@@ -266,7 +288,7 @@ def test_everything_round_trips_across_a_reopen(tmp_path: Path) -> None:
     store, snapshot = reopen(tmp_path, BASE + timedelta(minutes=1))
     assert snapshot.rule_states == {"freezer": state}
     assert snapshot.deliveries == records
-    assert snapshot.attempts == attempts
+    assert snapshot.attempts == attempts[:1]  # dry-run sends are never stored
     assert snapshot.suppression == suppression
     assert snapshot.last_seen == BASE
     assert snapshot.clock_moved_backwards is False
@@ -409,7 +431,7 @@ def test_unreadable_text_is_replaced_by_a_notice(tmp_path: Path) -> None:
             "CREATE TABLE delivery (event_id TEXT, recipient TEXT, rule_id TEXT, kind TEXT, "
             "status TEXT, text TEXT, attempts INTEGER, created_at TEXT, updated_at TEXT, "
             "next_attempt_at TEXT, last_attempt_at TEXT, provider_message_id TEXT, "
-            "PRIMARY KEY (event_id, recipient))"
+            "covers INTEGER, PRIMARY KEY (event_id, recipient))"
         )
         _insert_delivery(connection, event_id="evt_t", text=None, attempts=True)
     store, snapshot = reopen(tmp_path)
@@ -424,12 +446,11 @@ def test_corrupt_attempts_and_meta_fail_closed(tmp_path: Path) -> None:
     store.close()
     with closing(raw(tmp_path)) as connection:
         connection.executemany(
-            "INSERT INTO send_attempt (event_id, recipient, attempt, at, live) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO send_attempt (event_id, recipient, attempt, at) VALUES (?, ?, ?, ?)",
             [
-                ("evt_2", "owner_sms", 1, "garbage", 1),
-                ("evt_3", "owner_sms", 1, BASE.isoformat(), 7),
-                ("bad id", "owner_sms", 1, BASE.isoformat(), 1),
+                ("evt_2", "owner_sms", 1, "garbage"),
+                ("evt_3", "owner_sms", 1, "x" * 10_000),
+                ("bad id", "owner_sms", 1, BASE.isoformat()),
             ],
         )
         connection.executemany(
@@ -549,8 +570,10 @@ def test_journal_is_replayed_at_load_and_merged_by_the_next_flush(tmp_path: Path
     in_flight = record(1, DeliveryStatus.IN_FLIGHT, attempts=1, last_attempt_at=BASE)
     delivered = record(1, DeliveryStatus.DELIVERED, attempts=1, last_attempt_at=BASE)
     other = record(2, DeliveryStatus.IN_FLIGHT, attempts=1, last_attempt_at=BASE)
-    assert store.journal((JournalEntry(in_flight, attempt=True), JournalEntry(other, attempt=True)))
-    assert store.journal((JournalEntry(delivered, attempt=False),))
+    assert store.journal(
+        (JournalEntry(in_flight, attempt=True), JournalEntry(other, attempt=True)), BASE
+    )
+    assert store.journal((JournalEntry(delivered, attempt=False),), BASE)
     store.close()
     with (tmp_path / JOURNAL_FILENAME).open("ab") as handle:
         handle.write(b'{"v": 1, "torn')
@@ -578,7 +601,7 @@ def test_journal_is_replayed_at_load_and_merged_by_the_next_flush(tmp_path: Path
 def test_an_older_journal_version_does_not_replace_a_newer_row(tmp_path: Path) -> None:
     store, _ = reopen(tmp_path)
     in_flight = record(1, DeliveryStatus.IN_FLIGHT, attempts=1, last_attempt_at=BASE)
-    assert store.journal((JournalEntry(in_flight, attempt=True),))
+    assert store.journal((JournalEntry(in_flight, attempt=True),), BASE)
     with closing(raw(tmp_path)) as connection:
         _insert_delivery(connection, event_id="evt_0001", status="delivered", attempts=1)
     store.close()
@@ -603,7 +626,7 @@ def test_corrupt_journal_lines_occupy_slots(tmp_path: Path) -> None:
 def test_a_corrupt_row_is_replaced_by_the_journal_version(tmp_path: Path) -> None:
     store, _ = reopen(tmp_path)
     in_flight = record(1, DeliveryStatus.IN_FLIGHT, attempts=1, last_attempt_at=BASE)
-    assert store.journal((JournalEntry(in_flight, attempt=True),))
+    assert store.journal((JournalEntry(in_flight, attempt=True),), BASE)
     with closing(raw(tmp_path)) as connection:
         _insert_delivery(connection, event_id="evt_0001", created_at="garbage")
     assert store.flush(Changes(), BASE)
@@ -614,7 +637,7 @@ def test_a_corrupt_row_is_replaced_by_the_journal_version(tmp_path: Path) -> Non
 def test_an_unreadable_journal_fails_the_flush_and_is_kept(
     opened: StateStore, tmp_path: Path
 ) -> None:
-    assert opened.journal((JournalEntry(record(1), attempt=True),))
+    assert opened.journal((JournalEntry(record(1), attempt=True),), BASE)
     (tmp_path / JOURNAL_FILENAME).chmod(0o000)
     try:
         assert not opened.flush(Changes(), BASE)
@@ -626,22 +649,30 @@ def test_an_unreadable_journal_fails_the_flush_and_is_kept(
 
 def test_an_unreadable_journal_at_load_is_reported(tmp_path: Path) -> None:
     store, _ = reopen(tmp_path)
-    assert store.journal((JournalEntry(record(1), attempt=True),))
+    assert store.journal((JournalEntry(record(1), attempt=True),), BASE)
     store.close()
     (tmp_path / JOURNAL_FILENAME).chmod(0o000)
     try:
         store, snapshot = reopen(tmp_path)
+        assert snapshot.deliveries == ()
+        assert not snapshot.complete
+        assert not store.readable
+        assert store.error == "PermissionError: Permission denied"
+        assert store.reload(BASE) is None
     finally:
         (tmp_path / JOURNAL_FILENAME).chmod(0o600)
-    assert snapshot.deliveries == ()
-    assert store.error == "PermissionError: Permission denied"
+    reloaded = store.reload(BASE)
+    assert reloaded is not None
+    assert reloaded.complete
+    assert [r.event_id for r in reloaded.deliveries] == ["evt_0001"]
+    assert store.readable
     store.close()
 
 
 def test_journal_clear_failure_keeps_the_store_unhealthy(
     opened: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    assert opened.journal((JournalEntry(record(1), attempt=True),))
+    assert opened.journal((JournalEntry(record(1), attempt=True),), BASE)
 
     def refuse() -> None:
         raise PermissionError(13, "Permission denied")
@@ -719,12 +750,26 @@ def test_rollback_and_close_failures_are_contained(tmp_path: Path) -> None:
     store.close()
 
 
-def test_failed_load_reads_nothing_and_writes_nothing(tmp_path: Path) -> None:
-    plan = {"fail": True, "match": "FROM meta", "error": "database disk image is malformed"}
+def test_failed_load_reads_what_it_can_and_writes_nothing(tmp_path: Path) -> None:
+    store, _ = reopen(tmp_path)
+    assert store.flush(Changes(deliveries=(record(1),), suppression=SuppressionState(2)), BASE)
+    store.close()
+    plan = {"fail": True, "match": "FROM meta", "error": "disk I/O error"}
     store = failing_store(tmp_path, plan)
     snapshot = store.load(BASE)
-    assert snapshot.rule_states == {}
+    assert [r.event_id for r in snapshot.deliveries] == ["evt_0001"]  # H5: other tables read
+    assert not snapshot.complete
+    assert not snapshot.suppression_read
     assert not store.healthy
+    assert not store.flush(Changes(deliveries=(record(2),)), BASE)  # untouched until re-read
+    assert store.reload(BASE) is None
+    plan["fail"] = False
+    reloaded = store.reload(BASE)
+    assert reloaded is not None
+    assert reloaded.complete
+    assert reloaded.suppression.count == 2
+    assert store.flush(Changes(deliveries=(record(2),)), BASE)
+    assert store.healthy
     store.close()
 
 
@@ -741,21 +786,33 @@ def test_failed_repair_still_returns_what_was_read(tmp_path: Path) -> None:
     store.close()
 
 
-def test_not_a_database_is_reported_not_overwritten(tmp_path: Path) -> None:
-    (tmp_path / DB_FILENAME).write_bytes(b"this is not an SQLite file" * 100)
+def test_not_a_database_is_moved_aside_and_state_starts_afresh(tmp_path: Path) -> None:
+    garbage = b"this is not an SQLite file" * 100
+    (tmp_path / DB_FILENAME).write_bytes(garbage)
+    (tmp_path / DB_FILENAME).chmod(0o644)
     store, snapshot = reopen(tmp_path)
-    assert snapshot.deliveries == ()
-    assert not store.flush(Changes(), BASE)
-    assert store.error is not None
-    assert store.error.startswith("DatabaseError")
-    assert (tmp_path / DB_FILENAME).read_bytes().startswith(b"this is not an SQLite file")
+    assert snapshot.reset
+    assert snapshot.complete
+    assert not store.healthy
+    assert store.flush(Changes(deliveries=(record(1),)), BASE)
+    assert not store.healthy  # for the rest of the run
+    assert store.error == "corrupt database moved aside; state started afresh"
+    [moved] = tmp_path.glob(f"{DB_FILENAME}.corrupt-*")
+    assert moved.name == f"{DB_FILENAME}.corrupt-20350101T000000000000Z"
+    assert moved.read_bytes() == garbage
+    assert stat.S_IMODE(moved.stat().st_mode) == 0o600
+    store.close()
+    store, snapshot = reopen(tmp_path)
+    assert [r.event_id for r in snapshot.deliveries] == ["evt_0001"]
+    assert store.healthy
     store.close()
 
 
 def test_missing_directory_error_omits_the_path(tmp_path: Path) -> None:
-    store, _ = reopen(tmp_path / "missing")
+    store, snapshot = reopen(tmp_path / "missing")
+    assert not snapshot.complete
     assert store.error == "FileNotFoundError: No such file or directory"
-    assert not store.journal((JournalEntry(record(1), attempt=True),))
+    assert not store.journal((JournalEntry(record(1), attempt=True),), BASE)
 
 
 def test_read_only_volume_is_a_storage_failure_not_a_crash(tmp_path: Path) -> None:
@@ -769,7 +826,7 @@ def test_read_only_volume_is_a_storage_failure_not_a_crash(tmp_path: Path) -> No
         store, _ = reopen(tmp_path)
         assert not store.healthy
         assert not store.flush(Changes(deliveries=(record(2),)), BASE)
-        assert not store.journal((JournalEntry(record(2), attempt=True),))
+        assert not store.journal((JournalEntry(record(2), attempt=True),), BASE)
         with pytest.raises(StateLockedError):
             StateStore(tmp_path).load(BASE)  # the read-only lock file still locks
         store.close()

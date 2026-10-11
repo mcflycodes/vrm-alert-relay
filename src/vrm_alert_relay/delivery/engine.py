@@ -7,27 +7,32 @@ Life of a delivery, one per (event_id, recipient):
   already seen are ignored), stores the cycle's rule states, and commits both
   in one transaction.
 * :meth:`DeliveryEngine.run_due` processes due records. A real provider call
-  needs a free slot in the global cap and an ``IN_FLIGHT`` record that is
-  durable first, in SQLite or else in the fallback journal. Without either,
-  nothing is sent (see "no durable accounting" below). The provider's result
-  moves the record to ``DELIVERED``, ``FAILED``, back to ``PENDING`` with a
-  backoff (a retryable failure), or ``AMBIGUOUS``.
+  needs a free slot in the global cap. Its ``IN_FLIGHT`` record is made
+  durable first, in SQLite or else in the fallback journal; if neither can
+  record it, the message is sent anyway (see "failures favour alerting"
+  below). The provider's result moves the record to ``DELIVERED``,
+  ``FAILED``, back to ``PENDING`` with a backoff (a retryable failure), or
+  ``AMBIGUOUS``.
 * An ``AMBIGUOUS`` record, or an ``IN_FLIGHT`` one found at startup (a crash
   mid-send), is reconciled with the provider before any retry when the
   provider supports a lookup; otherwise, or when the lookup cannot tell, it is
   retried. A rare duplicate after a crash is accepted.
 * When the cap has no free slot, a real delivery becomes ``SUPPRESSED`` and is
-  counted. When no real alert is due and the cap allows, one aggregate
-  "N alerts held back" summary goes to the system recipients, at most one per
-  ``summary_interval``. The count is reduced only once a summary is delivered.
+  counted. One aggregate "N alerts held back" summary goes to the system
+  recipients, at most one per ``summary_interval``: when no real alert is
+  due, or once the summary has waited ``summary_max_wait``, whichever comes
+  first. The count is reduced only once a summary is delivered.
 
 Only real provider calls use the cap. Dry-run sends go to the dry-run sink and
 are counted against a separate "would send" cap that is only reported.
 
-**No durable accounting.** If neither SQLite nor the journal can record an
-attempt, the engine sends nothing except one "state storage unavailable"
-notice per process, to one system recipient, and logs an error every run
-until storage works again. Provider-side limits are the final backstop.
+**Failures favour alerting.** The cap is hard in normal operation and
+across ordinary crashes and restarts. When state storage cannot be read or
+written, or the stored history is lost, the engine keeps alerting under the
+cap it enforces in memory, reports itself unhealthy, logs an error every run,
+and sends a storage notice to the system recipients (at most one per
+:data:`NOTICE_INTERVAL`, and when nothing can be recorded, one per process
+start). Provider-side limits are the final backstop.
 
 Windows and backoff use monotonic time. Wall-clock time is only stored; see
 :meth:`DeliveryEngine.__init__` for how it is interpreted after a restart.
@@ -53,6 +58,7 @@ from vrm_alert_relay.state import (
     DeliveryRecord,
     DeliveryStatus,
     JournalEntry,
+    SuppressionState,
     is_identifier,
 )
 from vrm_alert_relay.state.models import MAX_COUNTER, encode_time, is_message_id
@@ -81,6 +87,7 @@ if TYPE_CHECKING:
     from .clock import Clock
 
 __all__ = [
+    "NOTICE_INTERVAL",
     "STORAGE_NOTICE_TEXT",
     "DeliveryEngine",
     "DeliveryHealth",
@@ -93,9 +100,10 @@ logger = logging.getLogger(__name__)
 type DeliveryKey = tuple[str, str]
 
 DEFAULT_MAX_QUEUE: Final = 1000
+NOTICE_INTERVAL: Final = timedelta(days=1)
 STORAGE_NOTICE_TEXT: Final = (
-    "VRM Alert Relay: state storage is unavailable, so alerting is degraded and "
-    "further alerts are held until storage recovers. Check the relay."
+    "VRM Alert Relay: state storage is failing, so alerts continue under limits "
+    "kept in memory only. Check the relay."
 )
 
 
@@ -109,12 +117,14 @@ class DeliveryLimits:
     """Records kept in memory; the oldest finished records are dropped first."""
     summary_interval: timedelta = HOUR
     """Minimum time between two suppression summaries."""
+    summary_max_wait: timedelta = HOUR
+    """How long a summary gives way to real alerts before it takes the next free slot."""
 
     def __post_init__(self) -> None:
         if self.max_queue < 1 or self.max_records < self.max_queue:
             raise ValueError("limits need max_queue >= 1 and max_records >= max_queue")  # noqa: TRY003  # per-check validation message
-        if self.summary_interval <= timedelta(0):
-            raise ValueError("summary_interval must be positive")  # noqa: TRY003  # per-check validation message
+        if self.summary_interval <= timedelta(0) or self.summary_max_wait < timedelta(0):
+            raise ValueError("summary_interval must be positive and summary_max_wait >= 0")  # noqa: TRY003  # per-check validation message
 
 
 @dataclass(slots=True)
@@ -130,9 +140,10 @@ class RunReport:
     ambiguous: int = 0
     failed: int = 0
     suppressed: int = 0
-    held_for_storage: int = 0
-    """Real sends not attempted because no attempt record could be made durable."""
-    storage_notice_sent: bool = False
+    sent_unrecorded: int = 0
+    """Real provider calls made although no attempt record could be made durable."""
+    storage_notice: SendStatus | None = None
+    """The outcome of a storage notice sent in this run, if one was."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +162,15 @@ class DeliveryHealth:
     dry_run_sent_last_day: int
     dry_run_over_cap_total: int
     """Dry-run sends that the global cap would have held back."""
+
+
+@dataclass(slots=True)
+class _NoticeEpisode:
+    """A storage notice working through the system recipients in order."""
+
+    event_id: str
+    routes: tuple[Route, ...]
+    position: int = 0
 
 
 def _untrusted(value: object) -> object:
@@ -216,16 +236,22 @@ class DeliveryEngine:
         self._active: set[DeliveryKey] = set()
         self._due: dict[DeliveryKey, float] = {}
         self._dirty_records: set[DeliveryKey] = set()
+        self._journaled: dict[DeliveryKey, DeliveryRecord] = {}
         self._rule_states: dict[str, RuleState] = {}
         self._dirty_states: set[str] = set()
         self._new_attempts: deque[AttemptMark] = deque(maxlen=MAX_ATTEMPT_ROWS)
         self._expired: deque[AttemptKey] = deque(maxlen=MAX_EXPIRED)
         self._durable = True
-        self._history_known = True
-        self._unaccounted: dict[AttemptKey, tuple[float, bool]] = {}
+        self._complete = True
+        self._reset = False
+        self._suppression_read = True
         self._per_hour = rate_limits.global_per_hour
         self._per_day = rate_limits.global_per_day
-        self._notice_sent = False
+        self._live = RateLimiter(self._per_hour, self._per_day)
+        self._shadow = RateLimiter(self._per_hour, self._per_day)
+        self._notice_mono: float | None = None
+        self._notice: _NoticeEpisode | None = None
+        self._summary_wanted_mono: float | None = None
         self._suppressed_total = 0
         self._dry_run_over_cap = 0
 
@@ -234,75 +260,139 @@ class DeliveryEngine:
 
     def _restore(self, snapshot: Snapshot, wall: datetime, mono: float) -> None:
         self._rule_states.update(snapshot.rule_states)
-        self._rebuild_limiters(snapshot.attempts, wall, mono)
-        self._history_known = snapshot.attempts_complete
-        if not self._history_known:
+        self._restore_slots(snapshot.attempts, wall, mono)
+        self._complete = snapshot.complete
+        self._suppression_read = snapshot.suppression_read
+        if not self._complete:
             logger.error(
-                "the send-attempt history could not be read; real alerts are held until it can",
-                extra={"event": "delivery.attempt_history_unknown"},
+                "stored state could not be read; alerting continues with the cap kept in memory",
+                extra={"event": "delivery.history_unknown"},
             )
         state = snapshot.suppression
         self._suppression = state
-        self._last_summary_mono = (
-            None
-            if state.last_summary_at is None
-            else mono - max(_seconds(wall - state.last_summary_at), 0.0)
-        )
-        recovered = 0
-        for record in snapshot.deliveries:
-            if record.status is DeliveryStatus.IN_FLIGHT:
-                # The process stopped between recording the attempt and its
-                # outcome: the message may or may not have been sent.
-                self._put(
-                    replace(record, status=DeliveryStatus.AMBIGUOUS, next_attempt_at=wall),
-                    mono,
-                )
-                recovered += 1
-                continue
-            self._records[record.key] = record
-            if not record.status.terminal:
-                self._active.add(record.key)
-                self._due[record.key] = self._restored_due(record, wall, mono)
+        self._last_summary_mono = self._mono_of(state.last_summary_at, wall, mono)
+        if state.count:
+            self._summary_wanted_mono = self._mono_of(state.since, wall, mono) or mono
+        recovered = sum(self._adopt(record, wall, mono) for record in snapshot.deliveries)
         if recovered:
             logger.warning(
                 "found deliveries interrupted mid-send; reconciling before any retry",
                 extra={"event": "delivery.recovered_in_flight", "count": recovered},
             )
+        self._adopt_open_summary()
+        if snapshot.reset:
+            self._start_afresh(snapshot)
         self._prune_memory()
         if self._dirty_records:
-            self.flush()
+            self._save()
 
-    def _rebuild_limiters(
-        self, marks: tuple[AttemptMark, ...], wall: datetime, mono: float
-    ) -> None:
-        slots: dict[AttemptKey, tuple[float, bool]] = {}
+    @staticmethod
+    def _mono_of(when: datetime | None, wall: datetime, mono: float) -> float | None:
+        """Monotonic time for a stored wall-clock time; a future one counts as now."""
+        return None if when is None else mono - max(_seconds(wall - when), 0.0)
+
+    def _restore_slots(self, marks: Iterable[AttemptMark], wall: datetime, mono: float) -> None:
+        """Give stored attempts slots by their age; slots already held do not move."""
+        slots: list[tuple[float, AttemptKey]] = []
         for mark in marks:
             age = max(_seconds(wall - mark.at), 0.0)
-            if age < _seconds(DAY):
-                slots[mark.key] = (mono - age, mark.live)
-        slots.update(self._unaccounted)
-        live = [(at, key) for key, (at, is_live) in slots.items() if is_live]
-        shadow = [(at, key) for key, (at, is_live) in slots.items() if not is_live]
-        self._live = RateLimiter(self._per_hour, self._per_day, live)
-        self._shadow = RateLimiter(self._per_hour, self._per_day, shadow)
+            if mark.live and age < _seconds(DAY):
+                slots.append((mono - age, mark.key))
+        self._live.restore(slots)
 
-    def _reload_history(self) -> None:
-        wall, mono = self._clock.wall(), self._clock.monotonic()
-        marks = self._store.reload_attempts(wall)
-        if marks is None:
+    def _adopt(self, record: DeliveryRecord, wall: datetime, mono: float) -> bool:
+        """Take a stored record into memory; True if it was interrupted mid-send."""
+        current = self._records.get(record.key)
+        if current is not None and current.progress() >= record.progress():
+            return False
+        if record.kind is DeliveryKind.NOTICE:
+            # History only: a storage notice is never sent again after a restart.
+            self._records[record.key] = record
+            noticed = self._mono_of(record.created_at, wall, mono)
+            if noticed is not None and mono - noticed < _seconds(NOTICE_INTERVAL):
+                self._notice_mono = max(noticed, self._notice_mono or noticed)
+            return False
+        if record.status is DeliveryStatus.IN_FLIGHT:
+            # The process stopped between recording the attempt and its
+            # outcome: the message may or may not have been sent.
+            self._put(replace(record, status=DeliveryStatus.AMBIGUOUS, next_attempt_at=wall), mono)
+            return True
+        self._records[record.key] = record
+        if not record.status.terminal:
+            self._active.add(record.key)
+            self._due[record.key] = self._restored_due(record, wall, mono)
+        return False
+
+    def _adopt_open_summary(self) -> None:
+        """Resume a summary whose start only the journal recorded."""
+        if self._suppression.summary_event_id is not None:
             return
-        self._rebuild_limiters(marks, wall, mono)
-        self._history_known = True
-        self._unaccounted.clear()
-        logger.warning(
-            "the send-attempt history is readable again",
-            extra={"event": "delivery.attempt_history_restored"},
+        open_summaries = sorted(
+            (
+                self._records[key]
+                for key in self._active
+                if self._records[key].kind is DeliveryKind.SUMMARY and self._records[key].covers
+            ),
+            key=lambda record: record.created_at,
         )
+        if open_summaries:
+            newest = open_summaries[-1]
+            self._suppression = replace(
+                self._suppression,
+                summary_event_id=newest.event_id,
+                summary_count=newest.covers,
+                last_summary_at=newest.created_at,
+            )
+
+    def _start_afresh(self, snapshot: Snapshot) -> None:
+        """The database was corrupt and replaced: write everything held into the new one."""
+        self._reset = True
+        self._dirty_records.update(self._records)
+        self._dirty_states.update(self._rule_states)
+        self._new_attempts.extend(mark for mark in snapshot.attempts if mark.live)
+
+    def _reload(self) -> None:
+        """Merge stored state that could not be read before, once it can."""
+        wall, mono = self._clock.wall(), self._clock.monotonic()
+        snapshot = self._store.reload(wall)
+        if snapshot is None:
+            return
+        self._restore_slots(snapshot.attempts, wall, mono)
+        for record in snapshot.deliveries:
+            self._adopt(record, wall, mono)
+        for rule_id, state in snapshot.rule_states.items():
+            self._rule_states.setdefault(rule_id, state)
+        if not self._suppression_read and snapshot.suppression_read:
+            self._merge_suppression(snapshot.suppression, wall, mono)
+            self._suppression_read = True
+        self._adopt_open_summary()
+        if snapshot.reset:
+            self._start_afresh(snapshot)
+        self._complete = True
+        logger.warning(
+            "stored state is readable again and was merged",
+            extra={"event": "delivery.history_restored"},
+        )
+
+    def _merge_suppression(self, stored: SuppressionState, wall: datetime, mono: float) -> None:
+        """Add stored counts that this process has not seen to its own."""
+        current = self._suppression
+        count = min(current.count + stored.count, MAX_COUNTER)
+        sinces = [when for when in (current.since, stored.since) if when is not None]
+        summaries = [when for when in (current.last_summary_at, stored.last_summary_at) if when]
+        keep_current = current.summary_event_id is not None
+        self._suppression = SuppressionState(
+            count=count,
+            since=min(sinces) if sinces and count else None,
+            last_summary_at=max(summaries) if summaries else None,
+            summary_event_id=current.summary_event_id if keep_current else stored.summary_event_id,
+            summary_count=current.summary_count if keep_current else stored.summary_count,
+        )
+        if count and self._summary_wanted_mono is None:
+            self._summary_wanted_mono = self._mono_of(self._suppression.since, wall, mono) or mono
 
     def _consume(self, mark: AttemptMark, mono: float) -> None:
         (self._live if mark.live else self._shadow).consume(mark.key, mono)
-        if not self._history_known:
-            self._unaccounted[mark.key] = (mono, mark.live)
 
     def _restored_due(self, record: DeliveryRecord, wall: datetime, mono: float) -> float:
         if record.next_attempt_at is None:
@@ -371,7 +461,7 @@ class DeliveryEngine:
                     continue
                 if len(self._active) >= self._limits.max_queue:
                     status = DeliveryStatus.SUPPRESSED
-                    self._count_suppressed(wall)
+                    self._count_suppressed()
                     held += 1
                 else:
                     status = DeliveryStatus.PENDING
@@ -399,7 +489,7 @@ class DeliveryEngine:
         for rule_id, state in rule_states.items():
             self._set_rule_state(rule_id, state)
         self._prune_memory()
-        self.flush()
+        self._save()
         return queued
 
     def _routes_for(self, notification: object) -> tuple[Route, ...]:
@@ -443,32 +533,40 @@ class DeliveryEngine:
     # Delivery -------------------------------------------------------------
 
     def run_due(self) -> RunReport:
-        """Process due deliveries: real alerts first, then any summary."""
+        """Process due deliveries: real alerts first, then any summary, then any notice."""
         report = RunReport()
-        if not self._history_known:
-            self._reload_history()
+        if not self._complete:
+            self._reload()
         if not self._durable and self.flush():
             self._set_durable(durable=True)
+        overdue = self._summary_overdue()
+        if overdue:
+            self._process_summary(report)
         for record in self._due_records(DeliveryKind.EVENT):
             self._process(record, report)
-        if not self._due_records(DeliveryKind.EVENT):
-            self._maybe_open_summary()
-            for record in self._due_records(DeliveryKind.SUMMARY):
-                self._process(record, report)
-        self._maybe_send_storage_notice(report)
+        if not overdue and not self._due_records(DeliveryKind.EVENT):
+            self._process_summary(report)
+        self._storage_notice(report)
         if report.suppressed:
             logger.warning(
                 "global rate limit reached; deliveries held back",
                 extra={"event": "delivery.suppressed", "count": report.suppressed},
             )
-        if not (self._durable and self._history_known):
+        if self._degraded():
             logger.error(
-                "state storage is unavailable; real alerts are held until it recovers",
-                extra={"event": "delivery.no_durable_accounting", "held": report.held_for_storage},
+                "state storage is failing; alerting continues under the cap kept in memory",
+                extra={
+                    "event": "delivery.storage_degraded",
+                    "sent_unrecorded": report.sent_unrecorded,
+                },
             )
         self._prune_memory()
-        self.flush()
+        self._save()
         return report
+
+    def _degraded(self) -> bool:
+        """Whether accounting is not fully durable: the case for a storage notice."""
+        return not (self._durable and self._complete) or self._reset
 
     def _due_records(self, kind: DeliveryKind) -> list[DeliveryRecord]:
         mono = self._clock.monotonic()
@@ -481,7 +579,7 @@ class DeliveryEngine:
             due, key=lambda record: (record.created_at, record.event_id, record.recipient)
         )
 
-    def _process(  # noqa: C901  # one decision ladder per delivery
+    def _process(  # one decision ladder per delivery
         self, record: DeliveryRecord, report: RunReport
     ) -> None:
         route = self._routing.route(record.recipient)
@@ -513,17 +611,24 @@ class DeliveryEngine:
                 },
             )
             return
-        mono, wall = self._clock.monotonic(), self._clock.wall()
-        if live and not self._history_known:
-            # Without the stored history the cap cannot be enforced (ADR 0002).
-            report.held_for_storage += 1
-            return
+        mono = self._clock.monotonic()
         if live and not self._live.available(mono):
             self._finish(record, DeliveryStatus.SUPPRESSED)
             if record.kind is DeliveryKind.EVENT:
-                self._count_suppressed(wall)
+                self._count_suppressed()
             report.suppressed += 1
             return
+        in_flight = self._begin_attempt(record, report, live=live)
+        result = self._send(provider, message, route.recipient, record)
+        self._apply(in_flight, result, report)
+        if live:
+            self._save()
+
+    def _begin_attempt(
+        self, record: DeliveryRecord, report: RunReport, *, live: bool
+    ) -> DeliveryRecord:
+        """Record an attempt (durably for a real send, best effort) and take its slot."""
+        mono, wall = self._clock.monotonic(), self._clock.wall()
         in_flight = replace(
             record,
             status=DeliveryStatus.IN_FLIGHT,
@@ -534,33 +639,27 @@ class DeliveryEngine:
         )
         mark = AttemptMark(record.event_id, record.recipient, in_flight.attempts, wall, live)
         self._put(in_flight, mono)
-        self._new_attempts.append(mark)
         if live:
-            if not self._make_durable(in_flight):
-                self._new_attempts.pop()
-                self._put(record, mono)
-                report.held_for_storage += 1
-                return
+            self._new_attempts.append(mark)
+            if self._make_durable(in_flight):
+                report.sent += 1
+            else:
+                report.sent_unrecorded += 1
             self._consume(mark, mono)
-            report.sent += 1
         else:
             if not self._shadow.available(mono):
                 self._dry_run_over_cap = min(self._dry_run_over_cap + 1, MAX_COUNTER)
             self._consume(mark, mono)
             report.dry_run_sent += 1
-        result = self._send(provider, message, route.recipient, record)
-        outcome = self._apply(in_flight, result, report)
-        if live:
-            self._persist(outcome)
-
-    def _persist(self, record: DeliveryRecord) -> None:
-        """Best effort: SQLite, or else the journal, so a restart does not resend."""
-        if not self.flush():
-            self._store.journal((JournalEntry(record, attempt=False),))
+        return in_flight
 
     def _make_durable(self, in_flight: DeliveryRecord) -> bool:
-        """Record the attempt in SQLite, or else in the journal (R15, ADR 0002)."""
-        durable = self.flush() or self._store.journal((JournalEntry(in_flight, attempt=True),))
+        """Record the attempt in SQLite, or else in the journal (R15, ADR 0002).
+
+        When neither can record it the message is still sent: the cap kept
+        in memory still applies, and alerting comes first.
+        """
+        durable = self._save(attempt=in_flight)
         self._set_durable(durable=durable)
         return durable
 
@@ -572,49 +671,79 @@ class DeliveryEngine:
             )
         elif not durable and self._durable:
             logger.error(
-                "cannot record a send attempt durably; holding real alerts",
+                "cannot record send attempts; sending anyway under the cap kept in memory",
                 extra={"event": "delivery.durable_accounting_lost"},
             )
         self._durable = durable
 
-    def _maybe_send_storage_notice(self, report: RunReport) -> None:
-        """While nothing can be recorded, send one notice per process, unaccounted."""
-        if (self._durable and self._history_known) or self._notice_sent:
-            return
-        routes = self._routing.system_routes
-        if not routes:
-            return
-        route = next((r for r in routes if r.mode is DeliveryMode.LIVE), routes[0])
-        live = route.mode is DeliveryMode.LIVE
+    def _storage_notice(self, report: RunReport) -> None:
+        """Tell the system recipients, in order, that storage is failing.
+
+        At most one notice per :data:`NOTICE_INTERVAL`, remembered in storage
+        when anything can record it. Recipients are tried in order (live ones
+        first) until one reports the notice delivered or its outcome is
+        unknown; only a definite failure moves on to the next. The notice
+        waits for a free slot in the cap.
+        """
         mono, wall = self._clock.monotonic(), self._clock.wall()
-        if live and not self._live.available(mono):
-            return
-        self._notice_sent = True
-        event_id = f"storage_{int(wall.timestamp())}"
-        mark = AttemptMark(event_id, route.name, 1, wall, live)
-        self._consume(mark, mono)
-        self._new_attempts.append(mark)
-        record = DeliveryRecord(
-            event_id=event_id,
-            recipient=route.name,
-            kind=DeliveryKind.SUMMARY,
-            status=DeliveryStatus.IN_FLIGHT,
-            text=STORAGE_NOTICE_TEXT,
-            attempts=1,
-            created_at=wall,
-            updated_at=wall,
-        )
-        self._send(
-            self._provider_for(route),
-            Message(delivery_id(event_id, route.name), STORAGE_NOTICE_TEXT),
-            route.recipient,
-            record,
-        )
-        report.storage_notice_sent = True
-        logger.error(
-            "sent the one storage-unavailable notice for this process",
-            extra={"event": "delivery.storage_notice", **self._log_ids(record)},
-        )
+        if self._notice is None:
+            recent = self._notice_mono is not None and mono - self._notice_mono < _seconds(
+                NOTICE_INTERVAL
+            )
+            routes = sorted(
+                self._routing.system_routes, key=lambda route: route.mode is not DeliveryMode.LIVE
+            )
+            if not self._degraded() or recent or not routes:
+                return
+            digest = hashlib.sha256(f"notice|{encode_time(wall)}|{mono!r}".encode()).hexdigest()
+            self._notice = _NoticeEpisode(f"notice_{digest[:32]}", tuple(routes))
+            self._notice_mono = mono
+        episode = self._notice
+        while episode.position < len(episode.routes):
+            route = episode.routes[episode.position]
+            live = route.mode is DeliveryMode.LIVE
+            if live and not self._live.available(mono):
+                return  # Wait for the next free slot.
+            record = DeliveryRecord(
+                event_id=episode.event_id,
+                recipient=route.name,
+                kind=DeliveryKind.NOTICE,
+                status=DeliveryStatus.PENDING,
+                text=STORAGE_NOTICE_TEXT,
+                attempts=0,
+                created_at=wall,
+                updated_at=wall,
+            )
+            in_flight = self._begin_attempt(record, report, live=live)
+            result = self._send(
+                self._provider_for(route),
+                Message(delivery_id(record.event_id, route.name), STORAGE_NOTICE_TEXT),
+                route.recipient,
+                record,
+            )
+            status = {
+                SendStatus.DELIVERED: DeliveryStatus.DELIVERED,
+                SendStatus.AMBIGUOUS: DeliveryStatus.AMBIGUOUS,
+            }.get(result.status, DeliveryStatus.FAILED)
+            self._put(
+                replace(in_flight, status=status, updated_at=self._clock.wall()),
+                self._clock.monotonic(),
+            )
+            report.storage_notice = result.status
+            logger.error(
+                "sent a storage notice",
+                extra={
+                    "event": "delivery.storage_notice",
+                    "outcome": result.status.value,
+                    **self._log_ids(record),
+                },
+            )
+            if live:
+                self._save()
+            if status is not DeliveryStatus.FAILED:
+                break
+            episode.position += 1
+        self._notice = None
 
     def _provider_for(self, route: Route) -> Provider:
         if route.mode is DeliveryMode.LIVE:
@@ -654,7 +783,7 @@ class DeliveryEngine:
         )
         if outcome is ReconcileStatus.DELIVERED:
             self._finish(record, DeliveryStatus.DELIVERED)
-            self._persist(self._records[record.key])
+            self._save()
             return True
         return False
 
@@ -727,14 +856,30 @@ class DeliveryEngine:
 
     # Suppression and summaries --------------------------------------------
 
-    def _count_suppressed(self, wall: datetime) -> None:
+    def _count_suppressed(self) -> None:
         state = self._suppression
         self._suppression = replace(
             state,
             count=min(state.count + 1, MAX_COUNTER),
-            since=state.since or wall,
+            since=state.since or self._clock.wall(),
         )
+        if self._summary_wanted_mono is None:
+            self._summary_wanted_mono = self._clock.monotonic()
         self._suppressed_total = min(self._suppressed_total + 1, MAX_COUNTER)
+
+    def _summary_overdue(self) -> bool:
+        """Whether a summary has given way to real alerts for long enough."""
+        wanted = self._summary_wanted_mono
+        return (
+            self._suppression.count > 0
+            and wanted is not None
+            and self._clock.monotonic() - wanted >= _seconds(self._limits.summary_max_wait)
+        )
+
+    def _process_summary(self, report: RunReport) -> None:
+        self._maybe_open_summary()
+        for record in self._due_records(DeliveryKind.SUMMARY):
+            self._process(record, report)
 
     def _maybe_open_summary(self) -> None:
         state = self._suppression
@@ -770,6 +915,7 @@ class DeliveryEngine:
                     created_at=wall,
                     updated_at=wall,
                     next_attempt_at=wall,
+                    covers=state.count,
                 ),
                 mono,
             )
@@ -784,13 +930,15 @@ class DeliveryEngine:
         if record.event_id != state.summary_event_id:
             return
         if record.status is DeliveryStatus.DELIVERED and state.summary_count:
-            remaining = max(state.count - state.summary_count, 0)
+            remaining = max(state.count - record.covers, 0)
             state = replace(
                 state,
                 count=remaining,
                 since=None if remaining == 0 else state.since,
                 summary_count=0,
             )
+            # Anything still unreported starts its own wait for a summary.
+            self._summary_wanted_mono = None if remaining == 0 else self._clock.monotonic()
         if not any(key[0] == record.event_id for key in self._active):
             # Every delivery of this summary has finished. If none was
             # delivered, the count stands and a later summary reports it.
@@ -802,6 +950,8 @@ class DeliveryEngine:
     def _put(self, record: DeliveryRecord, due: float) -> None:
         self._records[record.key] = record
         self._dirty_records.add(record.key)
+        if record.kind is DeliveryKind.NOTICE:
+            return  # Sent inline by _storage_notice, never queued.
         if record.status.terminal:
             self._active.discard(record.key)
             self._due.pop(record.key, None)
@@ -822,15 +972,20 @@ class DeliveryEngine:
         if excess <= 0:
             return
         finished = sorted(
-            (record for record in self._records.values() if record.status.terminal),
+            (
+                record
+                for record in self._records.values()
+                if record.status.terminal or record.kind is DeliveryKind.NOTICE
+            ),
             key=lambda record: (record.updated_at, record.event_id, record.recipient),
         )
         for record in finished[:excess]:
             del self._records[record.key]
             self._dirty_records.discard(record.key)
+            self._journaled.pop(record.key, None)
 
     def flush(self) -> bool:
-        """Write unsaved changes; on failure they are kept and retried next time."""
+        """Write unsaved changes to SQLite; on failure they are kept and retried next time."""
         self._expired.extend(self._live.take_expired())
         self._expired.extend(self._shadow.take_expired())
         changes = Changes(
@@ -848,8 +1003,36 @@ class DeliveryEngine:
             return False
         self._dirty_states.clear()
         self._dirty_records.clear()
+        self._journaled.clear()
         self._new_attempts.clear()
         self._expired.clear()
+        return True
+
+    def _save(self, attempt: DeliveryRecord | None = None) -> bool:
+        """Write to SQLite, or else journal what changed; True if it is durable.
+
+        The journal gets every changed delivery not yet journaled in its
+        current version, so suppression and summary acknowledgements survive
+        a restart, keyed by delivery identity. ``attempt`` is journaled as a
+        send attempt, which also holds its slot in the cap after a restart.
+        """
+        if self.flush():
+            return True
+        entries = [
+            JournalEntry(record, attempt=False)
+            for key in sorted(self._dirty_records)
+            if (record := self._records.get(key)) is not None
+            and self._journaled.get(key) != record
+            and (attempt is None or key != attempt.key)
+        ]
+        if attempt is not None:
+            entries.append(JournalEntry(attempt, attempt=True))
+        if not entries:
+            return True
+        if not self._store.journal(tuple(entries), self._clock.wall()):
+            return False
+        for entry in entries:
+            self._journaled[entry.record.key] = entry.record
         return True
 
     # Health -----------------------------------------------------------------
@@ -861,7 +1044,7 @@ class DeliveryEngine:
         return DeliveryHealth(
             persistence_healthy=self._store.healthy,
             persistence_error=self._store.error,
-            durable_accounting=self._durable and self._history_known,
+            durable_accounting=not self._degraded(),
             queued=len(self._active),
             suppressed_pending=self._suppression.count,
             suppressed_total=self._suppressed_total,

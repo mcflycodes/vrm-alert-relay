@@ -29,6 +29,7 @@ from delivery_fakes import (
 
 from vrm_alert_relay.delivery import (
     STORAGE_NOTICE_TEXT,
+    DeliveryLimits,
     Notification,
     RecipientTarget,
     ReconcileStatus,
@@ -240,7 +241,11 @@ def test_real_alerts_get_capacity_before_the_summary(tmp_path: Path) -> None:
     clock = FakeClock()
     provider = FakeProvider()
     engine = make_engine(
-        StateStore(tmp_path), clock=clock, config=make_config(per_hour=2), voipms=provider
+        StateStore(tmp_path),
+        clock=clock,
+        config=make_config(per_hour=2),
+        voipms=provider,
+        limits=DeliveryLimits(summary_max_wait=timedelta(hours=3)),
     )
     engine.accept_cycle(rule_states={}, notifications=[rule_note(n) for n in range(5)])
     engine.run_due()
@@ -255,6 +260,28 @@ def test_real_alerts_get_capacity_before_the_summary(tmp_path: Path) -> None:
     assert summaries(provider) == [
         "VRM Alert Relay: 3 alerts held back by the global rate limit since 2035-01-01 00:00 UTC."
     ]
+
+
+def test_a_summary_waits_at_most_an_hour_for_real_alerts(tmp_path: Path) -> None:
+    """M7: under a steady stream of real alerts, the summary still goes out within an hour."""
+    clock = FakeClock()
+    provider = FakeProvider()
+    engine = make_engine(
+        StateStore(tmp_path), clock=clock, config=make_config(per_hour=2), voipms=provider
+    )
+    n = 0
+    for _ in range(13):  # two new alerts every 10 minutes for two hours
+        engine.accept_cycle(rule_states={}, notifications=[rule_note(n), rule_note(n + 1)])
+        n += 2
+        engine.run_due()
+        clock.advance(timedelta(minutes=10))
+    # Slots free up at 0:00, 1:00 and 2:00. At 1:00 the first held alert has
+    # waited only 50 minutes, so real alerts take both slots; at 2:00 the
+    # summary has waited over an hour and takes the first free slot.
+    texts = provider.texts()
+    assert len(summaries(provider)) == 1
+    assert texts.index(summaries(provider)[0]) == 4
+    assert summaries(provider)[0].startswith("VRM Alert Relay: 20 alerts held back")
 
 
 def test_at_most_one_summary_per_hour_while_a_flood_continues(tmp_path: Path) -> None:
@@ -415,9 +442,10 @@ def test_sqlite_write_failure_falls_back_to_the_journal_across_restarts(tmp_path
         assert connection.execute("SELECT count(*) FROM send_attempt").fetchone() == (1,)
 
 
-def test_no_durable_storage_sends_only_one_notice_per_process(
+def test_unrecordable_sends_still_go_out_with_one_notice_per_process_start(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """R1 and B3: nothing can record an attempt, so alerts go out under the in-memory cap."""
     clock = FakeClock()
     state_dir = tmp_path / "state"
     state_dir.mkdir()
@@ -438,50 +466,56 @@ def test_no_durable_storage_sends_only_one_notice_per_process(
                 )
                 with caplog.at_level(logging.ERROR, logger="vrm_alert_relay.delivery"):
                     report = engine.run_due()
-                assert report.sent == 0
-                assert report.held_for_storage == 2 * (cycle + 1)
+                assert (report.sent, report.sent_unrecorded) == (0, 2 + (cycle == 0))
                 clock.advance(timedelta(minutes=1))
             assert engine.health().durable_accounting is False
+            assert engine.health().sent_last_hour == 9  # the in-memory cap still counts
             store.close()
     finally:
         state_dir.chmod(0o700)
-    assert provider.texts() == [STORAGE_NOTICE_TEXT] * 3
+    texts = provider.texts()
+    assert texts.count(STORAGE_NOTICE_TEXT) == 3  # one per process start (accepted, ADR 0002)
+    assert len(texts) == 3 * 9
     owner = make_config().recipients["owner_sms"]
-    assert all(sent.recipient == owner for sent in provider.sent)
+    notices = [sent for sent in provider.sent if sent.message.text == STORAGE_NOTICE_TEXT]
+    assert all(sent.recipient == owner for sent in notices)
     logged = [r.__dict__.get("event") for r in caplog.records]
-    assert logged.count("delivery.no_durable_accounting") == 12
+    assert logged.count("delivery.storage_degraded") == 12
 
 
 def test_failed_initial_load_is_not_an_empty_database(tmp_path: Path) -> None:
+    """R2: an unreadable history is left untouched, alerts continue, and it is merged later."""
     clock = FakeClock()
     provider = FakeProvider()
     store = StateStore(tmp_path)
-    engine = make_engine(store, clock=clock, voipms=provider)
+    engine = make_engine(store, clock=clock, config=make_config(per_hour=2), voipms=provider)
     engine.accept_cycle(rule_states={}, notifications=[rule_note(1)])
     engine.run_due()
     store.close()
     before = (tmp_path / DB_FILENAME).read_bytes()
 
-    switch = FailSwitch(error="database disk image is malformed", only="FROM send_attempt")
+    switch = FailSwitch(error="disk I/O error", only="FROM send_attempt")
     switch.on = True
-    config = make_config(per_hour=1)
+    config = make_config(per_hour=2)
     engine = make_engine(flaky_store(tmp_path, switch), clock=clock, config=config, voipms=provider)
     assert engine.health().persistence_healthy is False
     assert engine.health().durable_accounting is False
-    assert (tmp_path / DB_FILENAME).read_bytes() == before
-    # The cap cannot be enforced without the history: real alerts wait, one notice goes out.
+    # Real alerts are never held for an unknown history; a notice says why limits are weaker.
     engine.accept_cycle(rule_states={}, notifications=[rule_note(2)])
     report = engine.run_due()
-    assert (report.sent, report.held_for_storage, report.storage_notice_sent) == (0, 1, True)
-    assert provider.texts()[-1] == STORAGE_NOTICE_TEXT
-    # Once the history can be read, the earlier send fills the cap again.
+    assert (report.sent, report.storage_notice) == (2, SendStatus.DELIVERED)  # alert and notice
+    assert provider.texts()[-2:] == ["Freezer warming", STORAGE_NOTICE_TEXT]
+    assert (tmp_path / DB_FILENAME).read_bytes() == before  # untouched while unreadable
+    # Once the history can be read it is merged: the earlier send counts again.
     switch.on = False
-    report = engine.run_due()
-    assert (report.sent, report.suppressed) == (0, 1)
+    engine.run_due()
     assert engine.health().durable_accounting is True
-    clock.advance(timedelta(hours=1, seconds=1))
+    assert engine.health().sent_last_hour == 3  # the documented overshoot, bounded by one process
     engine.accept_cycle(rule_states={}, notifications=[rule_note(3)])
-    assert engine.run_due().sent == 1
+    assert engine.run_due().suppressed == 1
+    clock.advance(timedelta(hours=1, seconds=1))
+    engine.accept_cycle(rule_states={}, notifications=[rule_note(4)])
+    assert engine.run_due().sent >= 1
 
 
 def test_persistence_failure_keeps_alerting_with_in_memory_dedupe(tmp_path: Path) -> None:
@@ -512,9 +546,8 @@ def test_corrupt_attempt_rows_keep_their_slots(tmp_path: Path) -> None:
     setup.close()
     with closing(sqlite3.connect(tmp_path / DB_FILENAME, autocommit=True)) as connection:
         connection.executemany(
-            "INSERT INTO send_attempt (event_id, recipient, attempt, at, live) "
-            "VALUES (?, ?, ?, ?, ?)",
-            [("evt_a", "owner_sms", 1, "garbage", 1), ("bad id", "owner_sms", 1, "x", 1)],
+            "INSERT INTO send_attempt (event_id, recipient, attempt, at) VALUES (?, ?, ?, ?)",
+            [("evt_a", "owner_sms", 1, "garbage"), ("bad id", "owner_sms", 1, "x")],
         )
     provider = FakeProvider()
     engine = make_engine(
@@ -526,8 +559,9 @@ def test_corrupt_attempt_rows_keep_their_slots(tmp_path: Path) -> None:
     clock.advance(timedelta(hours=1, seconds=1))
     engine.accept_cycle(rule_states={}, notifications=[rule_note(2)])
     assert engine.run_due().sent == 2
-    assert provider.texts()[0] == "Freezer warming"  # the alert first, then the summary
+    # The summary has waited an hour, so it takes the first free slot (M7).
     assert summaries(provider)[0].startswith("VRM Alert Relay: 1 alert held back")
+    assert provider.texts() == [summaries(provider)[0], "Freezer warming"]
 
 
 def test_corrupt_pending_deliveries_are_recovered_not_dropped(tmp_path: Path) -> None:

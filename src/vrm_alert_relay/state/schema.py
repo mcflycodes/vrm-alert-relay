@@ -9,7 +9,9 @@ if TYPE_CHECKING:
 
 # Each entry migrates the schema from version ``index`` to ``index + 1``; the
 # version is kept in ``PRAGMA user_version``. Append new migrations; never
-# edit a released one.
+# edit a released one. (Version 1 was changed in place before any release.)
+# ``send_attempt`` holds real provider calls only: dry-run sends are never
+# stored, so they can never displace evidence of a real one.
 MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
     (
         """
@@ -33,6 +35,7 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
             next_attempt_at TEXT,
             last_attempt_at TEXT,
             provider_message_id TEXT,
+            covers INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (event_id, recipient)
         ) STRICT
         """,
@@ -44,7 +47,6 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
             recipient TEXT NOT NULL,
             attempt INTEGER NOT NULL,
             at TEXT NOT NULL,
-            live INTEGER NOT NULL,
             UNIQUE (event_id, recipient, attempt)
         ) STRICT
         """,
