@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from vrm_alert_relay.config import ConfigError
-from vrm_alert_relay.config.errors import format_path, mask_digits
+from vrm_alert_relay.config.errors import format_path, mask_digits, sanitize_identifier
 
 
 @pytest.mark.parametrize(
@@ -17,6 +17,13 @@ from vrm_alert_relay.config.errors import format_path, mask_digits
         (("recipients", "Bad Name", "[key]"), 'recipients["Bad Name"] (key)'),
         (("recipients", "line\nbreak"), 'recipients["line\\nbreak"]'),
         (("recipients", "+1 (202) 555-0142"), 'recipients["***0142"]'),
+        (("recipients", "a2025550142"), 'recipients["a***0142"]'),
+        (
+            ("recipients", "owner_2025550142", "phone"),
+            'recipients["owner_***0142"].phone',
+        ),
+        (("rules", 0, "id_12345"), 'rules[0]["id_***2345"]'),
+        (("rules", 0, "id_1234"), "rules[0].id_1234"),
         (("k", "x" * 100), f'k["{"x" * 64}..."]'),
         (("k", ""), 'k[""]'),
     ],
@@ -38,6 +45,19 @@ def test_format_path(loc: tuple[str | int, ...], expected: str) -> None:
 )
 def test_mask_digits(text: str, expected: str) -> None:
     assert mask_digits(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("owner_sms", "owner_sms"),
+        ("x2025550142y", "x***0142y"),
+        ("1" * 100, "***1111"),
+        ("y" * 70, "y" * 64 + "..."),
+    ],
+)
+def test_sanitize_identifier(text: str, expected: str) -> None:
+    assert sanitize_identifier(text) == expected
 
 
 def test_config_error_rendering() -> None:

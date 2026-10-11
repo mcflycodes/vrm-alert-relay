@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Iterable, Sequence
 
-__all__ = ["ConfigError", "format_path", "mask_digits"]
+__all__ = ["ConfigError", "format_path", "mask_digits", "sanitize_identifier"]
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
 _DIGIT_RUN = re.compile(r"\+?[0-9][0-9 ().-]*[0-9]")
@@ -16,9 +16,9 @@ _MAX_KEY_DISPLAY = 64
 class ConfigError(Exception):
     """The configuration is invalid.
 
-    ``problems`` holds one human-readable line per problem, each prefixed with the
-    YAML path it refers to. Problems never contain secret values or complete
-    phone numbers.
+    ``problems`` holds one human-readable line per problem: a sanitized YAML path
+    and a fixed message. Problems never contain configuration values, secret
+    file contents, or complete phone numbers.
     """
 
     def __init__(self, problems: Iterable[str]) -> None:
@@ -42,11 +42,21 @@ def mask_digits(text: str) -> str:
     return _DIGIT_RUN.sub(_mask, text)
 
 
+def sanitize_identifier(text: str) -> str:
+    """Make an operator-supplied key safe to show: mask phone-shaped digit runs
+    and truncate. Configuration values never pass through here; they are not shown.
+    """
+    masked = mask_digits(text)
+    if len(masked) > _MAX_KEY_DISPLAY:
+        masked = masked[:_MAX_KEY_DISPLAY] + "..."
+    return masked
+
+
 def _format_key(key: str) -> str:
-    if _IDENTIFIER.fullmatch(key):
-        return f".{key}"
-    shown = key if len(key) <= _MAX_KEY_DISPLAY else key[:_MAX_KEY_DISPLAY] + "..."
-    return f"[{json.dumps(mask_digits(shown))}]"
+    shown = sanitize_identifier(key)
+    if _IDENTIFIER.fullmatch(shown):
+        return f".{shown}"
+    return f"[{json.dumps(shown)}]"
 
 
 def format_path(loc: Sequence[str | int]) -> str:

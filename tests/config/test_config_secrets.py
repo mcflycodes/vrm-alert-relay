@@ -22,6 +22,7 @@ from vrm_alert_relay.config import (
     RelaySecrets,
     Secret,
     SecretFileError,
+    SecretTypeError,
     load_secrets,
     read_secret_file,
 )
@@ -120,10 +121,46 @@ def test_secret_in_pydantic_models_is_masked(fake_secret: str) -> None:
     assert secrets.vrm_token.reveal() == fake_secret
 
 
-def test_pydantic_refuses_plain_strings_as_secrets(fake_secret: str) -> None:
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda s: RelaySecrets(vrm_token=s),
+        lambda s: RelaySecrets(vrm_token=Secret("fake-other"), voipms_password=s),
+        lambda s: RelaySecrets(unexpected=s),
+        lambda s: RelaySecrets.model_validate({"homeassistant_token": s}),
+        lambda s: RelaySecrets.model_validate([s]),
+        lambda s: RelaySecrets.model_validate_json(json.dumps({"vrm_token": s})),
+        lambda s: RelaySecrets(vrm_token=s.encode()),
+    ],
+)
+def test_plain_values_are_refused_before_pydantic_validation(
+    fake_secret: str, build: Callable[[str], Any]
+) -> None:
+    with pytest.raises(SecretTypeError) as caught:
+        build(fake_secret)
+    error = caught.value
+    assert str(error) == "secret fields accept only Secret values read from files"
+    assert not isinstance(error, pydantic.ValidationError)
+    assert error.__cause__ is None and error.__context__ is None
+    assert fake_secret not in repr(error)
+
+
+def test_secret_field_validator_refuses_plain_values(fake_secret: str) -> None:
+    class Holder(pydantic.BaseModel):
+        token: Secret
+
+    with pytest.raises(SecretTypeError):
+        Holder(token=fake_secret)  # type: ignore[arg-type]
+
+
+def test_remaining_validation_errors_hold_no_plaintext(fake_secret: str) -> None:
     with pytest.raises(pydantic.ValidationError) as caught:
-        RelaySecrets(vrm_token=fake_secret)  # type: ignore[arg-type]
-    assert fake_secret not in str(caught.value)
+        RelaySecrets(unexpected=Secret(fake_secret))  # type: ignore[call-arg]
+    error = caught.value
+    rendered = [str(error), repr(error), error.json(), repr(error.errors())]
+    for text in rendered:
+        assert fake_secret not in text
+    assert error.errors()[0]["type"] == "extra_forbidden"
 
 
 # --- read_secret_file ------------------------------------------------------
@@ -246,7 +283,7 @@ def test_permissive_modes_are_flagged(
     [
         (errno.EACCES, "secret file is not readable (permission denied)"),
         (errno.EPERM, "secret file is not readable (permission denied)"),
-        (errno.EIO, "secret file cannot be read: Input/output error"),
+        (errno.EIO, "secret file cannot be read (EIO)"),
     ],
 )
 def test_open_errors_are_reported(
@@ -257,7 +294,7 @@ def test_open_errors_are_reported(
     def fail(*_args: Any) -> int:
         raise OSError(error, os.strerror(error), path)
 
-    monkeypatch.setattr("vrm_alert_relay.config.secret.os.open", fail)
+    monkeypatch.setattr("vrm_alert_relay.config._files.os.open", fail)
     with pytest.raises(SecretFileError) as caught:
         read_secret_file(path)
     assert caught.value.reason == reason
@@ -270,8 +307,8 @@ def test_os_error_without_message(
     def fail(*_args: Any) -> int:
         raise OSError()
 
-    monkeypatch.setattr("vrm_alert_relay.config.secret.os.open", fail)
-    with pytest.raises(SecretFileError, match="cannot be read: unknown error"):
+    monkeypatch.setattr("vrm_alert_relay.config._files.os.open", fail)
+    with pytest.raises(SecretFileError, match=r"cannot be read \(unknown\)"):
         read_secret_file(secret_file("s"))
 
 
@@ -281,8 +318,8 @@ def test_read_errors_are_reported(
     def fail(*_args: Any) -> bytes:
         raise OSError(errno.EIO, os.strerror(errno.EIO))
 
-    monkeypatch.setattr("vrm_alert_relay.config.secret.os.read", fail)
-    with pytest.raises(SecretFileError, match="Input/output error"):
+    monkeypatch.setattr("vrm_alert_relay.config._files.os.read", fail)
+    with pytest.raises(SecretFileError, match=r"cannot be read \(EIO\)"):
         read_secret_file(secret_file("s"))
 
 
@@ -297,7 +334,7 @@ def test_file_growing_past_its_reported_size_is_rejected(
         fields[stat.ST_SIZE] = 1
         return os.stat_result(fields)
 
-    monkeypatch.setattr("vrm_alert_relay.config.secret.os.fstat", small_fstat)
+    monkeypatch.setattr("vrm_alert_relay.config._files.os.fstat", small_fstat)
     with pytest.raises(SecretFileError, match="larger than"):
         read_secret_file(path)
 
@@ -311,7 +348,7 @@ def test_short_reads_are_reassembled(
     def one_byte(fd: int, _size: int) -> bytes:
         return real_read(fd, 1)
 
-    monkeypatch.setattr("vrm_alert_relay.config.secret.os.read", one_byte)
+    monkeypatch.setattr("vrm_alert_relay.config._files.os.read", one_byte)
     assert read_secret_file(path).secret.reveal() == "abcdef"
 
 

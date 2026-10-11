@@ -52,6 +52,7 @@ def secrets_dir(tmp_path: Path) -> Path:
 def config_data(secrets_dir: Path) -> dict[str, Any]:
     """A complete dry-run configuration using every provider and recipient type."""
     return {
+        "version": 1,
         "sending": {"enabled": False},
         "vrm": {
             "token_file": str(secrets_dir / "vrm_token"),

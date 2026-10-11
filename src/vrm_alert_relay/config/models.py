@@ -21,6 +21,7 @@ from pydantic import (
 from .errors import ConfigError, format_path
 from .fields import (
     BindAddress,
+    FieldProblem,
     HaServiceName,
     HeaderName,
     HttpsUrl,
@@ -36,6 +37,9 @@ __all__ = [
     "DEFAULT_VOIPMS_BASE_URL",
     "DEFAULT_VRM_BASE_URL",
     "PROVIDER_NAMES",
+    "SUPPORTED_VERSIONS",
+    "SUPPORTED_VERSIONS_TEXT",
+    "UNSUPPORTED_VERSION_MESSAGE",
     "DeliveryMode",
     "HealthConfig",
     "HomeAssistantProvider",
@@ -67,8 +71,22 @@ MAX_RULES = 200
 MAX_LEVELS = 20
 MAX_RECIPIENTS = 50
 
+SUPPORTED_VERSIONS: tuple[int, ...] = (1,)
+SUPPORTED_VERSIONS_TEXT = "this release supports configuration version " + ", ".join(
+    str(v) for v in SUPPORTED_VERSIONS
+)
+UNSUPPORTED_VERSION_MESSAGE = (
+    f"unsupported configuration version; {SUPPORTED_VERSIONS_TEXT}"
+)
+
 ProviderName: TypeAlias = Literal["voipms", "homeassistant", "webhook", "log"]
 PROVIDER_NAMES: tuple[ProviderName, ...] = ("voipms", "homeassistant", "webhook", "log")
+
+
+def _check_version(value: int) -> int:
+    if value not in SUPPORTED_VERSIONS:
+        raise FieldProblem(UNSUPPORTED_VERSION_MESSAGE)
+    return value
 
 
 class DeliveryMode(StrEnum):
@@ -232,6 +250,7 @@ class HealthConfig(_Model):
 class RelayConfig(_Model):
     """The complete, validated operator configuration."""
 
+    version: Annotated[int, AfterValidator(_check_version)]
     sending: SendingConfig = Field(default_factory=SendingConfig)
     vrm: VrmConfig
     rate_limits: RateLimitsConfig = Field(default_factory=RateLimitsConfig)
@@ -332,17 +351,18 @@ def _rule_problems(index: int, rule: Rule, config: RelayConfig) -> list[str]:
     if rule.installation not in installations:
         problems.append(
             f"{format_path((*base, 'installation'))}: unknown installation "
-            f"'{rule.installation}' (not listed in vrm.installations)"
+            "(not listed in vrm.installations)"
         )
-    level_names: set[str] = set()
+    level_names: dict[str, int] = {}
     for level_index, level in enumerate(rule.levels):
         level_loc = (*base, "levels", level_index)
         if level.name in level_names:
+            first = format_path((*base, "levels", level_names[level.name], "name"))
             problems.append(
                 f"{format_path((*level_loc, 'name'))}: duplicate level name "
-                f"'{level.name}'"
+                f"(same as {first})"
             )
-        level_names.add(level.name)
+        level_names.setdefault(level.name, level_index)
         if level_index == 0:
             continue
         previous = rule.levels[level_index - 1].threshold
@@ -356,16 +376,15 @@ def _rule_problems(index: int, rule: Rule, config: RelayConfig) -> list[str]:
                 f"{format_path((*level_loc, 'threshold'))}: must be less than the "
                 "previous level's threshold for a falling rule"
             )
-    seen_recipients: set[str] = set()
+    seen_recipients: dict[str, int] = {}
     for recipient_index, name in enumerate(rule.recipients):
         loc = format_path((*base, "recipients", recipient_index))
         if name in seen_recipients:
-            problems.append(f"{loc}: duplicate recipient '{name}'")
+            first = format_path((*base, "recipients", seen_recipients[name]))
+            problems.append(f"{loc}: duplicate recipient (same as {first})")
         elif name not in config.recipients:
-            problems.append(
-                f"{loc}: unknown recipient '{name}' (not defined under recipients)"
-            )
-        seen_recipients.add(name)
+            problems.append(f"{loc}: unknown recipient (not defined under recipients)")
+        seen_recipients.setdefault(name, recipient_index)
     if rule.stale_after_minutes * 60 <= config.vrm.poll_interval:
         problems.append(
             f"{format_path((*base, 'stale_after_minutes'))}: must be longer than "
@@ -376,21 +395,25 @@ def _rule_problems(index: int, rule: Rule, config: RelayConfig) -> list[str]:
 
 def _semantic_problems(config: RelayConfig) -> list[str]:
     problems: list[str] = []
-    seen_ids: set[str] = set()
-    seen_sites: set[int] = set()
+    seen_ids: dict[str, int] = {}
+    seen_sites: dict[int, int] = {}
     for index, inst in enumerate(config.vrm.installations):
         loc = ("vrm", "installations", index)
         if inst.id in seen_ids:
+            first = format_path(("vrm", "installations", seen_ids[inst.id], "id"))
             problems.append(
-                f"{format_path((*loc, 'id'))}: duplicate installation id '{inst.id}'"
+                f"{format_path((*loc, 'id'))}: duplicate installation id "
+                f"(same as {first})"
             )
         if inst.site_id in seen_sites:
-            problems.append(
-                f"{format_path((*loc, 'site_id'))}: duplicate site_id "
-                "(another installation already uses it)"
+            first = format_path(
+                ("vrm", "installations", seen_sites[inst.site_id], "site_id")
             )
-        seen_ids.add(inst.id)
-        seen_sites.add(inst.site_id)
+            problems.append(
+                f"{format_path((*loc, 'site_id'))}: duplicate site_id (same as {first})"
+            )
+        seen_ids.setdefault(inst.id, index)
+        seen_sites.setdefault(inst.site_id, index)
 
     limits = config.rate_limits
     if limits.global_per_hour > limits.global_per_day:
@@ -400,12 +423,14 @@ def _semantic_problems(config: RelayConfig) -> list[str]:
 
     problems.extend(_provider_problems(config.providers))
 
-    rule_ids: set[str] = set()
+    rule_ids: dict[str, int] = {}
     for index, rule in enumerate(config.rules):
         if rule.id in rule_ids:
+            first = format_path(("rules", rule_ids[rule.id], "id"))
             problems.append(
-                f"{format_path(('rules', index, 'id'))}: duplicate rule id '{rule.id}'"
+                f"{format_path(('rules', index, 'id'))}: duplicate rule id "
+                f"(same as {first})"
             )
-        rule_ids.add(rule.id)
+        rule_ids.setdefault(rule.id, index)
         problems.extend(_rule_problems(index, rule, config))
     return problems

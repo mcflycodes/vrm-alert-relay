@@ -9,16 +9,29 @@ from .errors import ConfigError
 from .loader import _collect_secrets, config_warnings, load_config
 from .models import DeliveryMode, ProviderName
 
-__all__ = ["CheckReport", "check_config"]
+__all__ = ["STRUCTURE_ONLY_NOTE", "CheckReport", "check_config"]
+
+STRUCTURE_ONLY_NOTE = (
+    "structure-only check: secret files were not read, so this configuration "
+    "has not been verified as ready to deploy"
+)
 
 
 @dataclass(frozen=True, slots=True)
 class CheckReport:
-    """Outcome of validating a configuration file and its secret files."""
+    """Outcome of validating a configuration file and, unless skipped, its secrets.
+
+    ``ok`` means no problems were found by the checks that ran. ``ready`` means
+    the configuration and every required secret file were verified; it is always
+    false for a structure-only check.
+    """
 
     ok: bool
+    ready: bool = False
+    secrets_checked: bool = False
     problems: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
     installations: int = 0
     rules: int = 0
     recipients: int = 0
@@ -28,24 +41,38 @@ class CheckReport:
     dry_run_recipients: tuple[str, ...] = ()
 
 
-def check_config(path: str | os.PathLike[str]) -> CheckReport:
+def check_config(
+    path: str | os.PathLike[str], *, structure_only: bool = False
+) -> CheckReport:
     """Validate the configuration at ``path`` without contacting any service.
 
-    Reads only the configuration file and the secret files it references. A
-    configuration in dry-run mode passes even when provider secret files are
-    absent; a live provider's secret files must exist and be usable.
+    Reads only the configuration file and the secret files it references. The
+    VRM token file must exist and be usable, as must the secret files of every
+    live provider; problems with the secrets of providers that are enabled but
+    not live (``sending.enabled`` is false) are warnings.
+
+    With ``structure_only`` no secret file is read, and the report is never
+    ``ready``.
     """
+    notes = (STRUCTURE_ONLY_NOTE,) if structure_only else ()
     try:
         config = load_config(path)
     except ConfigError as exc:
-        return CheckReport(ok=False, problems=exc.problems)
+        return CheckReport(ok=False, problems=exc.problems, notes=notes)
 
-    _, problems, secret_warnings = _collect_secrets(config, preflight=True)
+    problems: list[str] = []
+    secret_warnings: list[str] = []
+    if not structure_only:
+        _, problems, secret_warnings = _collect_secrets(config, preflight=True)
     modes = config.delivery_modes()
+    ok = not problems
     return CheckReport(
-        ok=not problems,
+        ok=ok,
+        ready=ok and not structure_only,
+        secrets_checked=not structure_only,
         problems=tuple(problems),
         warnings=(*config_warnings(config), *secret_warnings),
+        notes=notes,
         installations=len(config.vrm.installations),
         rules=len(config.rules),
         recipients=len(config.recipients),

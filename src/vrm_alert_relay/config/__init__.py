@@ -1,6 +1,6 @@
 """Operator configuration: strict YAML loading, validation, and secret files."""
 
-from .check import CheckReport, check_config
+from .check import STRUCTURE_ONLY_NOTE, CheckReport, check_config
 from .errors import ConfigError
 from .fields import PhoneNumber
 from .loader import (
@@ -12,6 +12,7 @@ from .loader import (
 )
 from .models import (
     PROVIDER_NAMES,
+    SUPPORTED_VERSIONS,
     DeliveryMode,
     HealthConfig,
     HomeAssistantProvider,
@@ -34,10 +35,18 @@ from .models import (
     WebhookProvider,
     WebhookRecipient,
 )
-from .secret import Secret, SecretFile, SecretFileError, read_secret_file
+from .secret import (
+    Secret,
+    SecretFile,
+    SecretFileError,
+    SecretTypeError,
+    read_secret_file,
+)
 
 __all__ = [
     "PROVIDER_NAMES",
+    "STRUCTURE_ONLY_NOTE",
+    "SUPPORTED_VERSIONS",
     "CheckReport",
     "ConfigError",
     "DeliveryMode",
@@ -60,6 +69,7 @@ __all__ = [
     "Secret",
     "SecretFile",
     "SecretFileError",
+    "SecretTypeError",
     "SendingConfig",
     "VoipmsProvider",
     "VoipmsRecipient",

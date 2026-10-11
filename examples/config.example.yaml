@@ -18,6 +18,9 @@
 #     lowercase letters, digits, "_" and "-", up to 63 characters.
 #   - Quote phone numbers so YAML reads them as text.
 
+# Configuration format version (required). This release supports version 1.
+version: 1
+
 # Master switch for real notifications. While this is false, the relay runs in
 # dry-run mode: every message is written to the log instead of being sent,
 # whatever the provider settings below say. A provider sends for real only when
@@ -129,6 +132,9 @@ rules:
     # A level clears only after the value falls back past threshold minus
     # hysteresis (plus for falling rules), for clear_after_samples consecutive
     # samples. Defaults: hysteresis 0, clear_after_samples 1.
+    # Recommended: set a non-zero hysteresis in the measurement's units. With 0,
+    # a value hovering at a threshold clears and re-triggers repeatedly, held
+    # back only by the cooldown.
     hysteresis: 1.0
     clear_after_samples: 2
     # Send a recovery notification when the rule returns to normal (default true).
@@ -159,6 +165,7 @@ rules:
         threshold: 40
       - name: critical
         threshold: 20
+    # 5 percentage points of state of charge before a level clears.
     hysteresis: 5
     recipients:
       - owner_phone_app

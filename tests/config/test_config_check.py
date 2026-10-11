@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -9,6 +11,7 @@ from typing import Any
 import pytest
 
 from vrm_alert_relay.config import (
+    STRUCTURE_ONLY_NOTE,
     CheckReport,
     DeliveryMode,
     RelayConfig,
@@ -22,6 +25,18 @@ Write = Callable[[Any], Path]
 SecretWriter = Callable[..., str]
 
 RECIPIENT_OF = {"voipms": "owner_sms", "homeassistant": "owner_app", "webhook": "hook"}
+FAKE_VRM_CREDENTIAL = "fake-vrm-token-value\n"
+
+
+def _deny_reads_of(monkeypatch: pytest.MonkeyPatch, denied: str) -> None:
+    real_open = os.open
+
+    def guarded(path: Any, flags: int, *args: Any) -> int:
+        if os.fspath(path) == denied:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr("vrm_alert_relay.config._files.os.open", guarded)
 
 
 def _write_all_secrets(secret_file: SecretWriter, mode: int = 0o600) -> None:
@@ -89,21 +104,90 @@ def test_recipient_of_absent_provider_section_is_dry_run(
     assert config.live_providers() == ()
 
 
-def test_check_dry_run_passes_without_secret_files(
-    config_data: Data, write_config: Write
+def test_check_dry_run_passes_with_only_the_vrm_token(
+    config_data: Data, write_config: Write, secret_file: SecretWriter
 ) -> None:
+    secret_file("vrm_token")
     report = check_config(write_config(config_data))
     assert report.ok is True
+    assert report.ready is True
+    assert report.secrets_checked is True
+    assert report.notes == ()
     assert report.problems == ()
     assert (report.installations, report.rules, report.recipients) == (2, 3, 4)
     assert report.live_providers == ()
     assert report.dry_run_providers == ("voipms", "homeassistant", "webhook", "log")
     assert report.live_recipients == ()
     assert report.dry_run_recipients == ("owner_sms", "owner_app", "hook", "audit")
-    assert (
-        "vrm.token_file: secret file does not exist; the relay cannot poll VRM until it exists"
-        in report.warnings
+
+
+@pytest.mark.parametrize(
+    ("content", "mode", "reason"),
+    [
+        (None, 0o600, "secret file does not exist"),
+        ("", 0o600, "secret file is empty"),
+        (FAKE_VRM_CREDENTIAL, 0o400, "secret file is not readable (permission denied)"),
+    ],
+)
+def test_check_missing_or_unreadable_vrm_token_is_a_problem(
+    config_data: Data,
+    write_config: Write,
+    secret_file: SecretWriter,
+    monkeypatch: pytest.MonkeyPatch,
+    content: str | None,
+    mode: int,
+    reason: str,
+) -> None:
+    if content is not None:
+        path = secret_file("vrm_token", content, mode)
+        if "permission denied" in reason:
+            _deny_reads_of(monkeypatch, path)
+    report = check_config(write_config(config_data))
+    assert report.ok is False
+    assert report.ready is False
+    assert report.problems == (f"vrm.token_file: {reason}",)
+
+
+def test_structure_only_skips_secret_files(
+    config_data: Data, write_config: Write
+) -> None:
+    config_data["sending"]["enabled"] = True
+    config_data["providers"]["voipms"]["enabled"] = True
+    report = check_config(write_config(config_data), structure_only=True)
+    assert report.ok is True
+    assert report.ready is False
+    assert report.secrets_checked is False
+    assert report.notes == (STRUCTURE_ONLY_NOTE,)
+    assert "not been verified as ready to deploy" in STRUCTURE_ONLY_NOTE
+    assert report.problems == ()
+    assert not any("secret file" in w for w in report.warnings)
+    assert report.live_providers == ("voipms",)
+
+
+def test_structure_only_still_reports_structural_problems(
+    config_data: Data, write_config: Write
+) -> None:
+    config_data["rules"][0]["recipients"] = ["nobody"]
+    report = check_config(write_config(config_data), structure_only=True)
+    assert report.ok is False
+    assert report.ready is False
+    assert report.notes == (STRUCTURE_ONLY_NOTE,)
+    assert report.problems == (
+        "rules[0].recipients[0]: unknown recipient (not defined under recipients)",
     )
+
+
+def test_structure_only_never_reads_secret_files(
+    config_data: Data, write_config: Write, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden(*_args: Any) -> Any:
+        raise AssertionError("secret file read during a structure-only check")
+
+    config_path = write_config(config_data)
+    monkeypatch.setattr("vrm_alert_relay.config.loader.read_secret_file", forbidden)
+    assert check_config(config_path, structure_only=True).ok is True
+    with pytest.raises(AssertionError):
+        check_config(config_path)
 
 
 def test_check_enabled_but_not_live_provider_warns_about_secrets(
@@ -164,6 +248,8 @@ def test_check_fully_live_configuration(
     report = check_config(write_config(config_data))
     assert report == CheckReport(
         ok=True,
+        ready=True,
+        secrets_checked=True,
         installations=2,
         rules=3,
         recipients=4,
@@ -215,7 +301,7 @@ def test_check_invalid_configuration(config_data: Data, write_config: Write) -> 
     assert report == CheckReport(
         ok=False,
         problems=(
-            "rules[0].recipients[0]: unknown recipient 'nobody' (not defined under recipients)",
+            "rules[0].recipients[0]: unknown recipient (not defined under recipients)",
         ),
     )
 

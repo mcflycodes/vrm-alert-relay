@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import errno
 import hmac
 import os
 import re
@@ -13,11 +12,14 @@ from typing import Any, NoReturn
 from pydantic import GetCoreSchemaHandler
 from pydantic_core import CoreSchema, core_schema
 
+from ._files import FileProblem, FileReadError, read_regular_file
+
 __all__ = [
     "MAX_SECRET_BYTES",
     "Secret",
     "SecretFile",
     "SecretFileError",
+    "SecretTypeError",
     "read_secret_file",
 ]
 
@@ -84,7 +86,16 @@ class Secret:
     def _validate(cls, value: object) -> Secret:
         if isinstance(value, Secret):
             return value
-        raise ValueError("must be a Secret loaded from a secret file")
+        # TypeError is not wrapped by pydantic, so the rejected plaintext never
+        # lands in a ValidationError's errors() or json() output.
+        raise SecretTypeError()
+
+
+class SecretTypeError(TypeError):
+    """A plain value was given where a :class:`Secret` is required."""
+
+    def __init__(self) -> None:
+        super().__init__("secret fields accept only Secret values read from files")
 
 
 def _mask_secret(_value: object) -> str:
@@ -108,18 +119,19 @@ class SecretFile:
     group_or_world_readable: bool
 
 
-_OPEN_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOCTTY | os.O_NONBLOCK
+_FILE_PROBLEMS = {
+    FileProblem.MISSING: "secret file does not exist",
+    FileProblem.PERMISSION_DENIED: "secret file is not readable (permission denied)",
+    FileProblem.NOT_REGULAR: "secret file is not a regular file",
+    FileProblem.TOO_LARGE: f"secret file is larger than {MAX_SECRET_BYTES} bytes",
+}
 
 
-def _fail_open(exc: OSError) -> NoReturn:
-    if exc.errno in (errno.ENOENT, errno.ENOTDIR):
-        raise SecretFileError("secret file does not exist", missing=True) from None
-    if exc.errno in (errno.EACCES, errno.EPERM):
-        raise SecretFileError(
-            "secret file is not readable (permission denied)"
-        ) from None
-    reason = exc.strerror or "unknown error"
-    raise SecretFileError(f"secret file cannot be read: {reason}") from None
+def _decode(data: bytes) -> str | None:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def read_secret_file(path: str | os.PathLike[str]) -> SecretFile:
@@ -127,39 +139,23 @@ def read_secret_file(path: str | os.PathLike[str]) -> SecretFile:
 
     The file must be a regular file of at most 4 KiB containing UTF-8 text. One
     trailing newline is stripped; the remaining value must be non-empty and free
-    of line breaks and control characters.
+    of line breaks and control characters. Errors never chain an exception that
+    could hold the file's bytes.
     """
+    failure: FileReadError | None = None
     try:
-        fd = os.open(path, _OPEN_FLAGS)
-    except OSError as exc:
-        _fail_open(exc)
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise SecretFileError("secret file is not a regular file")
-        if info.st_size > MAX_SECRET_BYTES:
-            raise SecretFileError(
-                f"secret file is larger than {MAX_SECRET_BYTES} bytes"
-            )
-        chunks: list[bytes] = []
-        total = 0
-        while total <= MAX_SECRET_BYTES:
-            chunk = os.read(fd, MAX_SECRET_BYTES + 1 - total)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-    except OSError as exc:
-        _fail_open(exc)
-    finally:
-        os.close(fd)
+        content = read_regular_file(path, MAX_SECRET_BYTES)
+    except FileReadError as exc:
+        failure = exc
+    if failure is not None:
+        reason = _FILE_PROBLEMS.get(
+            failure.problem, f"secret file cannot be read ({failure.code})"
+        )
+        raise SecretFileError(reason, missing=failure.problem is FileProblem.MISSING)
 
-    if total > MAX_SECRET_BYTES:
-        raise SecretFileError(f"secret file is larger than {MAX_SECRET_BYTES} bytes")
-    try:
-        text = b"".join(chunks).decode("utf-8")
-    except UnicodeDecodeError:
-        raise SecretFileError("secret file is not valid UTF-8") from None
+    text = _decode(content.data)
+    if text is None:
+        raise SecretFileError("secret file is not valid UTF-8")
     if text.endswith("\r\n"):
         text = text[:-2]
     elif text.endswith("\n"):
@@ -168,5 +164,5 @@ def read_secret_file(path: str | os.PathLike[str]) -> SecretFile:
         raise SecretFileError("secret file is empty")
     if _CONTROL.search(text):
         raise SecretFileError("secret file contains line breaks or control characters")
-    permissive = bool(info.st_mode & (stat.S_IRGRP | stat.S_IROTH))
+    permissive = bool(content.mode & (stat.S_IRGRP | stat.S_IROTH))
     return SecretFile(secret=Secret(text), group_or_world_readable=permissive)

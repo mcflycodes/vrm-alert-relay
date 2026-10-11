@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
-import errno
 import ipaddress
 import os
 import re
-import stat
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+from pydantic_core import ErrorDetails
 
+from ._files import FileProblem, FileReadError, read_regular_file
 from .errors import ConfigError, format_path
-from .models import PROVIDER_NAMES, ProviderName, RelayConfig
-from .secret import Secret, SecretFileError, read_secret_file
+from .fields import FieldProblem
+from .models import (
+    PROVIDER_NAMES,
+    SUPPORTED_VERSIONS,
+    SUPPORTED_VERSIONS_TEXT,
+    UNSUPPORTED_VERSION_MESSAGE,
+    ProviderName,
+    RelayConfig,
+)
+from .secret import Secret, SecretFileError, SecretTypeError, read_secret_file
 from .yaml_loader import MAX_CONFIG_BYTES, parse_yaml
 
 __all__ = [
@@ -31,14 +40,44 @@ _INLINE_VALUE_MESSAGE = (
     "inline secret values are not allowed; put the value in a file "
     "and reference it with the matching '*_file' setting"
 )
-_VALUE_ERROR_PREFIX = "Value error, "
+_PROVIDER_CHOICES = ", ".join(f"'{name}'" for name in PROVIDER_NAMES)
+
+# Fixed operator-facing text per pydantic error type. Upstream message text and
+# input values are never shown, because they can contain secrets or phone numbers.
+_FIXED_MESSAGES = {
+    "missing": "is required",
+    "extra_forbidden": "is not a recognized setting",
+    "string_type": "must be a string",
+    "bool_type": "must be true or false",
+    "int_type": "must be a whole number",
+    "float_type": "must be a number",
+    "finite_number": "must be a finite number",
+    "dict_type": "must be a mapping",
+    "model_type": "must be a mapping",
+    "model_attributes_type": "must be a mapping",
+    "tuple_type": "must be a list",
+    "union_tag_invalid": f"must be one of {_PROVIDER_CHOICES}",
+    "union_tag_not_found": f"is required (one of {_PROVIDER_CHOICES})",
+}
+_BOUND_MESSAGES = {
+    "greater_than_equal": ("ge", "must be at least {}"),
+    "less_than_equal": ("le", "must be at most {}"),
+    "greater_than": ("gt", "must be greater than {}"),
+    "less_than": ("lt", "must be less than {}"),
+    "too_short": ("min_length", "must contain at least {} item(s)"),
+    "too_long": ("max_length", "must contain at most {} item(s)"),
+}
+_GENERIC_MESSAGE = "is invalid"
 
 
 class RelaySecrets(BaseModel):
     """Secret values resolved from the files the configuration references.
 
     A field is ``None`` when its provider is not live (or, for ``vrm_token``, when
-    it was not required). Serialization always masks the values.
+    it was not required). Serialization always masks the values. Constructing it
+    with anything other than :class:`Secret` values raises
+    :class:`SecretTypeError` before pydantic validation, so no plaintext can be
+    captured in a ``ValidationError``.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
@@ -49,30 +88,61 @@ class RelaySecrets(BaseModel):
     homeassistant_token: Secret | None = None
     webhook_auth_header_value: Secret | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _only_secrets(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or not all(
+            value is None or isinstance(value, Secret) for value in data.values()
+        ):
+            raise SecretTypeError()
+        return data
 
-def _strip_union_tag(loc: tuple[str | int, ...]) -> tuple[str | int, ...]:
+
+def _error_location(error: ErrorDetails) -> tuple[str | int, ...]:
+    loc = tuple(error["loc"])
     # Pydantic inserts the discriminator value into recipient error locations.
     if len(loc) >= 3 and loc[0] == "recipients" and loc[2] in PROVIDER_NAMES:
-        return (*loc[:2], *loc[3:])
+        loc = (*loc[:2], *loc[3:])
+    if error["type"] in ("union_tag_invalid", "union_tag_not_found"):
+        loc = (*loc, "provider")
     return loc
+
+
+def _error_message(error: ErrorDetails, loc: tuple[str | int, ...]) -> str:
+    kind = error["type"]
+    ctx = error.get("ctx") or {}
+    if kind == "value_error":
+        cause = ctx.get("error")
+        return str(cause) if isinstance(cause, FieldProblem) else _GENERIC_MESSAGE
+    if kind == "extra_forbidden":
+        key = loc[-1] if loc else None
+        if isinstance(key, str) and _INLINE_SECRET_KEY.fullmatch(key):
+            return _INLINE_VALUE_MESSAGE
+    if kind == "missing" and loc == ("version",):
+        return f"is required; {SUPPORTED_VERSIONS_TEXT}"
+    if kind == "literal_error":
+        expected = ctx.get("expected")
+        return (
+            f"must be one of {expected}"
+            if isinstance(expected, str)
+            else _GENERIC_MESSAGE
+        )
+    if kind in _BOUND_MESSAGES:
+        name, template = _BOUND_MESSAGES[kind]
+        bound = ctx.get(name)
+        if isinstance(bound, int | float) and not isinstance(bound, bool):
+            return template.format(bound)
+        return _GENERIC_MESSAGE
+    return _FIXED_MESSAGES.get(kind, _GENERIC_MESSAGE)
 
 
 def _validation_problems(exc: ValidationError) -> list[str]:
     problems: list[str] = []
     for error in exc.errors(
-        include_url=False, include_input=False, include_context=False
+        include_url=False, include_input=False, include_context=True
     ):
-        loc = _strip_union_tag(tuple(error["loc"]))
-        key = loc[-1] if loc else None
-        if (
-            error["type"] == "extra_forbidden"
-            and isinstance(key, str)
-            and _INLINE_SECRET_KEY.fullmatch(key)
-        ):
-            message = _INLINE_VALUE_MESSAGE
-        else:
-            message = str(error["msg"]).removeprefix(_VALUE_ERROR_PREFIX)
-        problems.append(f"{format_path(loc)}: {message}")
+        loc = _error_location(error)
+        problems.append(f"{format_path(loc)}: {_error_message(error, loc)}")
     return problems
 
 
@@ -81,34 +151,42 @@ def parse_config(data: bytes | str) -> RelayConfig:
     raw = parse_yaml(data)
     if not isinstance(raw, dict):
         raise ConfigError(["configuration must be a YAML mapping at the top level"])
+    version = raw.get("version")
+    if (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version not in SUPPORTED_VERSIONS
+    ):
+        # Other problems are likely noise when the file targets another version.
+        raise ConfigError([f"version: {UNSUPPORTED_VERSION_MESSAGE}"])
+    problems: list[str] = []
     try:
         return RelayConfig.model_validate(raw)
     except ValidationError as exc:
-        raise ConfigError(_validation_problems(exc)) from None
+        problems = _validation_problems(exc)
+    # Raised outside the except block so the ValidationError, which holds raw
+    # input values, is not chained as __context__.
+    raise ConfigError(problems)
+
+
+_CONFIG_FILE_PROBLEMS = {
+    FileProblem.MISSING: "configuration file does not exist",
+    FileProblem.PERMISSION_DENIED: "configuration file is not readable (permission denied)",
+    FileProblem.NOT_REGULAR: "configuration path is not a regular file",
+    FileProblem.TOO_LARGE: f"configuration is larger than {MAX_CONFIG_BYTES} bytes",
+}
 
 
 def _read_config_bytes(path: str | os.PathLike[str]) -> bytes:
-    shown = os.fspath(path)
+    failure: FileReadError | None = None
     try:
-        with open(path, "rb") as handle:
-            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                raise ConfigError(
-                    [f"{shown}: configuration path is not a regular file"]
-                )
-            data = handle.read(MAX_CONFIG_BYTES + 1)
-    except OSError as exc:
-        if exc.errno == errno.ENOENT:
-            reason = "configuration file does not exist"
-        else:
-            reason = (
-                f"configuration file cannot be read: {exc.strerror or 'unknown error'}"
-            )
-        raise ConfigError([f"{shown}: {reason}"]) from None
-    if len(data) > MAX_CONFIG_BYTES:
-        raise ConfigError(
-            [f"{shown}: configuration is larger than {MAX_CONFIG_BYTES} bytes"]
-        )
-    return data
+        return read_regular_file(path, MAX_CONFIG_BYTES).data
+    except FileReadError as exc:
+        failure = exc
+    reason = _CONFIG_FILE_PROBLEMS.get(
+        failure.problem, f"configuration file cannot be read ({failure.code})"
+    )
+    raise ConfigError([f"{os.fspath(path)}: {reason}"])
 
 
 def load_config(path: str | os.PathLike[str]) -> RelayConfig:
@@ -222,10 +300,11 @@ def _collect_secrets(
 ) -> tuple[RelaySecrets, list[str], list[str]]:
     """Read secret files.
 
-    At runtime (``preflight=False``) the VRM token and every live provider's
-    secrets are required, and providers that are not live are skipped. In a
-    preflight check a missing VRM token and problems with the secrets of enabled
-    but not yet live providers are warnings, so a dry-run configuration passes.
+    The VRM token is always required, and so are the secrets of every live
+    provider. At runtime (``preflight=False``) providers that are not live are
+    skipped. In a preflight check, enabled but not yet live providers' secrets
+    are read too and their problems reported as warnings, so a dry-run
+    configuration passes.
     """
     values: dict[str, Secret] = {}
     problems: list[str] = []
@@ -234,11 +313,7 @@ def _collect_secrets(
     vrm_spec: _SecretSpec = ("vrm_token", ("vrm", "token_file"), config.vrm.token_file)
     error = _read_into(values, warnings, vrm_spec)
     if error is not None:
-        message = f"vrm.token_file: {error.reason}"
-        if error.missing and preflight:
-            warnings.append(f"{message}; the relay cannot poll VRM until it exists")
-        else:
-            problems.append(message)
+        problems.append(f"vrm.token_file: {error.reason}")
 
     for provider, spec in _provider_secret_specs(config):
         live = config.provider_is_live(provider)

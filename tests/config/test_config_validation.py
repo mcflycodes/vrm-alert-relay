@@ -46,6 +46,7 @@ def test_valid_configuration_loads(config_data: Data, parse: Parse) -> None:
 def test_defaults_match_requirements(secrets_dir: Any, parse: Parse) -> None:
     config = parse(
         {
+            "version": 1,
             "vrm": {
                 "token_file": str(secrets_dir / "vrm_token"),
                 "installations": [{"id": "cabin", "site_id": 123456}],
@@ -119,26 +120,26 @@ def test_model_dump_round_trips_structure(config_data: Data, parse: Parse) -> No
 @pytest.mark.parametrize(
     ("mutate", "expected"),
     [
-        (lambda d: d.update(extra=1), "extra: Extra inputs are not permitted"),
+        (lambda d: d.update(extra=1), "extra: is not a recognized setting"),
         (
             lambda d: d["vrm"].update(tokenpath="/x"),
-            "vrm.tokenpath: Extra inputs are not permitted",
+            "vrm.tokenpath: is not a recognized setting",
         ),
         (
             lambda d: d["rules"][2]["levels"][1].update(colour="red"),
-            "rules[2].levels[1].colour: Extra inputs are not permitted",
+            "rules[2].levels[1].colour: is not a recognized setting",
         ),
         (
             lambda d: d["recipients"]["owner_sms"].update(email="x"),
-            "recipients.owner_sms.email: Extra inputs are not permitted",
+            "recipients.owner_sms.email: is not a recognized setting",
         ),
         (
             lambda d: d["providers"].update(twilio={}),
-            "providers.twilio: Extra inputs are not permitted",
+            "providers.twilio: is not a recognized setting",
         ),
         (
             lambda d: d["providers"].update(log={"level": "info"}),
-            "providers.log.level: Extra inputs are not permitted",
+            "providers.log.level: is not a recognized setting",
         ),
     ],
 )
@@ -380,8 +381,8 @@ def test_unknown_rule_references(config_data: Data, problems: Problems) -> None:
     config_data["rules"][2]["installation"] = "barn"
     config_data["rules"][2]["recipients"] = ["audit", "nobody"]
     assert problems(config_data) == (
-        "rules[2].installation: unknown installation 'barn' (not listed in vrm.installations)",
-        "rules[2].recipients[1]: unknown recipient 'nobody' (not defined under recipients)",
+        "rules[2].installation: unknown installation (not listed in vrm.installations)",
+        "rules[2].recipients[1]: unknown recipient (not defined under recipients)",
     )
 
 
@@ -393,11 +394,11 @@ def test_duplicates_are_rejected(config_data: Data, problems: Problems) -> None:
     config_data["rules"][2]["recipients"] = ["audit", "audit"]
     config_data["rules"][1]["installation"] = "cabin"
     assert problems(config_data) == (
-        "vrm.installations[1].id: duplicate installation id 'cabin'",
-        "vrm.installations[1].site_id: duplicate site_id (another installation already uses it)",
-        "rules[2].id: duplicate rule id 'battery'",
-        "rules[2].levels[2].name: duplicate level name 'warning'",
-        "rules[2].recipients[1]: duplicate recipient 'audit'",
+        "vrm.installations[1].id: duplicate installation id (same as vrm.installations[0].id)",
+        "vrm.installations[1].site_id: duplicate site_id (same as vrm.installations[0].site_id)",
+        "rules[2].id: duplicate rule id (same as rules[1].id)",
+        "rules[2].levels[2].name: duplicate level name (same as rules[2].levels[0].name)",
+        "rules[2].recipients[1]: duplicate recipient (same as rules[2].recipients[0])",
     )
 
 
@@ -587,13 +588,12 @@ def test_recipient_provider_discriminator(
     config_data["recipients"]["owner_sms"] = {"provider": "carrier_pigeon"}
     config_data["recipients"]["owner_app"] = {"service": "mobile_app_test"}
     config_data["recipients"]["hook"] = {"provider": "voipms"}
-    found = problems(config_data)
-    paths = [p.split(": ")[0] for p in found]
-    assert paths == [
-        "recipients.owner_sms",
-        "recipients.owner_app",
-        "recipients.hook.phone",
-    ]
+    choices = "'voipms', 'homeassistant', 'webhook', 'log'"
+    assert problems(config_data) == (
+        f"recipients.owner_sms.provider: must be one of {choices}",
+        f"recipients.owner_app.provider: is required (one of {choices})",
+        "recipients.hook.phone: is required",
+    )
 
 
 GOOD_URLS = [
@@ -858,7 +858,41 @@ def test_invalid_measurement_identifiers(
 
 
 def test_missing_required_sections(problems: Problems) -> None:
-    assert problems({"sending": {"enabled": False}}) == ("vrm: Field required",)
+    assert problems({"sending": {"enabled": False}}) == (
+        "version: is required; this release supports configuration version 1",
+        "vrm: is required",
+    )
+
+
+@pytest.mark.parametrize("version", [0, 2, 99])
+def test_unsupported_version_is_reported_alone(
+    config_data: Data, problems: Problems, version: int
+) -> None:
+    config_data["version"] = version
+    config_data["vrm"]["poll_interval"] = 1
+    assert problems(config_data) == (
+        "version: unsupported configuration version; this release supports configuration version 1",
+    )
+
+
+@pytest.mark.parametrize("version", ["1", 1.0, True, None])
+def test_version_must_be_an_integer(
+    config_data: Data, problems: Problems, version: object
+) -> None:
+    config_data["version"] = version
+    (problem,) = problems(config_data)
+    assert problem.startswith("version: must be a whole number")
+
+
+def test_unsupported_version_rejected_by_direct_validation(
+    config_data: Data, parse: Parse
+) -> None:
+    config = parse(config_data)
+    assert config.version == 1
+    data = copy.deepcopy(config_data)
+    data["version"] = 2
+    with pytest.raises(pydantic.ValidationError):
+        RelayConfig.model_validate(data)
 
 
 def test_many_field_problems_are_reported_together(
@@ -878,7 +912,7 @@ def test_semantic_errors_raise_config_error_from_direct_validation(
     with pytest.raises(ConfigError) as caught:
         RelayConfig.model_validate(data)
     assert caught.value.problems == (
-        "rules[0].installation: unknown installation 'barn' (not listed in vrm.installations)",
+        "rules[0].installation: unknown installation (not listed in vrm.installations)",
     )
 
 
@@ -886,6 +920,7 @@ def test_python_objects_validate_directly(config_data: Data, parse: Parse) -> No
     config = parse(config_data)
     rebuilt = RelayConfig.model_validate(
         {
+            "version": 1,
             "vrm": config.vrm,
             "recipients": {"owner_sms": config.recipients["owner_sms"]},
             "providers": config.providers,

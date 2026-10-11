@@ -5,10 +5,15 @@ from __future__ import annotations
 from typing import Any
 
 import yaml
+from yaml.composer import ComposerError
+from yaml.constructor import ConstructorError
 from yaml.events import AliasEvent, NodeEvent
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
+from yaml.parser import ParserError
+from yaml.reader import ReaderError
+from yaml.scanner import ScannerError
 
-from .errors import ConfigError, format_path, mask_digits
+from .errors import ConfigError, format_path
 
 __all__ = ["MAX_CONFIG_BYTES", "MAX_NESTING_DEPTH", "parse_yaml"]
 
@@ -93,53 +98,74 @@ def _check_tree(node: Node, loc: tuple[str | int, ...]) -> None:
             _check_tree(value_node, (*loc, key))
 
 
+# Fixed text per PyYAML exception class. PyYAML's own messages quote source
+# text (values, tags, snippets), so only its line and column numbers are used.
+_YAML_PROBLEMS: tuple[tuple[type[yaml.YAMLError], str], ...] = (
+    (ScannerError, "invalid YAML syntax"),
+    (ParserError, "invalid YAML structure"),
+    (ComposerError, "the file must contain exactly one YAML document"),
+    (ConstructorError, "unsupported YAML tag or value"),
+    (ReaderError, "contains a character that is not allowed in YAML"),
+)
+
+
 def _yaml_problem(exc: yaml.YAMLError) -> str:
-    # Never include the source snippet that PyYAML attaches to its messages.
-    if isinstance(exc, yaml.MarkedYAMLError):
-        where = ""
-        if exc.problem_mark is not None:
-            mark = exc.problem_mark
-            where = f"line {mark.line + 1}, column {mark.column + 1}: "
-        problem = exc.problem or exc.context or "invalid YAML"
-        return f"YAML syntax error: {where}{mask_digits(problem)}"
-    return "YAML syntax error"
+    problem = next(
+        (text for kind, text in _YAML_PROBLEMS if isinstance(exc, kind)), "invalid YAML"
+    )
+    where = ""
+    if isinstance(exc, yaml.MarkedYAMLError) and exc.problem_mark is not None:
+        mark = exc.problem_mark
+        where = f"line {int(mark.line) + 1}, column {int(mark.column) + 1}: "
+    elif isinstance(exc, ReaderError):
+        where = f"position {int(exc.position)}: "
+    return f"YAML error: {where}{problem}"
 
 
-def parse_yaml(data: bytes | str) -> Any:
-    """Parse one YAML document into plain Python data, rejecting unsafe input."""
-    if isinstance(data, bytes):
-        if len(data) > MAX_CONFIG_BYTES:
-            raise ConfigError(
-                [f"configuration is larger than {MAX_CONFIG_BYTES} bytes"]
-            )
-        try:
-            text = data.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            raise ConfigError(["configuration is not valid UTF-8"]) from None
-    else:
-        if len(data.encode("utf-8")) > MAX_CONFIG_BYTES:
-            raise ConfigError(
-                [f"configuration is larger than {MAX_CONFIG_BYTES} bytes"]
-            )
-        text = data
+def _decode(data: bytes) -> str | None:
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return None
 
+
+def _compose(text: str) -> Any:
     loader = _StrictLoader(text)
     try:
         node = loader.get_single_node()
-        result: Any = None
-        if node is not None:
-            _check_tree(node, ())
-            result = loader.construct_document(node)
-        if result is None:
-            raise ConfigError(["configuration is empty"])
-        return result
-    except _Rejected as exc:
-        raise ConfigError([exc.message]) from None
-    except yaml.YAMLError as exc:
-        raise ConfigError([_yaml_problem(exc)]) from None
-    except (ValueError, TypeError, OverflowError, RecursionError):
-        raise ConfigError(
-            ["configuration contains a value that cannot be parsed"]
-        ) from None
+        if node is None:
+            return None
+        _check_tree(node, ())
+        return loader.construct_document(node)
     finally:
         loader.dispose()
+
+
+def parse_yaml(data: bytes | str) -> Any:
+    """Parse one YAML document into plain Python data, rejecting unsafe input.
+
+    Errors are raised outside ``except`` blocks so no exception holding source
+    text is chained onto the :class:`ConfigError`.
+    """
+    size = len(data) if isinstance(data, bytes) else len(data.encode("utf-8"))
+    if size > MAX_CONFIG_BYTES:
+        raise ConfigError([f"configuration is larger than {MAX_CONFIG_BYTES} bytes"])
+    text = _decode(data) if isinstance(data, bytes) else data
+    if text is None:
+        raise ConfigError(["configuration is not valid UTF-8"])
+
+    problem: str | None = None
+    result: Any = None
+    try:
+        result = _compose(text)
+    except _Rejected as exc:
+        problem = exc.message
+    except yaml.YAMLError as exc:
+        problem = _yaml_problem(exc)
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        problem = "configuration contains a value that cannot be parsed"
+    if problem is not None:
+        raise ConfigError([problem])
+    if result is None:
+        raise ConfigError(["configuration is empty"])
+    return result

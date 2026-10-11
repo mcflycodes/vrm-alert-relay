@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import errno
+import os
+import stat
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -149,7 +152,30 @@ def test_top_level_must_be_a_mapping(problems: Problems, text: str) -> None:
 
 def test_multiple_documents_are_rejected(problems: Problems) -> None:
     (problem,) = problems("a: 1\n---\nb: 2\n")
-    assert problem == "YAML syntax error: line 2, column 1: but found another document"
+    assert problem == (
+        "YAML error: line 2, column 1: the file must contain exactly one YAML document"
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("a: b: c\n", "YAML error: line 1, column 5: invalid YAML syntax"),
+        ("a: [1, 2\n", "YAML error: line 2, column 1: invalid YAML structure"),
+        (
+            "a: 1\n\x07b: 2\n",
+            "YAML error: position 5: contains a character that is not allowed in YAML",
+        ),
+        (
+            "vrm: !custom-tag {}\n",
+            "YAML error: line 1, column 6: unsupported YAML tag or value",
+        ),
+    ],
+)
+def test_yaml_errors_use_fixed_messages(
+    problems: Problems, text: str, expected: str
+) -> None:
+    assert problems(text) == (expected,)
 
 
 def test_invalid_utf8_is_rejected(problems: Problems) -> None:
@@ -170,14 +196,13 @@ def test_unparseable_scalar_is_rejected(problems: Problems) -> None:
 
 def test_python_tags_are_not_constructed(problems: Problems) -> None:
     (problem,) = problems("a: !!python/object/apply:os.system ['true']\n")
-    assert problem.startswith("YAML syntax error:")
-    assert "could not determine a constructor" in problem
+    assert problem == "YAML error: line 1, column 4: unsupported YAML tag or value"
 
 
 def test_syntax_errors_do_not_echo_source_lines(problems: Problems) -> None:
     text = 'vrm:\n  note: "+1 202 555 0142 fake-secret-for-tests-only\n  x: [\n'
     (problem,) = problems(text)
-    assert problem.startswith("YAML syntax error: line ")
+    assert problem.startswith("YAML error: line ")
     assert "fake-secret" not in problem
     assert "2025550142" not in problem
     assert "555 0142" not in problem
@@ -196,7 +221,7 @@ def test_yaml_error_without_mark_has_generic_message(
     monkeypatch.setattr(yaml_loader._StrictLoader, "get_single_node", explode)
     with pytest.raises(ConfigError) as caught:
         parse_config("a: 1\n")
-    assert caught.value.problems == ("YAML syntax error",)
+    assert caught.value.problems == ("YAML error: invalid YAML",)
 
 
 def test_marked_error_without_problem_mark(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -210,7 +235,7 @@ def test_marked_error_without_problem_mark(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(yaml_loader._StrictLoader, "get_single_node", explode)
     with pytest.raises(ConfigError) as caught:
         parse_config("a: 1\n")
-    assert caught.value.problems == ("YAML syntax error: while testing",)
+    assert caught.value.problems == ("YAML error: invalid YAML",)
 
 
 def test_load_config_missing_file(tmp_path: Path) -> None:
@@ -220,49 +245,71 @@ def test_load_config_missing_file(tmp_path: Path) -> None:
     assert caught.value.problems == (f"{path}: configuration file does not exist",)
 
 
-def test_load_config_directory(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError) as caught:
-        load_config(tmp_path)
-    (problem,) = caught.value.problems
-    assert problem.startswith(f"{tmp_path}: ")
+def _load_within(path: Path, seconds: float = 5.0) -> ConfigError:
+    """Run load_config in a daemon thread so a blocking open cannot hang the suite."""
+    outcome: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            load_config(path)
+        except BaseException as exc:  # noqa: BLE001 - handed back to the test
+            outcome.append(exc)
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    assert not worker.is_alive(), "load_config blocked"
+    (error,) = outcome
+    assert isinstance(error, ConfigError)
+    return error
 
 
-def test_load_config_rejects_non_regular_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import os
-    import stat
+def test_load_config_fifo_fails_fast(tmp_path: Path) -> None:
+    fifo = tmp_path / "config.yaml"
+    os.mkfifo(fifo)
+    error = _load_within(fifo)
+    assert error.problems == (f"{fifo}: configuration path is not a regular file",)
 
+
+def test_load_config_directory_fails_fast(tmp_path: Path) -> None:
+    error = _load_within(tmp_path)
+    assert error.problems == (f"{tmp_path}: configuration path is not a regular file",)
+
+
+def test_load_config_device_fails_fast() -> None:
+    device = Path(os.devnull)
+    assert stat.S_ISCHR(device.stat().st_mode)
+    error = _load_within(device)
+    assert error.problems == (f"{device}: configuration path is not a regular file",)
+
+
+def test_load_config_oversize_fails_fast(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
-    path.write_text("a: 1\n")
-    real_fstat = os.fstat
-
-    def fake_fstat(fd: int) -> os.stat_result:
-        result = real_fstat(fd)
-        fields = list(result)
-        fields[0] = stat.S_IFIFO | 0o600
-        return os.stat_result(fields)
-
-    monkeypatch.setattr("vrm_alert_relay.config.loader.os.fstat", fake_fstat)
-    with pytest.raises(ConfigError) as caught:
-        load_config(path)
-    assert caught.value.problems == (
-        f"{path}: configuration path is not a regular file",
+    path.write_bytes(b"#" * (MAX_CONFIG_BYTES + 1))
+    error = _load_within(path)
+    assert error.problems == (
+        f"{path}: configuration is larger than {MAX_CONFIG_BYTES} bytes",
     )
 
 
-def test_load_config_permission_denied(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("code", "reason"),
+    [
+        (errno.EACCES, "configuration file is not readable (permission denied)"),
+        (errno.EIO, "configuration file cannot be read (EIO)"),
+    ],
+)
+def test_load_config_open_errors_use_fixed_messages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int, reason: str
 ) -> None:
     path = tmp_path / "config.yaml"
     path.write_text("a: 1\n")
 
-    def deny(*_args: Any, **_kwargs: Any) -> Any:
-        raise PermissionError(errno.EACCES, "Permission denied")
+    def fail(*_args: Any) -> int:
+        raise OSError(code, "raw OS text fake-secret-for-tests-only")
 
-    monkeypatch.setattr("builtins.open", deny)
+    monkeypatch.setattr("vrm_alert_relay.config._files.os.open", fail)
     with pytest.raises(ConfigError) as caught:
         load_config(path)
-    assert caught.value.problems == (
-        f"{path}: configuration file cannot be read: Permission denied",
-    )
+    assert caught.value.problems == (f"{path}: {reason}",)
+    assert "fake-secret" not in str(caught.value)

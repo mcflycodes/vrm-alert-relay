@@ -15,6 +15,7 @@ from pydantic_core import CoreSchema, core_schema
 __all__ = [
     "MAX_TEMPLATE_CHARS",
     "BindAddress",
+    "FieldProblem",
     "HaServiceName",
     "HeaderName",
     "HttpsUrl",
@@ -51,12 +52,17 @@ _RESERVED_HEADERS = frozenset(
 )
 
 
+class FieldProblem(ValueError):
+    """A field validation failure whose message is fixed text that never contains
+    the rejected value. Only these messages are shown to operators verbatim."""
+
+
 def _pattern(regex: str, description: str) -> Callable[[str], str]:
     compiled = re.compile(regex)
 
     def check(value: str) -> str:
         if not compiled.fullmatch(value):
-            raise ValueError(description)
+            raise FieldProblem(description)
         return value
 
     return check
@@ -73,6 +79,8 @@ Name = Annotated[
     ),
 ]
 
+# Provisional: the code and service-type patterns are not yet verified against
+# real VRM Diagnostics data.
 MeasurementCode = Annotated[
     str,
     AfterValidator(
@@ -104,9 +112,9 @@ HaServiceName = Annotated[
 
 def _check_header_name(value: str) -> str:
     if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}", value):
-        raise ValueError("must be a valid HTTP header name of at most 64 characters")
+        raise FieldProblem("must be a valid HTTP header name of at most 64 characters")
     if value.lower() in _RESERVED_HEADERS or value.lower().startswith("proxy-"):
-        raise ValueError("must not be a header that the HTTP transport controls")
+        raise FieldProblem("must not be a header that the HTTP transport controls")
     return value
 
 
@@ -115,11 +123,11 @@ HeaderName = Annotated[str, AfterValidator(_check_header_name)]
 
 def _check_template(value: str) -> str:
     if not value:
-        raise ValueError("must not be empty")
+        raise FieldProblem("must not be empty")
     if len(value) > MAX_TEMPLATE_CHARS:
-        raise ValueError(f"must be at most {MAX_TEMPLATE_CHARS} characters")
+        raise FieldProblem(f"must be at most {MAX_TEMPLATE_CHARS} characters")
     if CONTROL_CHARS.search(value):
-        raise ValueError("must not contain line breaks or control characters")
+        raise FieldProblem("must not contain line breaks or control characters")
     return value
 
 
@@ -129,13 +137,13 @@ MessageTemplate = Annotated[str, AfterValidator(_check_template)]
 def _check_secret_path(value: str) -> str:
     # Never echo the value: an operator may have pasted the secret itself here.
     if not value:
-        raise ValueError("must not be empty")
+        raise FieldProblem("must not be empty")
     if len(value) > MAX_PATH_CHARS:
-        raise ValueError(f"must be at most {MAX_PATH_CHARS} characters")
+        raise FieldProblem(f"must be at most {MAX_PATH_CHARS} characters")
     if CONTROL_CHARS.search(value):
-        raise ValueError("must not contain line breaks or control characters")
+        raise FieldProblem("must not contain line breaks or control characters")
     if not os.path.isabs(value):
-        raise ValueError("must be an absolute path to a secret file")
+        raise FieldProblem("must be an absolute path to a secret file")
     return value
 
 
@@ -147,29 +155,29 @@ def _check_host(host: str) -> None:
         try:
             ipaddress.IPv6Address(host[1:-1] if host.endswith("]") else host)
         except ValueError:
-            raise ValueError("has an invalid IPv6 host") from None
+            raise FieldProblem("has an invalid IPv6 host") from None
         return
     if not _HOST_LABELS.fullmatch(host):
-        raise ValueError("has an invalid host name (use ASCII or punycode)")
+        raise FieldProblem("has an invalid host name (use ASCII or punycode)")
 
 
 def _check_https_url(value: str) -> str:
     # The value is not echoed in errors because query strings may carry tokens.
     if len(value) > MAX_URL_CHARS:
-        raise ValueError(f"must be at most {MAX_URL_CHARS} characters")
+        raise FieldProblem(f"must be at most {MAX_URL_CHARS} characters")
     if CONTROL_CHARS.search(value) or any(c.isspace() for c in value) or "\\" in value:
-        raise ValueError("must not contain whitespace, control characters, or '\\'")
+        raise FieldProblem("must not contain whitespace, control characters, or '\\'")
     try:
         parts = urlsplit(value)
     except ValueError:
-        raise ValueError("is not a valid URL") from None
+        raise FieldProblem("is not a valid URL") from None
     if parts.scheme != "https":
-        raise ValueError("must be an https:// URL")
+        raise FieldProblem("must be an https:// URL")
     if "#" in value:
-        raise ValueError("must not contain a fragment ('#')")
+        raise FieldProblem("must not contain a fragment ('#')")
     authority = parts.netloc
     if "@" in authority:
-        raise ValueError("must not contain user info (credentials) before the host")
+        raise FieldProblem("must not contain user info (credentials) before the host")
     host = authority
     if host.startswith("["):
         end = host.find("]")
@@ -177,14 +185,14 @@ def _check_https_url(value: str) -> str:
     else:
         host = host.rsplit(":", 1)[0]
     if not host:
-        raise ValueError("must include a host")
+        raise FieldProblem("must include a host")
     _check_host(host)
     try:
         port = parts.port
     except ValueError:
-        raise ValueError("has an invalid port") from None
+        raise FieldProblem("has an invalid port") from None
     if port == 0:
-        raise ValueError("has an invalid port")
+        raise FieldProblem("has an invalid port")
     return value
 
 
@@ -195,7 +203,7 @@ def _check_bind(value: str) -> str:
     try:
         return str(ipaddress.ip_address(value))
     except ValueError:
-        raise ValueError("must be an IPv4 or IPv6 address") from None
+        raise FieldProblem("must be an IPv4 or IPv6 address") from None
 
 
 BindAddress = Annotated[str, AfterValidator(_check_bind)]
@@ -216,7 +224,7 @@ class PhoneNumber:
 
     def __init__(self, national: str) -> None:
         if not re.fullmatch(r"[2-9][0-9]{2}[2-9][0-9]{6}", national):
-            raise ValueError(_PHONE_ERROR)
+            raise FieldProblem(_PHONE_ERROR)
         self._national = national
 
     @classmethod
@@ -236,7 +244,7 @@ class PhoneNumber:
         except ValueError:
             digits = re.sub(r"[^0-9]", "", value)
             hint = f" (value ending {digits[-4:]})" if len(digits) >= 4 else ""
-            raise ValueError(f"{_PHONE_ERROR}{hint}") from None
+            raise FieldProblem(f"{_PHONE_ERROR}{hint}") from None
 
     @property
     def national(self) -> str:
@@ -288,7 +296,7 @@ class PhoneNumber:
         if isinstance(value, str):
             return cls.parse(value)
         # A ValueError (not TypeError) so pydantic reports it as a field problem.
-        raise ValueError("must be a string (quote phone numbers in YAML)")
+        raise FieldProblem("must be a string (quote phone numbers in YAML)")
 
 
 def _masked_phone(value: PhoneNumber) -> str:
