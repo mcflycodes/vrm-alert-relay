@@ -15,7 +15,7 @@ The project is intended for use cases where a single threshold notification is n
 - Stale-data and polling-failure detection
 - Persistent state across restarts
 - Multiple installations, devices, and measurements
-- Pluggable notification providers, beginning with VoIP.ms SMS
+- Pluggable notification providers: VoIP.ms SMS, Home Assistant, and a generic webhook to start
 - Dry-run mode and container deployment
 
 ## Status
@@ -36,7 +36,7 @@ The current build is a placeholder: it logs that it is running in dry-run mode a
 
 ## Security and privacy
 
-Abuse prevention and deployment privacy are core design requirements. Sending will be disabled by default, recipients will be explicitly allow-listed, and layered rate limits will constrain providers, recipients, and rules. The project will not collect telemetry.
+Abuse prevention and deployment privacy are core design requirements. Sending will be disabled by default, recipients will be explicitly allow-listed, and a global rate limit, per-rule cooldowns, and bounded critical reminders will constrain message volume. The project will not collect telemetry.
 
 Public examples and tests use fictitious identifiers. Operators supply their own installations, devices, rules, providers, and recipients through deployment configuration; none are built into the software.
 
