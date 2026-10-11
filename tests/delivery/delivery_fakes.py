@@ -1,4 +1,4 @@
-"""Fake providers, configuration, and a switchable failing SQLite connection.
+"""Fake clocks, providers, configuration, and switchable failing SQLite connections.
 
 Every identifier, number, and address here is fictitious.
 """
@@ -9,7 +9,7 @@ import random
 import sqlite3
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from vrm_alert_relay.config import RelayConfig, parse_config
@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from vrm_alert_relay.config import Recipient
 
 BASE = datetime(2035, 1, 1, tzinfo=UTC)
+SUMMARY_PREFIX = "VRM Alert Relay: "
 
 CONFIG_TEMPLATE = """
 version: 1
@@ -46,6 +47,7 @@ recipients:
   partner_sms: {{provider: voipms, phone: "+1 202 555 0177"}}
   audit: {{provider: log}}
   hook: {{provider: webhook}}
+  r2025550123: {{provider: voipms, phone: "+1 202 555 0123"}}
 providers:
   voipms:
     enabled: {voipms}
@@ -66,17 +68,26 @@ rules:
     direction: falling
     levels: [{{name: warning, threshold: 40}}]
     recipients: [owner_sms, partner_sms, audit]
+  - id: pump
+    installation: cabin
+    measurement: {{code: pu, instance: 7}}
+    direction: rising
+    levels: [{{name: warning, threshold: 1}}]
+    recipients: [r2025550123]
+{system}
 """
 
 
-def make_config(
+def make_config(  # every knob is a keyword with a default
     *,
     sending: bool = True,
     voipms: bool = True,
     per_hour: int = 20,
     per_day: int = 60,
     retries: int = 3,
+    system: tuple[str, ...] | None = ("owner_sms",),
 ) -> RelayConfig:
+    """Configuration for tests; system notifications go to ``owner_sms`` by default."""
     return parse_config(
         CONFIG_TEMPLATE.format(
             sending=str(sending).lower(),
@@ -84,8 +95,36 @@ def make_config(
             per_hour=per_hour,
             per_day=per_day,
             retries=retries,
+            system="" if system is None else f"system_recipients: [{', '.join(system)}]",
         )
     )
+
+
+@dataclass
+class FakeClock:
+    """Wall-clock and monotonic time that tests move explicitly."""
+
+    now: datetime = BASE
+    mono: float = 10_000.0
+
+    def wall(self) -> datetime:
+        return self.now
+
+    def monotonic(self) -> float:
+        return self.mono
+
+    def advance(self, delta: timedelta) -> None:
+        """Real time passes: both clocks move."""
+        self.now += delta
+        self.mono += delta.total_seconds()
+
+    def set(self, when: datetime) -> None:
+        """Real time passes until ``when``."""
+        self.advance(when - self.now)
+
+    def jump_wall(self, delta: timedelta) -> None:
+        """Only the wall clock is changed, as by a bad time sync."""
+        self.now += delta
 
 
 @dataclass
@@ -97,13 +136,13 @@ class Sent:
 
 @dataclass
 class FakeProvider:
-    """Records every send; returns scripted results, then ``default``."""
+    """Records every send; returns scripted results, then ``default``. No lookup."""
 
-    results: deque[SendResult | BaseException | Any] = field(default_factory=deque)
+    results: deque[Any] = field(default_factory=deque)
     default: SendResult = field(default_factory=lambda: SendResult(SendStatus.DELIVERED, "msg-1"))
     sent: list[Sent] = field(default_factory=list)
 
-    def script(self, *results: SendResult | BaseException | Any) -> None:
+    def script(self, *results: Any) -> None:
         self.results.extend(results)
 
     def send(self, message: Message, recipient: Recipient) -> SendResult:
@@ -114,12 +153,15 @@ class FakeProvider:
         self.sent.append(Sent(message, recipient, outcome))
         return outcome  # type: ignore[no-any-return]
 
+    def texts(self) -> list[str]:
+        return [sent.message.text for sent in self.sent]
+
 
 @dataclass
 class FakeReconcilingProvider(FakeProvider):
-    """A provider with a lookup; returns scripted reconcile outcomes."""
+    """A provider with a lookup; returns scripted reconcile outcomes, then UNKNOWN."""
 
-    lookups: deque[ReconcileStatus | BaseException | Any] = field(default_factory=deque)
+    lookups: deque[Any] = field(default_factory=deque)
     queries: list[ReconcileQuery] = field(default_factory=list)
 
     def reconcile(self, query: ReconcileQuery) -> ReconcileStatus:
@@ -137,7 +179,6 @@ class FailSwitch:
         self.on = False
         self.error = error
         self.only = only
-        self.failures = 0
 
     def check(self, sql: str) -> None:
         if (
@@ -145,7 +186,6 @@ class FailSwitch:
             and not sql.lstrip().upper().startswith("ROLLBACK")
             and (self.only is None or self.only in sql)
         ):
-            self.failures += 1
             raise sqlite3.OperationalError(self.error)
 
 
@@ -175,13 +215,13 @@ def flaky_store(state_dir: Path, switch: FailSwitch, **kwargs: Any) -> StateStor
     return StateStore(state_dir, connect=connect, **kwargs)
 
 
-def make_engine(
+def make_engine(  # every collaborator is a keyword with a default
     store: StateStore,
     *,
+    clock: FakeClock,
     config: RelayConfig | None = None,
     voipms: FakeProvider | None = None,
     dry_run: FakeProvider | None = None,
-    now: datetime = BASE,
     limits: DeliveryLimits | None = None,
     seed: int = 7,
 ) -> DeliveryEngine:
@@ -190,7 +230,7 @@ def make_engine(
         providers={"voipms": voipms or FakeProvider()},
         dry_run=dry_run or FakeProvider(),
         store=store,
-        now=now,
+        clock=clock,
         rng=random.Random(seed),  # noqa: S311  # deterministic jitter, not cryptography
         limits=limits,
     )
@@ -206,3 +246,7 @@ def rule_note(n: int, rule_id: str = "freezer", text: str = "Freezer warming") -
 
 def direct_note(n: int, name: str, text: str = "Test notification") -> Notification:
     return Notification(event_id=event_id(n), text=text, target=RecipientTarget(name))
+
+
+def summaries(provider: FakeProvider) -> list[str]:
+    return [text for text in provider.texts() if text.startswith(SUMMARY_PREFIX)]

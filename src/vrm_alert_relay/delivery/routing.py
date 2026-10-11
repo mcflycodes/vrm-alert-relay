@@ -2,11 +2,11 @@
 
 :class:`Routing` is built once from a validated
 :class:`~vrm_alert_relay.config.RelayConfig` and never changes. A
-:class:`Notification` can only *name* a configured rule or recipient; the
-destination a provider receives is always the configured
-:class:`~vrm_alert_relay.config.Recipient` object, looked up by name.
-Nothing in an event, label, template, or provider response can add a
-recipient or change where one points.
+:class:`Notification` can only *name* a configured rule, a configured
+recipient, or the configured system recipients; the destination a provider
+receives is always the configured :class:`~vrm_alert_relay.config.Recipient`
+object, looked up by name. Nothing in an event, label, template, delivery
+record, or provider response can add a recipient or change where one points.
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING
+
+from vrm_alert_relay.config import display_name
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -27,6 +29,7 @@ __all__ = [
     "Route",
     "Routing",
     "RuleTarget",
+    "SystemTarget",
     "Target",
     "UnknownTargetError",
 ]
@@ -45,12 +48,17 @@ class RuleTarget:
 
 @dataclass(frozen=True, slots=True)
 class RecipientTarget:
-    """Deliver to one configured recipient, e.g. a test or system notification."""
+    """Deliver to one configured recipient, e.g. a test notification."""
 
     name: str
 
 
-type Target = RuleTarget | RecipientTarget
+@dataclass(frozen=True, slots=True)
+class SystemTarget:
+    """Deliver to the configured system recipients, e.g. monitoring degraded."""
+
+
+type Target = RuleTarget | RecipientTarget | SystemTarget
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,27 +87,37 @@ class Route:
 class Routing:
     """An immutable name-to-recipient mapping built from operator configuration."""
 
-    __slots__ = ("_routes", "_rules")
+    __slots__ = ("_display", "_routes", "_rules", "_system")
+
+    _routes: Mapping[str, Route]
+    _rules: Mapping[str, tuple[str, ...]]
+    _system: tuple[str, ...]
+    _display: Mapping[str, str]
 
     def __init__(
         self,
         routes: Mapping[str, Route],
         rules: Mapping[str, tuple[str, ...]],
+        system: tuple[str, ...] = (),
     ) -> None:
         frozen_routes = dict(routes)
         for name, route in frozen_routes.items():
             if route.name != name:
                 raise ValueError("route names must match their keys")  # noqa: TRY003  # per-check validation message
         frozen_rules = {rule_id: tuple(names) for rule_id, names in rules.items()}
-        for names in frozen_rules.values():
-            unknown = [name for name in names if name not in frozen_routes]
-            if unknown:
-                raise UnknownTargetError("a rule names an unconfigured recipient")  # noqa: TRY003  # per-check validation message
+        for names in (*frozen_rules.values(), tuple(system)):
+            if any(name not in frozen_routes for name in names):
+                raise UnknownTargetError("a route list names an unconfigured recipient")  # noqa: TRY003  # per-check validation message
         object.__setattr__(self, "_routes", MappingProxyType(frozen_routes))
         object.__setattr__(self, "_rules", MappingProxyType(frozen_rules))
-
-    _routes: Mapping[str, Route]
-    _rules: Mapping[str, tuple[str, ...]]
+        object.__setattr__(self, "_system", tuple(system))
+        object.__setattr__(
+            self,
+            "_display",
+            MappingProxyType(
+                {name: display_name(name, index) for index, name in enumerate(frozen_routes)}
+            ),
+        )
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("Routing is immutable")  # noqa: TRY003  # per-check validation message
@@ -114,14 +132,22 @@ class Routing:
             for name, recipient in config.recipients.items()
         }
         rules = {rule.id: tuple(rule.recipients) for rule in config.rules}
-        return cls(routes, rules)
+        return cls(routes, rules, config.system_recipient_names())
 
     @property
     def routes(self) -> Mapping[str, Route]:
         return self._routes
 
+    @property
+    def system_routes(self) -> tuple[Route, ...]:
+        return tuple(self._routes[name] for name in self._system)
+
     def route(self, name: str) -> Route | None:
         return self._routes.get(name)
+
+    def display(self, name: str) -> str:
+        """The recipient name as logs may show it: phone-shaped names are withheld."""
+        return self._display.get(name) or display_name(name, "?")
 
     def resolve(self, target: Target) -> tuple[Route, ...]:
         """Return the configured routes for ``target``, or raise :class:`UnknownTargetError`."""
@@ -135,4 +161,6 @@ class Routing:
             if route is None:
                 raise UnknownTargetError("unknown recipient")  # noqa: TRY003  # per-check validation message
             return (route,)
+        if isinstance(target, SystemTarget):
+            return self.system_routes
         raise UnknownTargetError("unsupported target")  # noqa: TRY003  # per-check validation message

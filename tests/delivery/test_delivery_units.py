@@ -20,6 +20,8 @@ from vrm_alert_relay.delivery import (
     Route,
     Routing,
     RuleTarget,
+    SystemClock,
+    SystemTarget,
     UnknownTargetError,
     delivery_id,
     sanitize_text,
@@ -29,26 +31,34 @@ from vrm_alert_relay.engine import Event, EventKind
 # Rate limiter ---------------------------------------------------------------------
 
 
+def key(n: int) -> tuple[str, str, int]:
+    return (f"evt_{n}", "owner_sms", 1)
+
+
 def test_rate_limiter_uses_sliding_hour_and_day_windows() -> None:
     limiter = RateLimiter(per_hour=2, per_day=3)
-    assert limiter.available(BASE)
-    limiter.consume(BASE)
-    limiter.consume(BASE + timedelta(minutes=30))
-    assert not limiter.available(BASE + timedelta(minutes=59))
-    # The first attempt leaves the hour window exactly one hour later.
-    assert limiter.available(BASE + timedelta(hours=1))
-    limiter.consume(BASE + timedelta(hours=1))
-    assert limiter.counts(BASE + timedelta(hours=1)) == (2, 3)
-    assert not limiter.available(BASE + timedelta(hours=3))
-    assert limiter.available(BASE + timedelta(days=1))
-    assert limiter.counts(BASE + timedelta(days=2)) == (0, 0)
+    assert limiter.available(0.0)
+    limiter.consume(key(1), 0.0)
+    limiter.consume(key(2), 1800.0)
+    assert not limiter.available(3599.0)
+    # The first send leaves the hour window exactly one hour later.
+    assert limiter.available(3600.0)
+    limiter.consume(key(3), 3600.0)
+    assert limiter.counts(3600.0) == (2, 3)
+    assert not limiter.available(3 * 3600.0)
+    assert limiter.take_expired() == []
+    assert limiter.available(86_400.0)
+    assert limiter.take_expired() == [key(1)]
+    assert limiter.counts(2 * 86_400.0) == (0, 0)
+    assert limiter.take_expired() == [key(2), key(3)]
+    assert limiter.take_expired() == []
 
 
-def test_rate_limiter_restores_attempts_and_keeps_only_what_it_needs() -> None:
-    attempts = [BASE + timedelta(minutes=n) for n in range(50)]
-    limiter = RateLimiter(per_hour=5, per_day=10, attempts=reversed(attempts))
-    assert not limiter.available(BASE + timedelta(minutes=50))
-    assert limiter.counts(BASE + timedelta(minutes=50)) == (5, 10)
+def test_rate_limiter_restores_attempts_in_order() -> None:
+    restored = [(float(60 * n), key(n)) for n in range(50)]
+    limiter = RateLimiter(per_hour=5, per_day=10, restored=reversed(restored))
+    assert not limiter.available(50 * 60.0)
+    assert limiter.counts(50 * 60.0) == (50, 50)
 
 
 @pytest.mark.parametrize(("per_hour", "per_day"), [(0, 1), (1, 0)])
@@ -91,6 +101,11 @@ def test_routing_resolves_rules_and_recipients_from_config() -> None:
     routing = Routing.from_config(config)
     names = [route.name for route in routing.resolve(RuleTarget("battery"))]
     assert names == ["owner_sms", "partner_sms", "audit"]
+    assert [route.name for route in routing.resolve(SystemTarget())] == ["owner_sms"]
+    assert routing.display("owner_sms") == "owner_sms"
+    assert routing.display("r2025550123") == "[#4]"
+    assert routing.display("r2025550999") == "[#?]"
+    assert routing.display("retired") == "retired"
     (route,) = routing.resolve(RecipientTarget("hook"))
     assert route.recipient is config.recipients["hook"]
     assert route.mode is DeliveryMode.DRY_RUN
@@ -113,6 +128,8 @@ def test_routing_rejects_inconsistent_construction() -> None:
         Routing({"partner_sms": route}, {})
     with pytest.raises(UnknownTargetError):
         Routing({"owner_sms": route}, {"freezer": ("owner_sms", "partner_sms")})
+    with pytest.raises(UnknownTargetError):
+        Routing({"owner_sms": route}, {}, ("partner_sms",))
 
 
 def test_notification_for_event_targets_the_rule() -> None:
@@ -163,3 +180,10 @@ def test_protocols_are_runtime_checkable() -> None:
     assert not isinstance(FakeProvider(), ReconcilingProvider)
     assert isinstance(FakeReconcilingProvider(), ReconcilingProvider)
     assert not isinstance(object(), Provider)
+
+
+def test_system_clock_reads_real_time() -> None:
+    clock = SystemClock()
+    assert clock.wall().tzinfo is not None
+    first = clock.monotonic()
+    assert clock.monotonic() >= first

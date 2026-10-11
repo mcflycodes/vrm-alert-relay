@@ -23,6 +23,7 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
         CREATE TABLE delivery (
             event_id TEXT NOT NULL,
             recipient TEXT NOT NULL,
+            rule_id TEXT,
             kind TEXT NOT NULL,
             status TEXT NOT NULL,
             text TEXT NOT NULL,
@@ -36,9 +37,18 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
         ) STRICT
         """,
         "CREATE INDEX delivery_updated_at ON delivery (updated_at)",
-        "CREATE TABLE send_attempt (id INTEGER PRIMARY KEY, at TEXT NOT NULL) STRICT",
+        """
+        CREATE TABLE send_attempt (
+            id INTEGER PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            recipient TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            at TEXT NOT NULL,
+            live INTEGER NOT NULL,
+            UNIQUE (event_id, recipient, attempt)
+        ) STRICT
+        """,
         "CREATE INDEX send_attempt_at ON send_attempt (at)",
-        "CREATE TABLE suppressed (recipient TEXT PRIMARY KEY, count INTEGER NOT NULL) STRICT",
         "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT",
     ),
 )
@@ -61,22 +71,30 @@ def migrate(
 ) -> int:
     """Bring the schema up to date, one transaction per step; return the final version.
 
-    The connection must be in autocommit mode so that transactions are explicit.
+    The version is read again after each write lock is taken, so a concurrent
+    migration is never applied twice. The connection must be in autocommit
+    mode so that transactions are explicit.
     """
-    version = schema_version(connection)
-    if version > len(migrations):
-        raise SchemaTooNewError(  # noqa: TRY003  # the versions are the useful detail
-            f"database schema version {version} is newer than supported {len(migrations)}"
-        )
-    for index in range(version, len(migrations)):
+    target = len(migrations)
+    if schema_version(connection) == target:
+        return target  # Up to date: no write lock, so a read-only file can still be read.
+    while True:
         connection.execute("BEGIN IMMEDIATE")
         try:
-            for statement in migrations[index]:
-                connection.execute(statement)
-            # PRAGMA does not accept parameters; the value is a loop integer.
-            connection.execute(f"PRAGMA user_version = {index + 1:d}")
+            version = schema_version(connection)
+            if version < target:
+                for statement in migrations[version]:
+                    connection.execute(statement)
+                # PRAGMA does not accept parameters; the value is a checked integer.
+                connection.execute(f"PRAGMA user_version = {version + 1:d}")
         except BaseException:
             connection.execute("ROLLBACK")
             raise
         connection.execute("COMMIT")
-    return len(migrations)
+        if version >= target:
+            break
+    if version > target:
+        raise SchemaTooNewError(  # noqa: TRY003  # the versions are the useful detail
+            f"database schema version {version} is newer than supported {target}"
+        )
+    return target

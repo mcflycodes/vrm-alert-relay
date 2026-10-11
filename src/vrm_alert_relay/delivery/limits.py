@@ -10,52 +10,65 @@ from typing import TYPE_CHECKING, Final
 if TYPE_CHECKING:
     import random
     from collections.abc import Iterable
-    from datetime import datetime
 
-__all__ = ["DAY", "HOUR", "RateLimiter", "RetryPolicy"]
+    from vrm_alert_relay.state import AttemptKey
+
+__all__ = ["DAY", "HOUR", "MAX_EXPIRED", "RateLimiter", "RetryPolicy"]
 
 HOUR: Final = timedelta(hours=1)
 DAY: Final = timedelta(days=1)
+MAX_EXPIRED: Final = 10_000
 
 
 class RateLimiter:
-    """A global cap over sliding one-hour and 24-hour windows.
+    """A cap over sliding one-hour and 24-hour windows of monotonic time.
 
-    Every provider call (first attempts, retries, and summaries) consumes one
-    slot. An attempt at time ``t`` occupies the windows ``(t, t + 1 h]`` and
-    ``(t, t + 24 h]``, so no 60-minute or 24-hour interval ever holds more
-    than the configured number of attempts, including across restarts when the
-    attempts are reloaded from the store. Only the newest ``per_hour`` and
-    ``per_day`` attempts are kept, which is all the decision needs.
+    Each send at time ``t`` occupies the windows ``(t, t + 1 h]`` and
+    ``(t, t + 24 h]``, so no 60-minute or 24-hour interval holds more than
+    the configured number. Monotonic time cannot jump, so changing the wall
+    clock never frees a slot. Keys that leave the 24-hour window are kept
+    (bounded) for :meth:`take_expired`, so their stored evidence can be pruned.
     """
 
-    def __init__(self, per_hour: int, per_day: int, attempts: Iterable[datetime] = ()) -> None:
+    def __init__(
+        self,
+        per_hour: int,
+        per_day: int,
+        restored: Iterable[tuple[float, AttemptKey]] = (),
+    ) -> None:
         if per_hour < 1 or per_day < 1:
             raise ValueError("rate limits must be positive")  # noqa: TRY003  # per-check validation message
         self._per_hour = per_hour
         self._per_day = per_day
-        ordered = sorted(attempts)
-        self._hour: deque[datetime] = deque(ordered, maxlen=per_hour)
-        self._day: deque[datetime] = deque(ordered, maxlen=per_day)
+        ordered = sorted(restored)
+        self._hour: deque[float] = deque(at for at, _ in ordered)
+        self._day: deque[tuple[float, AttemptKey]] = deque(ordered)
+        self._expired: deque[AttemptKey] = deque(maxlen=MAX_EXPIRED)
 
-    def _expire(self, now: datetime) -> None:
-        while self._hour and self._hour[0] <= now - HOUR:
+    def _expire(self, now: float) -> None:
+        hour, day = HOUR.total_seconds(), DAY.total_seconds()
+        while self._hour and self._hour[0] <= now - hour:
             self._hour.popleft()
-        while self._day and self._day[0] <= now - DAY:
-            self._day.popleft()
+        while self._day and self._day[0][0] <= now - day:
+            self._expired.append(self._day.popleft()[1])
 
-    def available(self, now: datetime) -> bool:
+    def available(self, now: float) -> bool:
         self._expire(now)
         return len(self._hour) < self._per_hour and len(self._day) < self._per_day
 
-    def consume(self, now: datetime) -> None:
+    def consume(self, key: AttemptKey, now: float) -> None:
         self._hour.append(now)
-        self._day.append(now)
+        self._day.append((now, key))
 
-    def counts(self, now: datetime) -> tuple[int, int]:
-        """Attempts in the current one-hour and 24-hour windows."""
+    def counts(self, now: float) -> tuple[int, int]:
+        """Sends in the current one-hour and 24-hour windows."""
         self._expire(now)
         return len(self._hour), len(self._day)
+
+    def take_expired(self) -> list[AttemptKey]:
+        expired = list(self._expired)
+        self._expired.clear()
+        return expired
 
 
 @dataclass(frozen=True, slots=True)

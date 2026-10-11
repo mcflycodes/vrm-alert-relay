@@ -5,9 +5,17 @@ Providers (one per transport) implement :class:`Provider`, and
 service loop builds a :class:`DeliveryEngine` from configuration, hands it
 each poll cycle's rule states and notifications with
 :meth:`DeliveryEngine.accept_cycle`, and calls :meth:`DeliveryEngine.run_due`.
+ADR 0002 describes the delivery semantics.
 """
 
-from .engine import DeliveryEngine, DeliveryHealth, DeliveryLimits, RunReport
+from .clock import Clock, SystemClock
+from .engine import (
+    STORAGE_NOTICE_TEXT,
+    DeliveryEngine,
+    DeliveryHealth,
+    DeliveryLimits,
+    RunReport,
+)
 from .limits import RateLimiter, RetryPolicy
 from .protocol import (
     MAX_MESSAGE_LENGTH,
@@ -27,12 +35,15 @@ from .routing import (
     Route,
     Routing,
     RuleTarget,
+    SystemTarget,
     Target,
     UnknownTargetError,
 )
 
 __all__ = [
     "MAX_MESSAGE_LENGTH",
+    "STORAGE_NOTICE_TEXT",
+    "Clock",
     "DeliveryEngine",
     "DeliveryHealth",
     "DeliveryLimits",
@@ -51,6 +62,8 @@ __all__ = [
     "RunReport",
     "SendResult",
     "SendStatus",
+    "SystemClock",
+    "SystemTarget",
     "Target",
     "UnknownTargetError",
     "delivery_id",
