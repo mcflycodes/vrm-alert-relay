@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 
 import pytest
 
@@ -90,6 +90,7 @@ def test_invalid_levels_raise_value_error(name: str, threshold: float) -> None:
 
 def populated_state() -> RuleState:
     return RuleState(
+        generation=BASE.isoformat(),
         active_level="critical",
         episode=7,
         clear_count=2,
@@ -111,7 +112,6 @@ def populated_state() -> RuleState:
             ("critical", BASE + timedelta(minutes=1)),
             ("warning", BASE),
         ),
-        level_recovery_times=(("warning", BASE - timedelta(minutes=3)),),
         suppressed_escalations=4,
     )
 
@@ -123,19 +123,11 @@ def test_state_round_trips_through_json_compatible_dict() -> None:
     assert RuleState.from_dict(RuleState().to_dict()) == RuleState()
     assert isinstance(encoded["level_notification_times"], list)
 
-    pending = RuleState(
-        episode=8,
-        pending_recovery_levels=("critical",),
-        pending_recovery_started_at=BASE,
-        level_recovery_times=(("critical", BASE),),
-    )
-    assert RuleState.from_dict(pending.to_dict()) == pending
-
 
 def test_schema_version_is_bumped_and_old_state_is_rejected() -> None:
     encoded = RuleState().to_dict()
-    assert encoded["version"] == 2
-    encoded["version"] = 1
+    assert encoded["version"] == 3
+    encoded["version"] = 2
     with pytest.raises(InvalidRuleStateError, match="version"):
         RuleState.from_dict(encoded)
 
@@ -153,6 +145,9 @@ def test_persisted_active_level_requires_positive_episode() -> None:
         ("version", 1),
         ("version", 1.0),
         ("version", True),
+        ("generation", 1),
+        ("generation", "not-a-time"),
+        ("generation", "2030-01-01T00:00:00"),
         ("active_level", 1),
         ("active_level", ""),
         ("episode", -1),
@@ -171,15 +166,12 @@ def test_persisted_active_level_requires_positive_episode() -> None:
         ("episode_announced", 1),
         ("episode_notified_levels", "bad"),
         ("pending_escalation", 1),
-        ("pending_recovery_levels", "bad"),
-        ("pending_recovery_started_at", "bad"),
         ("escalation_ordinal", -1),
         ("rule_direction", "sideways"),
         ("rule_direction", 1),
         ("level_order", "bad"),
         ("needs_rederive", 1),
         ("level_notification_times", "bad"),
-        ("level_recovery_times", "bad"),
         ("suppressed_escalations", -1),
     ],
 )
@@ -200,9 +192,6 @@ def test_corrupt_scalar_state_is_rejected(field: str, bad_value: object) -> None
         ("level_notification_times", [["warning", "2030-01-01T00:00:00"]]),
         ("episode_notified_levels", [""]),
         ("episode_notified_levels", ["warning", "warning"]),
-        ("pending_recovery_levels", [""]),
-        ("pending_recovery_levels", ["warning", "warning"]),
-        ("level_recovery_times", [["warning"]]),
     ],
 )
 def test_corrupt_history_state_is_rejected(field: str, bad_value: object) -> None:
@@ -238,21 +227,13 @@ def test_state_rejects_missing_extra_and_non_mapping_inputs() -> None:
         {"episode_notified_levels": ("same", "same")},
         {"pending_escalation": "warning"},
         {"pending_escalation": ""},
-        {"pending_recovery_levels": ("warning",)},
-        {"pending_recovery_started_at": BASE},
-        {
-            "active_level": "warning",
-            "episode": 1,
-            "pending_recovery_levels": ("warning",),
-            "pending_recovery_started_at": BASE,
-        },
+        {"generation": "bad"},
         {"active_level": "warning"},
         {"newest_sample_time": datetime(2030, 1, 1)},
         {"newest_value": float("inf")},
         {"clear_count": 1},
         {"reminder_count": 1},
         {"level_notification_times": (("warning", datetime(2030, 1, 1)),)},
-        {"level_recovery_times": (("warning", datetime(2030, 1, 1)),)},
     ],
 )
 def test_direct_state_construction_is_validated(kwargs: dict[str, object]) -> None:
@@ -279,3 +260,20 @@ def test_direct_state_history_validation_covers_shape_duplicates_and_bounds() ->
     for kwargs in invalid_states:
         with pytest.raises(InvalidRuleStateError):
             RuleState(**kwargs)  # type: ignore[arg-type]
+
+
+def test_normal_state_cannot_claim_an_announced_episode() -> None:
+    with pytest.raises(
+        InvalidRuleStateError, match="normal state cannot have an announced episode"
+    ):
+        RuleState(episode=1, episode_announced=True)
+
+
+def test_unexpected_validation_error_is_converted_to_state_error() -> None:
+    class BrokenTimezone(tzinfo):
+        def utcoffset(self, value: datetime | None) -> timedelta | None:
+            raise ValueError("fictitious broken timezone")
+
+    broken_time = datetime(2030, 1, 1, tzinfo=BrokenTimezone())
+    with pytest.raises(InvalidRuleStateError, match="fictitious broken timezone"):
+        RuleState(newest_sample_time=broken_time)

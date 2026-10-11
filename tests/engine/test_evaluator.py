@@ -511,56 +511,34 @@ def test_threshold_oscillation_is_bounded_by_cross_episode_cooldown() -> None:
     ]
 
 
-def test_recovery_waits_for_its_sliding_cooldown_boundary() -> None:
+def test_every_announced_episode_recovers_immediately() -> None:
     rule = rising_rule(
-        levels=(LevelSpec("critical", 10.0),),
+        levels=(LevelSpec("warning", 10.0), LevelSpec("alert", 20.0)),
         cooldown=timedelta(minutes=15),
         stale_after=timedelta(days=1),
     )
-    state, _ = step(rule, RuleState(), 1, 10.0)
-    state, first_recovery = evaluate(
-        rule,
-        state,
-        Sample(9.0, BASE + timedelta(minutes=3)),
-        BASE + timedelta(minutes=3),
-    )
-    state, _ = step(rule, state, 16, 10.0)
-    state, suppressed_recovery = evaluate(
-        rule,
-        state,
-        Sample(9.0, BASE + timedelta(minutes=17)),
-        BASE + timedelta(minutes=17),
-    )
-    assert [event.kind for event in first_recovery] == [EventKind.RECOVERED]
-    assert suppressed_recovery == []
-    assert state.pending_recovery_levels == ("critical",)
+    sequence = ((0, 15.0), (10, 25.0), (11, 5.0), (16, 15.0), (17, 5.0))
+    state = RuleState()
+    kinds: dict[int, list[EventKind]] = {}
+    for minute, value in sequence:
+        state, events = step(rule, state, minute, value)
+        kinds[minute] = events
 
-    state, released_recovery = evaluate(rule, state, None, BASE + timedelta(minutes=18))
-    assert [event.kind for event in released_recovery] == [EventKind.RECOVERED]
-    assert state.pending_recovery_levels == ()
+    assert kinds == {
+        0: [EventKind.ESCALATED],
+        10: [EventKind.ESCALATED],
+        11: [EventKind.RECOVERED],
+        16: [EventKind.ESCALATED],
+        17: [EventKind.RECOVERED],
+    }
 
-
-def test_pending_recovery_is_dropped_when_danger_returns() -> None:
-    rule = rising_rule(
-        levels=(LevelSpec("critical", 10.0),),
-        cooldown=timedelta(minutes=15),
-        stale_after=timedelta(days=1),
-    )
-    state, _ = step(rule, RuleState(), 1, 10.0)
-    state, _ = step(rule, state, 3, 9.0)
-    state, _ = step(rule, state, 16, 10.0)
-    state, _ = step(rule, state, 17, 9.0)
-    assert state.pending_recovery_levels == ("critical",)
-
-    state, events = evaluate(
-        rule,
-        state,
-        Sample(10.0, BASE + timedelta(minutes=18)),
-        BASE + timedelta(minutes=18),
-    )
-    assert EventKind.RECOVERED not in [event.kind for event in events]
-    assert state.pending_recovery_levels == ()
-    assert state.pending_escalation == "critical"
+    state, events = step(rule, state, 18, 15.0)
+    assert events == []
+    assert state.pending_escalation == "warning"
+    state, events = step(rule, state, 19, 5.0)
+    assert events == []
+    assert state.active_level is None
+    assert state.pending_escalation is None
 
 
 def test_future_persisted_sample_times_are_treated_as_unset() -> None:
@@ -630,11 +608,13 @@ def test_event_ids_are_data_derived_across_clock_drift_and_round_trip() -> None:
         stale_after=timedelta(days=1),
     )
 
+    seeded_at = BASE - timedelta(minutes=1)
+    prior, _ = evaluate(rule, RuleState(), Sample(5.0, seeded_at), seeded_at)
+    prior = RuleState.from_dict(prior.to_dict())
     alert_sample = Sample(11.0, BASE)
-    for prior in (RuleState(), RuleState.from_dict(RuleState().to_dict())):
-        _, first = evaluate(rule, prior, alert_sample, BASE)
-        _, replayed = evaluate(rule, prior, alert_sample, BASE + timedelta(seconds=30))
-        assert first[0].event_id == replayed[0].event_id
+    _, first = evaluate(rule, prior, alert_sample, BASE)
+    _, replayed = evaluate(rule, prior, alert_sample, BASE + timedelta(seconds=30))
+    assert first[0].event_id == replayed[0].event_id
 
     alerted, _ = evaluate(rule, RuleState(), alert_sample, BASE)
     replay_state = RuleState.from_dict(alerted.to_dict())
@@ -794,17 +774,45 @@ def test_missing_active_level_without_old_index_fails_safe() -> None:
     assert state.pending_escalation is None
 
 
-def test_missing_active_level_outside_shorter_ladder_fails_safe() -> None:
-    rule = rising_rule(levels=(LevelSpec("critical", 10.0),))
+def test_removed_pending_level_clamps_to_top_remaining_level_while_stale() -> None:
+    rule = rising_rule(
+        levels=(LevelSpec("warning", 10.0),),
+        stale_after=timedelta(minutes=1),
+    )
     state = RuleState(
         active_level="removed",
         episode=1,
+        newest_sample_time=BASE,
+        newest_value=25.0,
+        last_evaluated_sample_time=BASE,
+        episode_started_at=BASE,
+        pending_escalation="removed",
         rule_direction=Direction.RISING,
-        level_order=("old-warning", "removed"),
+        level_order=("old-warning", "old-alert", "removed"),
+        level_notification_times=(("warning", BASE),),
+    )
+    state, events = evaluate(rule, state, None, BASE + timedelta(minutes=5))
+    assert [event.kind for event in events] == [EventKind.STALE]
+    assert events[0].level == "warning"
+    assert state.pending_escalation == "warning"
+
+
+def test_unannounced_active_state_fails_toward_alerting() -> None:
+    rule = rising_rule(levels=(LevelSpec("warning", 10.0),))
+    state = RuleState(
+        active_level="warning",
+        episode=1,
+        newest_sample_time=BASE,
+        newest_value=15.0,
+        last_evaluated_sample_time=BASE,
+        episode_started_at=BASE,
+        rule_direction=Direction.RISING,
+        level_order=("warning",),
     )
     state, events = evaluate(rule, state, None, BASE)
-    assert [event.kind for event in events] == [EventKind.STALE]
-    assert events[0].level is None
+    assert [event.kind for event in events] == [EventKind.ESCALATED]
+    assert state.episode_announced
+    assert state.pending_escalation is None
 
 
 def test_rederive_does_not_repeat_level_notified_under_current_name() -> None:
@@ -1022,8 +1030,17 @@ def test_missing_persisted_cycle_anchors_use_explicit_clock() -> None:
     assert [event.kind for event in events] == [EventKind.REMINDER]
 
 
-def test_no_sample_stale_events_use_a_stable_sentinel_identity() -> None:
+def test_startup_stale_event_ids_use_persisted_generation() -> None:
     rule = rising_rule()
-    _, first = evaluate(rule, RuleState(), None, BASE)
-    _, second = evaluate(rule, RuleState(), None, BASE + timedelta(minutes=1))
-    assert first[0].event_id == second[0].event_id
+    first_state, first = evaluate(rule, RuleState(), None, BASE)
+    later = BASE + timedelta(minutes=1)
+    _, second = evaluate(rule, RuleState(), None, later)
+    assert first_state.generation == BASE.isoformat()
+    assert first[0].event_id != second[0].event_id
+
+    initialized, _ = evaluate(rule, RuleState(), Sample(5.0, BASE), BASE)
+    persisted = RuleState.from_dict(initialized.to_dict())
+    stale_at = BASE + timedelta(hours=13)
+    _, first_replay = evaluate(rule, persisted, None, stale_at)
+    _, second_replay = evaluate(rule, persisted, None, stale_at + timedelta(seconds=30))
+    assert first_replay[0].event_id == second_replay[0].event_id

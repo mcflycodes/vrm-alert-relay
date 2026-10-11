@@ -62,17 +62,9 @@ def _mapping_set_time(
     return tuple(sorted(updated.items()))
 
 
-def _mapping_set_times(
-    values: tuple[LevelTime, ...], names: tuple[str, ...], timestamp: datetime
-) -> tuple[LevelTime, ...]:
-    updated = values
-    for name in names:
-        updated = _mapping_set_time(updated, name, timestamp)
-    return updated
-
-
 def _event_id(
     rule_id: str,
+    generation: str,
     episode: int,
     kind: EventKind,
     level: str | None,
@@ -82,6 +74,7 @@ def _event_id(
     identity = json.dumps(
         [
             rule_id,
+            generation,
             episode,
             kind.value,
             level,
@@ -114,6 +107,7 @@ def _event(
         sample_time=sample_time,
         event_id=_event_id(
             rule.rule_id,
+            cast(str, state.generation),
             state.episode,
             kind,
             level,
@@ -173,7 +167,7 @@ def _provisional_level(rule: RuleSpec, state: RuleState) -> str | None:
     except ValueError:
         return None
     if old_index >= len(rule.levels):
-        return None
+        return rule.levels[-1].name
     return rule.levels[old_index].name
 
 
@@ -198,19 +192,14 @@ def _sanitize_state(rule: RuleSpec, state: RuleState, now: datetime) -> RuleStat
     episode_levels = tuple(
         name for name in state.episode_notified_levels if name in allowed
     )
-    recovery_times = tuple(
-        (name, timestamp)
-        for name, timestamp in state.level_recovery_times
-        if name in allowed and timestamp <= now
-    )
-    pending_recovery_levels = tuple(
-        name for name in state.pending_recovery_levels if name in allowed
-    )
-    pending_recovery_started = state.pending_recovery_started_at
-    if not pending_recovery_levels:
-        pending_recovery_started = None
     pending = state.pending_escalation
     if pending is not None and pending not in allowed:
+        pending = _provisional_level(rule, state)
+    if (
+        state.active_level is not None
+        and not state.episode_announced
+        and pending is None
+    ):
         pending = _provisional_level(rule, state)
 
     newest_sample_time = state.newest_sample_time
@@ -247,10 +236,7 @@ def _sanitize_state(rule: RuleSpec, state: RuleState, now: datetime) -> RuleStat
         episode_started_at=episode_started,
         episode_notified_levels=episode_levels,
         pending_escalation=pending,
-        pending_recovery_levels=pending_recovery_levels,
-        pending_recovery_started_at=pending_recovery_started,
         level_notification_times=notification_times,
-        level_recovery_times=recovery_times,
         rule_direction=rule.direction,
         level_order=level_order,
         needs_rederive=needs_rederive,
@@ -319,27 +305,14 @@ def _attempt_escalation(
 
 
 def _recover(
-    rule: RuleSpec, state: RuleState, sample: Sample, now: datetime
+    rule: RuleSpec, state: RuleState, sample: Sample
 ) -> tuple[RuleState, list[Event]]:
     events: list[Event] = []
-    provisional = _provisional_level(rule, state)
-    recovery_levels = tuple(
-        dict.fromkeys(
-            (*state.episode_notified_levels, *((provisional,) if provisional else ()))
-        )
-    )
-    should_notify = (
+    if (
         rule.recovery_notify
         and state.episode_announced
         and state.active_level is not None
-    )
-    recovery_times = dict(state.level_recovery_times)
-    recovery_due = should_notify and all(
-        level not in recovery_times
-        or _elapsed(now, recovery_times[level]) >= rule.cooldown
-        for level in recovery_levels
-    )
-    if recovery_due:
+    ):
         discriminator = state.episode_started_at or sample.timestamp
         events.append(
             _event(
@@ -353,9 +326,6 @@ def _recover(
                 discriminator=discriminator,
             )
         )
-    pending_recovery_levels = (
-        recovery_levels if should_notify and not recovery_due else ()
-    )
     recovered = replace(
         state,
         active_level=None,
@@ -366,18 +336,9 @@ def _recover(
         episode_announced=False,
         episode_notified_levels=(),
         pending_escalation=None,
-        pending_recovery_levels=pending_recovery_levels,
-        pending_recovery_started_at=(
-            state.episode_started_at if pending_recovery_levels else None
-        ),
         escalation_ordinal=0,
         needs_rederive=False,
         last_evaluated_sample_time=sample.timestamp,
-        level_recovery_times=(
-            _mapping_set_times(state.level_recovery_times, recovery_levels, now)
-            if recovery_due
-            else state.level_recovery_times
-        ),
     )
     return recovered, events
 
@@ -402,7 +363,7 @@ def _rederive(
     if entry_level is None:
         if not allow_clear:
             return replace(state, last_evaluated_sample_time=sample.timestamp), []
-        return _recover(rule, state, sample, now)
+        return _recover(rule, state, sample)
     level_name = rule.levels[entry_level].name
     already_notified = level_name in state.episode_notified_levels
     state = replace(
@@ -459,8 +420,6 @@ def _evaluate_threshold(
             episode_announced=False,
             episode_notified_levels=(),
             pending_escalation=None,
-            pending_recovery_levels=(),
-            pending_recovery_started_at=None,
             escalation_ordinal=0,
             needs_rederive=False,
             level_order=tuple(level.name for level in rule.levels),
@@ -522,41 +481,7 @@ def _evaluate_threshold(
             clear_count=0,
             last_evaluated_sample_time=sample.timestamp,
         ), events
-    return _recover(rule, state, sample, now)
-
-
-def _maybe_emit_pending_recovery(
-    rule: RuleSpec, state: RuleState, now: datetime
-) -> tuple[RuleState, Event | None]:
-    levels = state.pending_recovery_levels
-    if not levels or state.active_level is not None:
-        return state, None
-    recovery_times = dict(state.level_recovery_times)
-    if any(
-        level in recovery_times and _elapsed(now, recovery_times[level]) < rule.cooldown
-        for level in levels
-    ):
-        return state, None
-    discriminator = state.pending_recovery_started_at or NO_SAMPLE_DISCRIMINATOR
-    event = _event(
-        rule,
-        state,
-        EventKind.RECOVERED,
-        level=None,
-        ordinal=0,
-        value=state.newest_value,
-        sample_time=state.newest_sample_time,
-        discriminator=discriminator,
-    )
-    return replace(
-        state,
-        pending_recovery_levels=(),
-        pending_recovery_started_at=None,
-        episode_started_at=None,
-        level_recovery_times=_mapping_set_times(
-            state.level_recovery_times, levels, now
-        ),
-    ), event
+    return _recover(rule, state, sample)
 
 
 def _maybe_emit_pending(
@@ -628,6 +553,8 @@ def evaluate(
 
     if not _aware(now):
         raise ValueError("now must be an aware datetime")
+    if state.generation is None:
+        state = replace(state, generation=now.isoformat())
     state = _sanitize_state(rule, state, now)
     events: list[Event] = []
     usable = _usable_sample(sample, now)
@@ -699,9 +626,6 @@ def evaluate(
     state, pending_event = _maybe_emit_pending(rule, state, now)
     if pending_event is not None:
         events.append(pending_event)
-    state, pending_recovery = _maybe_emit_pending_recovery(rule, state, now)
-    if pending_recovery is not None:
-        events.append(pending_recovery)
     state, reminder = _maybe_remind(rule, state, now)
     if reminder is not None:
         events.append(reminder)
