@@ -41,6 +41,7 @@ from email.utils import parsedate_to_datetime
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Final, Self
 
+import certifi
 import httpx
 
 from vrm_alert_relay.net.endpoint import Endpoint
@@ -122,8 +123,25 @@ def _quiet_library_loggers() -> None:
             logger.addFilter(_LIBRARY_FILTER)
 
 
+def _verifying_context(cafile: str | os.PathLike[str]) -> ssl.SSLContext:
+    """A client context that verifies certificates and hostnames against ``cafile``.
+
+    Built by hand rather than with :func:`ssl.create_default_context` (which
+    httpx also uses), because that function honours ``SSLKEYLOGFILE`` and
+    would write TLS session secrets to the file it names. This context never
+    has a key log file.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_verify_locations(cafile=cafile)
+    return context
+
+
 def _tls_context() -> ssl.SSLContext:
-    return httpx.create_ssl_context(verify=True, trust_env=False)
+    """The default context: the bundled (certifi) trust store."""
+    return _verifying_context(certifi.where())
 
 
 def load_ca_file(path: str | os.PathLike[str]) -> ssl.SSLContext:
@@ -134,7 +152,7 @@ def load_ca_file(path: str | os.PathLike[str]) -> ssl.SSLContext:
     file's content, when the file cannot be read or holds no certificate.
     """
     try:
-        return ssl.create_default_context(cafile=path)
+        return _verifying_context(path)
     except (OSError, ValueError, TypeError):
         pass
     # Raised outside the except block so no ssl or OS error, which can name
