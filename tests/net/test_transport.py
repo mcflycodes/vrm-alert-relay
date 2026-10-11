@@ -45,7 +45,7 @@ def address(sockaddr: tuple[str, int] = TEST_NET) -> AddressInfo:
 class FakeSocket:
     """Socket-compatible fake whose blocking calls sleep, up to the socket timeout."""
 
-    def __init__(  # noqa: PLR0913  # one keyword per fake behaviour
+    def __init__(
         self,
         *,
         connect_delay: float = 0.0,

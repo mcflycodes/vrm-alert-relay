@@ -1,0 +1,180 @@
+# VRM Alert Relay example configuration
+#
+# VRM Alert Relay is an unofficial, independent project. It is not affiliated
+# with, sponsored by, or endorsed by Victron Energy.
+#
+# Every value in this file is fictitious. Copy it, then replace the values with
+# your own. Validate the result with the check-config command before starting
+# the relay.
+#
+# Format rules:
+#   - Unknown keys are rejected, so a typo is an error rather than a silently
+#     ignored setting.
+#   - YAML anchors, aliases, and merge keys (&, *, <<) are not allowed.
+#   - Secrets are never written in this file. Each secret lives in its own file
+#     (mode 0600 or 0400), referenced here by absolute path with a "*_file"
+#     setting. Inline keys such as "password:" or "token:" are rejected.
+#   - Names (installation ids, rule ids, level names, recipient names) use
+#     lowercase letters, digits, "_" and "-", up to 63 characters.
+#   - Quote phone numbers so YAML reads them as text.
+
+# Configuration format version (required). This release supports version 1.
+version: 1
+
+# Master switch for real notifications. While this is false, the relay runs in
+# dry-run mode: every message is written to the log instead of being sent,
+# whatever the provider settings below say. A provider sends for real only when
+# this is true AND that provider's own "enabled" is true.
+sending:
+  enabled: false
+
+# Victron VRM API access.
+vrm:
+  # VRM API v2 base URL. The default is shown; override only if needed.
+  # Every URL in this file must use https:// and must not contain credentials
+  # or a "#fragment".
+  base_url: https://vrmapi.victronenergy.com/v2
+  # File holding a VRM personal access token. Use a dedicated VRM user that is
+  # invited only to the installations below, with the lowest role that works.
+  token_file: /run/secrets/vrm_token
+  # Seconds between polls (default 60, minimum 30). Polls are jittered.
+  poll_interval: 60
+  # Installations to monitor (up to 50). "id" is your own short name, used by
+  # rules; "site_id" is the numeric VRM installation id (idSite).
+  installations:
+    - id: cabin
+      site_id: 123456
+
+# Global caps on outgoing messages, shared by every rule and provider.
+# Retries count against these caps.
+rate_limits:
+  global_per_hour: 20 # default 20
+  global_per_day: 60 # default 60
+  retries: 3 # delivery retries per message, with backoff (default 3)
+
+# The recipient allowlist (up to 50). Rules refer to recipients by name;
+# nothing in VRM data or message templates can add or change a recipient.
+recipients:
+  # SMS through VoIP.ms. Accepts a 10-digit NANP number or +1 E.164 format;
+  # spaces, dashes, dots, and parentheses are ignored.
+  owner_sms:
+    provider: voipms
+    phone: "+1 202 555 0142"
+  # A Home Assistant notify service, without the "notify." prefix.
+  owner_phone_app:
+    provider: homeassistant
+    service: mobile_app_example_phone
+  # The webhook provider's URL (under providers.webhook) receives the message.
+  automation_hook:
+    provider: webhook
+  # Log only. Useful for testing rules without any provider.
+  audit_log:
+    provider: log
+
+# Notification providers. Each is disabled by default. Secret files of a
+# provider are required only once that provider is live (sending.enabled and
+# the provider's enabled are both true).
+providers:
+  voipms:
+    enabled: false
+    # VoIP.ms REST endpoint. The default is shown.
+    base_url: https://voip.ms/api/v1/rest.php
+    # VoIP.ms account email and API password, each in its own file.
+    username_file: /run/secrets/voipms_username
+    password_file: /run/secrets/voipms_api_password
+    # The SMS-enabled VoIP.ms DID that messages are sent from.
+    did: "202-555-0100"
+  homeassistant:
+    enabled: false
+    # Your Home Assistant URL. Private-network addresses are allowed.
+    base_url: https://homeassistant.example.invalid:8123
+    # Long-lived access token of a dedicated, non-admin Home Assistant user.
+    token_file: /run/secrets/homeassistant_token
+  webhook:
+    enabled: false
+    # Receives a fixed JSON payload by HTTPS POST.
+    url: https://hooks.example.com/vrm-alert-relay
+    # Optional header-based authentication. Set both settings or neither.
+    auth_header_name: X-Relay-Token
+    auth_header_value_file: /run/secrets/webhook_token
+  # The log provider needs no settings and is always available.
+  log: {}
+
+# Alert rules (up to 200). Each rule watches one measurement and escalates
+# through ordered levels.
+rules:
+  - id: cabin-freezer-warm
+    # One of the ids under vrm.installations.
+    installation: cabin
+    # The measurement is identified by VRM attribute code and device instance,
+    # plus service_type when the code and instance alone are ambiguous. Look up
+    # the codes and instances for your devices in VRM's Diagnostics data.
+    measurement:
+      code: tsT
+      instance: 20
+      service_type: temperature
+    # "rising" alerts as the value climbs past each threshold; thresholds must
+    # increase from one level to the next. "falling" is the reverse.
+    direction: rising
+    # Up to 20 levels. One notification is sent per escalation into a level;
+    # jumping several levels in one poll sends one notification for the highest.
+    # "message" is an optional single-line template of at most 320 characters;
+    # see the message template documentation for the placeholders it supports.
+    levels:
+      - name: warning
+        threshold: -12.0
+        message: "Cabin freezer is warming"
+      - name: alert
+        threshold: -8.0
+      - name: critical
+        threshold: -4.0
+        message: "CRITICAL: cabin freezer is close to thawing"
+    # A level clears only after the value falls back past threshold minus
+    # hysteresis (plus for falling rules), for clear_after_samples consecutive
+    # samples. Defaults: hysteresis 0, clear_after_samples 1.
+    # Recommended: set a non-zero hysteresis in the measurement's units. With 0,
+    # a value hovering at a threshold clears and re-triggers repeatedly, held
+    # back only by the cooldown.
+    hysteresis: 1.0
+    clear_after_samples: 2
+    # Send a recovery notification when the rule returns to normal (default true).
+    recovery_notify: true
+    # The same level is not sent twice within this many minutes (default 15).
+    cooldown_minutes: 15
+    # While at the highest level, repeat every reminder_interval_minutes, at
+    # most reminder_max times per episode (defaults 60 and 3; 0 disables).
+    reminder_interval_minutes: 60
+    reminder_max: 3
+    # Report stale data when the newest reading is older than this (default 35,
+    # two default GX log periods plus margin). Tune it to your GX log interval.
+    stale_after_minutes: 35
+    # Recipient names from the recipients section.
+    recipients:
+      - owner_sms
+      - owner_phone_app
+      - audit_log
+
+  - id: cabin-battery-low
+    installation: cabin
+    measurement:
+      code: bs
+      instance: 512
+    direction: falling
+    levels:
+      - name: warning
+        threshold: 40
+      - name: critical
+        threshold: 20
+    # 5 percentage points of state of charge before a level clears.
+    hysteresis: 5
+    recipients:
+      - owner_phone_app
+      - automation_hook
+      - audit_log
+
+# Optional informational health endpoint. It reports no secrets or recipient
+# data. Keep it on loopback unless something else needs to reach it.
+health:
+  enabled: false
+  bind: 127.0.0.1
+  port: 8080

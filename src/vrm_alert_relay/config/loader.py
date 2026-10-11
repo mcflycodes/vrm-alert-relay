@@ -1,0 +1,419 @@
+"""Loading the configuration file and resolving its secret files."""
+
+from __future__ import annotations
+
+import ipaddress
+import re
+from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
+from typing import TYPE_CHECKING, Any, NoReturn, Self
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+from ._files import FileProblem, FileReadError, read_regular_file
+from ._paths import SourceMap, describe
+from .errors import ConfigError, format_path
+from .fields import FieldValueError
+from .models import (
+    PROVIDER_NAMES,
+    SUPPORTED_VERSIONS,
+    SUPPORTED_VERSIONS_TEXT,
+    UNSUPPORTED_VERSION_MESSAGE,
+    ProviderName,
+    RelayConfig,
+)
+from .secret import Secret, SecretFileError, SecretTypeError, read_secret_file
+from .yaml_loader import MAX_CONFIG_BYTES, parse_yaml_with_source
+
+if TYPE_CHECKING:
+    import os
+
+    from pydantic_core import ErrorDetails
+
+__all__ = [
+    "RelaySecrets",
+    "SecretsImmutableError",
+    "config_warnings",
+    "load_config",
+    "load_secrets",
+    "parse_config",
+]
+
+_INLINE_SECRET_KEY = re.compile(
+    r"(?:.*_)?(?:password|passwd|token|secret|apikey|api_key|credentials?)"
+    r"|username|auth_header_value"
+)
+_INLINE_VALUE_MESSAGE = (
+    "inline secret values are not allowed; put the value in a file "
+    "and reference it with the matching '*_file' setting"
+)
+_PROVIDER_CHOICES = ", ".join(f"'{name}'" for name in PROVIDER_NAMES)
+
+# Fixed operator-facing text per pydantic error type. Upstream message text and
+# input values are never shown, because they can contain secrets or phone numbers.
+_FIXED_MESSAGES = {
+    "missing": "is required",
+    "extra_forbidden": "unrecognized setting",
+    "string_type": "must be a string",
+    "bool_type": "must be true or false",
+    "int_type": "must be a whole number",
+    "float_type": "must be a number",
+    "finite_number": "must be a finite number",
+    "dict_type": "must be a mapping",
+    "model_type": "must be a mapping",
+    "model_attributes_type": "must be a mapping",
+    "tuple_type": "must be a list",
+    "union_tag_invalid": f"must be one of {_PROVIDER_CHOICES}",
+    "union_tag_not_found": f"is required (one of {_PROVIDER_CHOICES})",
+}
+_BOUND_MESSAGES = {
+    "greater_than_equal": ("ge", "must be at least {}"),
+    "less_than_equal": ("le", "must be at most {}"),
+    "greater_than": ("gt", "must be greater than {}"),
+    "less_than": ("lt", "must be less than {}"),
+    "too_short": ("min_length", "must contain at least {} item(s)"),
+    "too_long": ("max_length", "must contain at most {} item(s)"),
+}
+_GENERIC_MESSAGE = "is invalid"
+# Pydantic inserts the discriminator value at this index of recipient error locations.
+_RECIPIENT_TAG_INDEX = 2
+
+# The include/exclude types of pydantic's deprecated ``copy``.
+_IncEx = AbstractSet[int] | AbstractSet[str] | Mapping[int, Any] | Mapping[str, Any] | None
+
+
+class SecretsImmutableError(TypeError):
+    """An attempt to change, pickle, or bypass validation of :class:`RelaySecrets`."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "RelaySecrets cannot be changed, pickled, or built without validation; "
+            "load the secrets again"
+        )
+
+
+def _only_secret_values(values: Mapping[str, object]) -> None:
+    if not all(value is None or isinstance(value, Secret) for value in values.values()):
+        raise SecretTypeError()
+
+
+class RelaySecrets(BaseModel):
+    """Secret values resolved from the files the configuration references.
+
+    A field is ``None`` when its provider is not live (or, for ``vrm_token``, when
+    it was not required). Serialization, ``str``, and ``repr`` never show the
+    values. Constructing it with anything other than :class:`Secret` values
+    raises :class:`SecretTypeError` before pydantic validation, so no plaintext
+    can be captured in a ``ValidationError``. Updates through ``model_copy``,
+    the deprecated ``copy``, ``copy.replace``, attribute assignment, and
+    pickling are refused with :class:`SecretsImmutableError`, because they
+    would skip that check.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
+
+    vrm_token: Secret | None = Field(default=None, repr=False)
+    voipms_username: Secret | None = Field(default=None, repr=False)
+    voipms_password: Secret | None = Field(default=None, repr=False)
+    homeassistant_token: Secret | None = Field(default=None, repr=False)
+    webhook_auth_header_value: Secret | None = Field(default=None, repr=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _only_secrets(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            raise SecretTypeError()
+        _only_secret_values(data)
+        return data
+
+    @classmethod
+    def model_construct(cls, _fields_set: set[str] | None = None, **values: object) -> Self:
+        _only_secret_values(values)
+        return super().model_construct(_fields_set, **values)
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        if update is not None:
+            raise SecretsImmutableError()
+        return super().model_copy(deep=deep)
+
+    def copy(
+        self,
+        *,
+        include: _IncEx = None,
+        exclude: _IncEx = None,
+        update: dict[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is not None:
+            raise SecretsImmutableError()
+        return super().copy(include=include, exclude=exclude, deep=deep)
+
+    def __replace__(self, **changes: object) -> Self:
+        raise SecretsImmutableError()
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise SecretsImmutableError()
+
+    def __delattr__(self, name: str) -> None:
+        raise SecretsImmutableError()
+
+    def __getstate__(self) -> NoReturn:
+        raise SecretsImmutableError()
+
+    def __setstate__(self, state: object) -> NoReturn:
+        raise SecretsImmutableError()
+
+    def __repr_args__(self) -> list[tuple[str | None, Any]]:
+        return []
+
+    def __repr__(self) -> str:
+        return "RelaySecrets(<hidden>)"
+
+    def __str__(self) -> str:
+        return "RelaySecrets(<hidden>)"
+
+
+def _error_location(error: ErrorDetails) -> tuple[str | int, ...]:
+    loc = tuple(error["loc"])
+    tag = _RECIPIENT_TAG_INDEX
+    if len(loc) > tag and loc[0] == "recipients" and loc[tag] in PROVIDER_NAMES:
+        loc = (*loc[:tag], *loc[tag + 1 :])
+    if error["type"] in ("union_tag_invalid", "union_tag_not_found"):
+        loc = (*loc, "provider")
+    return loc
+
+
+def _error_message(error: ErrorDetails, loc: tuple[str | int, ...]) -> str:
+    kind = error["type"]
+    ctx = error.get("ctx") or {}
+    if kind == "value_error":
+        cause = ctx.get("error")
+        return str(cause) if isinstance(cause, FieldValueError) else _GENERIC_MESSAGE
+    if kind == "extra_forbidden":
+        key = loc[-1] if loc else None
+        if isinstance(key, str) and _INLINE_SECRET_KEY.fullmatch(key):
+            return _INLINE_VALUE_MESSAGE
+    if kind == "missing" and loc == ("version",):
+        return f"is required; {SUPPORTED_VERSIONS_TEXT}"
+    if kind == "literal_error":
+        expected = ctx.get("expected")
+        return f"must be one of {expected}" if isinstance(expected, str) else _GENERIC_MESSAGE
+    if kind in _BOUND_MESSAGES:
+        return _bound_message(kind, ctx)
+    return _FIXED_MESSAGES.get(kind, _GENERIC_MESSAGE)
+
+
+def _bound_message(kind: str, ctx: Mapping[str, object]) -> str:
+    name, template = _BOUND_MESSAGES[kind]
+    bound = ctx.get(name)
+    if isinstance(bound, int | float) and not isinstance(bound, bool):
+        return template.format(bound)
+    return _GENERIC_MESSAGE
+
+
+def _validation_problems(exc: ValidationError, source: SourceMap) -> list[str]:
+    problems: list[str] = []
+    for error in exc.errors(include_url=False, include_input=False, include_context=True):
+        loc = _error_location(error)
+        message = _error_message(error, loc)
+        if error["type"] == "extra_forbidden":
+            # The unrecognized key itself is never shown; its line identifies it.
+            problems.append(describe(loc[:-1], message, source, line=source.line_of(loc)))
+        else:
+            problems.append(describe(loc, message, source))
+    return problems
+
+
+def parse_config(data: bytes | str) -> RelayConfig:
+    """Parse and validate configuration text. Raises :class:`ConfigError`."""
+    raw, source = parse_yaml_with_source(data)
+    if not isinstance(raw, dict):
+        raise ConfigError(["configuration must be a YAML mapping at the top level"])
+    version = raw.get("version")
+    if (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version not in SUPPORTED_VERSIONS
+    ):
+        # Other problems are likely noise when the file targets another version.
+        raise ConfigError([f"version: {UNSUPPORTED_VERSION_MESSAGE}"])
+    problems: list[str] = []
+    try:
+        return RelayConfig.model_validate(raw)
+    except ValidationError as exc:
+        problems = _validation_problems(exc, source)
+    # Raised outside the except block so the ValidationError, which holds raw
+    # input values, is not chained as __context__.
+    raise ConfigError(problems)
+
+
+# The path is never shown: the operator supplied it and it may hold anything.
+_CONFIG_FILE_PROBLEMS = {
+    FileProblem.MISSING: "configuration file: does not exist",
+    FileProblem.PERMISSION_DENIED: "configuration file: not readable (permission denied)",
+    FileProblem.NOT_REGULAR: "configuration file: not a regular file",
+    FileProblem.TOO_LARGE: f"configuration file: larger than {MAX_CONFIG_BYTES} bytes",
+}
+
+
+def _read_config_bytes(path: str | os.PathLike[str]) -> bytes:
+    failure: FileReadError | None = None
+    try:
+        return read_regular_file(path, MAX_CONFIG_BYTES).data
+    except FileReadError as exc:
+        failure = exc
+    reason = _CONFIG_FILE_PROBLEMS.get(
+        failure.problem, f"configuration file: cannot be read ({failure.code})"
+    )
+    raise ConfigError([reason])
+
+
+def load_config(path: str | os.PathLike[str]) -> RelayConfig:
+    """Read and validate the configuration file. Does not read secret files.
+
+    Raises :class:`ConfigError` listing every problem found.
+    """
+    return parse_config(_read_config_bytes(path))
+
+
+def config_warnings(config: RelayConfig) -> list[str]:
+    """Non-fatal findings an operator should see, such as unused recipients."""
+    warnings: list[str] = []
+    if config.sending.enabled and not config.live_providers():
+        warnings.append(
+            "sending.enabled: sending is enabled but no provider is enabled; "
+            "all messages will be logged only"
+        )
+    used = {name for rule in config.rules for name in rule.recipients}
+    positions = SourceMap(
+        positions={("recipients", name): i for i, name in enumerate(config.recipients)}
+    )
+    for name, recipient in config.recipients.items():
+        loc = ("recipients", name)
+        if recipient.provider != "log" and not config.providers.is_enabled(recipient.provider):
+            message = (
+                f"provider '{recipient.provider}' is not enabled; "
+                "messages to this recipient will be logged only"
+            )
+            warnings.append(describe(loc, message, positions))
+        if name not in used:
+            warnings.append(describe(loc, "not used by any rule", positions))
+    if not config.rules:
+        warnings.append("rules: no rules are configured; nothing will be monitored")
+    if config.health.enabled and not ipaddress.ip_address(config.health.bind).is_loopback:
+        warnings.append("health.bind: the health endpoint listens on a non-loopback address")
+    return warnings
+
+
+_SecretSpec = tuple[str, tuple[str, ...], str | None]
+
+
+def _provider_secret_specs(
+    config: RelayConfig,
+) -> list[tuple[ProviderName, _SecretSpec]]:
+    voipms = config.providers.voipms
+    ha = config.providers.homeassistant
+    webhook = config.providers.webhook
+    return [
+        (
+            "voipms",
+            (
+                "voipms_username",
+                ("providers", "voipms", "username_file"),
+                voipms.username_file,
+            ),
+        ),
+        (
+            "voipms",
+            (
+                "voipms_password",
+                ("providers", "voipms", "password_file"),
+                voipms.password_file,
+            ),
+        ),
+        (
+            "homeassistant",
+            (
+                "homeassistant_token",
+                ("providers", "homeassistant", "token_file"),
+                ha.token_file,
+            ),
+        ),
+        (
+            "webhook",
+            (
+                "webhook_auth_header_value",
+                ("providers", "webhook", "auth_header_value_file"),
+                webhook.auth_header_value_file,
+            ),
+        ),
+    ]
+
+
+def _read_into(
+    values: dict[str, Secret],
+    warnings: list[str],
+    spec: _SecretSpec,
+) -> SecretFileError | None:
+    field, loc, path = spec
+    if path is None:
+        return None
+    try:
+        result = read_secret_file(path)
+    except SecretFileError as exc:
+        return exc
+    values[field] = result.secret
+    if result.group_or_world_readable:
+        warnings.append(
+            f"{format_path(loc)}: secret file is readable by group or others; "
+            "restrict it to mode 0600 or 0400"
+        )
+    return None
+
+
+def _collect_secrets(
+    config: RelayConfig, *, preflight: bool
+) -> tuple[RelaySecrets, list[str], list[str]]:
+    """Read secret files.
+
+    The VRM token is always required, and so are the secrets of every live
+    provider. At runtime (``preflight=False``) providers that are not live are
+    skipped. In a preflight check, enabled but not yet live providers' secrets
+    are read too and their problems reported as warnings, so a dry-run
+    configuration passes.
+    """
+    values: dict[str, Secret] = {}
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    vrm_spec: _SecretSpec = ("vrm_token", ("vrm", "token_file"), config.vrm.token_file)
+    error = _read_into(values, warnings, vrm_spec)
+    if error is not None:
+        problems.append(f"vrm.token_file: {error.reason}")
+
+    for provider, spec in _provider_secret_specs(config):
+        live = config.provider_is_live(provider)
+        if not config.providers.is_enabled(provider) or not (live or preflight):
+            continue
+        error = _read_into(values, warnings, spec)
+        if error is None:
+            continue
+        message = f"{format_path(spec[1])}: {error.reason}"
+        if live:
+            problems.append(message)
+        else:
+            warnings.append(f"{message} (required before sending is enabled)")
+    return RelaySecrets(**values), problems, warnings
+
+
+def load_secrets(config: RelayConfig) -> tuple[RelaySecrets, list[str]]:
+    """Read the secrets the relay needs to run: the VRM token and live providers'.
+
+    Secret files of providers that are not live are not read. Returns the secrets
+    and any warnings (such as permissive file modes). Raises :class:`ConfigError`
+    if a required secret is missing or unusable.
+    """
+    secrets, problems, warnings = _collect_secrets(config, preflight=False)
+    if problems:
+        raise ConfigError(problems)
+    return secrets, warnings

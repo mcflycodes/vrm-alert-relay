@@ -17,6 +17,8 @@ classifiers = [
 dependencies = [
     "httpcore>=1.0,<2",
     "httpx>=0.28,<0.29",
+    "pydantic>=2.7,<3",
+    "pyyaml>=6.0.1,<7",
 ]
 
 [project.urls]
@@ -34,6 +36,7 @@ dev = [
     "pytest-cov",
     "ruff",
     "trustme",
+    "types-pyyaml",
 ]
 
 [build-system]
@@ -85,19 +88,24 @@ select = [
     "W",     # pycodestyle warnings
 ]
 
+[tool.ruff.lint.flake8-type-checking]
+# pydantic resolves model annotations at runtime, so their imports must not be
+# moved into type-checking blocks.
+runtime-evaluated-base-classes = ["pydantic.BaseModel"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = [
     "S101",
     "PLR2004",
-    "ANN401",  # test doubles mirror Any-typed library signatures
-    "ARG001",  # stubs and fixtures take the signature they replace
-    "ARG002",  # fake methods take the signature they replace
-    "ARG005",  # stub lambdas take the signature they replace
-    "SLF001",  # tests reach into private state to assert on it
-    "TRY003",  # fakes raise ad-hoc errors with descriptive messages
-    "TRY301",  # tests raise inside try to capture real tracebacks
-    "DTZ001",  # naive datetimes are deliberate test inputs (rejection cases, hypothesis bounds)
-    "FBT001",  # pytest.mark.parametrize injects bool arguments by name
+    "ANN401",   # fixtures and test doubles take arbitrary data; doubles mirror Any-typed library signatures
+    "ARG",      # test doubles and parametrized lambdas must match the real signature
+    "DTZ001",   # naive datetimes are deliberate test inputs (rejection cases, hypothesis bounds)
+    "FBT001",   # parametrized boolean arguments are passed by name
+    "PLR0913",  # fixtures and parameters are injected by name
+    "PLR0917",  # same, counted as positional arguments
+    "SLF001",   # tests reach into private members on purpose
+    "TRY003",   # test doubles raise with ad-hoc messages
+    "TRY301",   # tests raise inside try to capture real tracebacks
 ]
 
 [tool.mypy]

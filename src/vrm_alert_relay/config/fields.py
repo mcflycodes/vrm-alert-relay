@@ -1,0 +1,320 @@
+"""Validated scalar types used by the configuration models."""
+
+from __future__ import annotations
+
+import ipaddress
+import re
+from pathlib import PurePath
+from typing import TYPE_CHECKING, Annotated, Any
+from urllib.parse import urlsplit
+
+from pydantic import AfterValidator
+from pydantic_core import CoreSchema, core_schema
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from urllib.parse import SplitResult
+
+    from pydantic import GetCoreSchemaHandler
+
+__all__ = [
+    "MAX_TEMPLATE_CHARS",
+    "BindAddress",
+    "FieldValueError",
+    "HaServiceName",
+    "HeaderName",
+    "HttpsUrl",
+    "MeasurementCode",
+    "MessageTemplate",
+    "Name",
+    "PhoneNumber",
+    "SecretPath",
+    "ServiceType",
+]
+
+MAX_TEMPLATE_CHARS = 320
+MAX_URL_CHARS = 2048
+MAX_PATH_CHARS = 4096
+
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_HOST_LABELS = re.compile(
+    r"(?=.{1,253}\Z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?"
+)
+# Headers that control HTTP framing or routing; the transport owns them.
+_RESERVED_HEADERS = frozenset(
+    {
+        "connection",
+        "content-length",
+        "content-type",
+        "host",
+        "keep-alive",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+
+
+class FieldValueError(ValueError):
+    """A field validation failure whose message is fixed text that never contains
+    the rejected value. Only these messages are shown to operators verbatim."""
+
+
+def _pattern(regex: str, description: str) -> Callable[[str], str]:
+    compiled = re.compile(regex)
+
+    def check(value: str) -> str:
+        if not compiled.fullmatch(value):
+            raise FieldValueError(description)
+        return value
+
+    return check
+
+
+Name = Annotated[
+    str,
+    AfterValidator(
+        _pattern(
+            r"[a-z0-9][a-z0-9_-]{0,62}",
+            "must be 1-63 lowercase letters, digits, '_' or '-', starting with a letter or digit",
+        )
+    ),
+]
+
+# Provisional: the code and service-type patterns are not yet verified against
+# real VRM Diagnostics data.
+MeasurementCode = Annotated[
+    str,
+    AfterValidator(_pattern(r"[A-Za-z0-9_]{1,32}", "must be 1-32 letters, digits, or '_'")),
+]
+
+ServiceType = Annotated[
+    str,
+    AfterValidator(
+        _pattern(
+            r"[A-Za-z0-9_.-]{1,64}",
+            "must be 1-64 letters, digits, '_', '.', or '-'",
+        )
+    ),
+]
+
+HaServiceName = Annotated[
+    str,
+    AfterValidator(
+        _pattern(
+            r"[a-z0-9_]{1,255}",
+            "must be a Home Assistant notify service name "
+            "(lowercase letters, digits, '_'), without the 'notify.' prefix",
+        )
+    ),
+]
+
+
+def _check_header_name(value: str) -> str:
+    if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}", value):
+        raise FieldValueError("must be a valid HTTP header name of at most 64 characters")  # noqa: TRY003 -- fixed operator-facing text
+    if value.lower() in _RESERVED_HEADERS or value.lower().startswith("proxy-"):
+        raise FieldValueError("must not be a header that the HTTP transport controls")  # noqa: TRY003 -- fixed operator-facing text
+    return value
+
+
+HeaderName = Annotated[str, AfterValidator(_check_header_name)]
+
+
+def _check_template(value: str) -> str:
+    if not value:
+        raise FieldValueError("must not be empty")  # noqa: TRY003 -- fixed operator-facing text
+    if len(value) > MAX_TEMPLATE_CHARS:
+        raise FieldValueError(f"must be at most {MAX_TEMPLATE_CHARS} characters")  # noqa: TRY003 -- fixed operator-facing text
+    if CONTROL_CHARS.search(value):
+        raise FieldValueError("must not contain line breaks or control characters")  # noqa: TRY003 -- fixed operator-facing text
+    return value
+
+
+MessageTemplate = Annotated[str, AfterValidator(_check_template)]
+
+
+def _check_secret_path(value: str) -> str:
+    # Never echo the value: an operator may have pasted the secret itself here.
+    if not value:
+        raise FieldValueError("must not be empty")  # noqa: TRY003 -- fixed operator-facing text
+    if len(value) > MAX_PATH_CHARS:
+        raise FieldValueError(f"must be at most {MAX_PATH_CHARS} characters")  # noqa: TRY003 -- fixed operator-facing text
+    if CONTROL_CHARS.search(value):
+        raise FieldValueError("must not contain line breaks or control characters")  # noqa: TRY003 -- fixed operator-facing text
+    if not PurePath(value).is_absolute():
+        raise FieldValueError("must be an absolute path to a secret file")  # noqa: TRY003 -- fixed operator-facing text
+    return value
+
+
+SecretPath = Annotated[str, AfterValidator(_check_secret_path)]
+
+
+def _check_host(host: str) -> None:
+    if host.startswith("["):
+        try:
+            ipaddress.IPv6Address(host[1:-1] if host.endswith("]") else host)
+        except ValueError:
+            raise FieldValueError("has an invalid IPv6 host") from None  # noqa: TRY003 -- fixed operator-facing text
+        return
+    if not _HOST_LABELS.fullmatch(host):
+        raise FieldValueError("has an invalid host name (use ASCII or punycode)")  # noqa: TRY003 -- fixed operator-facing text
+
+
+def _check_https_url(value: str) -> str:
+    # The value is not echoed in errors because query strings may carry tokens.
+    if len(value) > MAX_URL_CHARS:
+        raise FieldValueError(f"must be at most {MAX_URL_CHARS} characters")  # noqa: TRY003 -- fixed operator-facing text
+    if CONTROL_CHARS.search(value) or any(c.isspace() for c in value) or "\\" in value:
+        raise FieldValueError("must not contain whitespace, control characters, or '\\'")  # noqa: TRY003 -- fixed operator-facing text
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        raise FieldValueError("is not a valid URL") from None  # noqa: TRY003 -- fixed operator-facing text
+    if parts.scheme != "https":
+        raise FieldValueError("must be an https:// URL")  # noqa: TRY003 -- fixed operator-facing text
+    if "#" in value:
+        raise FieldValueError("must not contain a fragment ('#')")  # noqa: TRY003 -- fixed operator-facing text
+    authority = parts.netloc
+    if "@" in authority:
+        raise FieldValueError("must not contain user info (credentials) before the host")  # noqa: TRY003 -- fixed operator-facing text
+    host = _host_of(authority)
+    if not host:
+        raise FieldValueError("must include a host")  # noqa: TRY003 -- fixed operator-facing text
+    _check_host(host)
+    _check_port(parts)
+    return value
+
+
+def _host_of(authority: str) -> str:
+    """The host part of a URL authority, keeping the brackets of an IPv6 host."""
+    if authority.startswith("["):
+        end = authority.find("]")
+        return authority[: end + 1] if end != -1 else authority
+    return authority.rsplit(":", 1)[0]
+
+
+def _check_port(parts: SplitResult) -> None:
+    try:
+        port = parts.port
+    except ValueError:
+        raise FieldValueError("has an invalid port") from None  # noqa: TRY003 -- fixed operator-facing text
+    if port == 0:
+        raise FieldValueError("has an invalid port")  # noqa: TRY003 -- fixed operator-facing text
+
+
+HttpsUrl = Annotated[str, AfterValidator(_check_https_url)]
+
+
+def _check_bind(value: str) -> str:
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        raise FieldValueError("must be an IPv4 or IPv6 address") from None  # noqa: TRY003 -- fixed operator-facing text
+
+
+BindAddress = Annotated[str, AfterValidator(_check_bind)]
+
+
+_PHONE_SEPARATORS = re.compile(r"[ ().-]")
+_PHONE_ERROR = "must be a 10-digit NANP number or a +1 E.164 number"
+# Longer input cannot be a phone number with separators; it is rejected unparsed.
+_MAX_PHONE_INPUT_CHARS = 32
+# A national number with the trunk prefix 1, as in 1 202 555 0142.
+_NANP_WITH_TRUNK_PREFIX_DIGITS = 11
+# Error hints show at most this many trailing digits of a rejected number.
+_HINT_DIGITS = 4
+
+
+class PhoneNumber:
+    """A validated North American phone number.
+
+    ``str``, ``repr``, and serialization show only the last four digits. Use
+    :attr:`e164` or :attr:`national` when the full number is required.
+    """
+
+    __slots__ = ("_national",)
+
+    def __init__(self, national: str) -> None:
+        if not re.fullmatch(r"[2-9][0-9]{2}[2-9][0-9]{6}", national):
+            raise FieldValueError(_PHONE_ERROR)
+        self._national = national
+
+    @classmethod
+    def parse(cls, value: str) -> PhoneNumber:
+        """Parse a 10-digit NANP number or a +1 E.164 number, ignoring separators."""
+        compact = _PHONE_SEPARATORS.sub("", value) if len(value) <= _MAX_PHONE_INPUT_CHARS else ""
+        if compact.startswith("+1"):
+            national = compact[2:]
+        elif compact.startswith("+"):
+            national = ""
+        elif len(compact) == _NANP_WITH_TRUNK_PREFIX_DIGITS and compact.startswith("1"):
+            national = compact[1:]
+        else:
+            national = compact
+        try:
+            return cls(national)
+        except ValueError:
+            digits = re.sub(r"[^0-9]", "", value)
+            hint = (
+                f" (value ending {digits[-_HINT_DIGITS:]})" if len(digits) >= _HINT_DIGITS else ""
+            )
+            raise FieldValueError(f"{_PHONE_ERROR}{hint}") from None
+
+    @property
+    def national(self) -> str:
+        """The ten-digit national number, for example ``2025550123``."""
+        return self._national
+
+    @property
+    def e164(self) -> str:
+        """The E.164 form, for example ``+12025550123``."""
+        return f"+1{self._national}"
+
+    @property
+    def last4(self) -> str:
+        return self._national[-4:]
+
+    @property
+    def masked(self) -> str:
+        return f"***-***-{self.last4}"
+
+    def __str__(self) -> str:
+        return self.masked
+
+    def __repr__(self) -> str:
+        return f"PhoneNumber('{self.masked}')"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, PhoneNumber):
+            return NotImplemented
+        return self._national == other._national
+
+    def __hash__(self) -> int:
+        return hash(self._national)
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, source: type[Any], handler: GetCoreSchemaHandler
+    ) -> CoreSchema:
+        return core_schema.no_info_plain_validator_function(
+            cls._validate,
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                _masked_phone, when_used="always"
+            ),
+        )
+
+    @classmethod
+    def _validate(cls, value: object) -> PhoneNumber:
+        if isinstance(value, PhoneNumber):
+            return value
+        if isinstance(value, str):
+            return cls.parse(value)
+        # A ValueError (not TypeError) so pydantic reports it as a field problem.
+        raise FieldValueError("must be a string (quote phone numbers in YAML)")  # noqa: TRY003 -- fixed operator-facing text
+
+
+def _masked_phone(value: PhoneNumber) -> str:
+    return value.masked
