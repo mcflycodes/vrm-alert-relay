@@ -79,7 +79,7 @@ def run_steps(
     return events, states, clocks
 
 
-@settings(max_examples=150, deadline=None)
+@settings(max_examples=150, deadline=None, derandomize=True)
 @given(STEPS, st.sampled_from(list(Direction)))
 def test_event_ids_are_unique_and_bounded_invariants_hold(
     steps: list[tuple[int, int, float | None]], direction: Direction
@@ -130,7 +130,7 @@ def test_event_ids_are_unique_and_bounded_invariants_hold(
         )
 
 
-@settings(max_examples=150, deadline=None)
+@settings(max_examples=150, deadline=None, derandomize=True)
 @given(
     st.lists(
         st.tuples(
@@ -157,3 +157,51 @@ def test_evaluate_never_raises_for_arbitrary_floats_and_aware_timestamps(
     state = RuleState()
     for value, timestamp, now in inputs:
         state, _ = evaluate(rule, state, Sample(value, timestamp), now)
+
+
+@settings(max_examples=200, deadline=None, derandomize=True)
+@given(
+    st.sampled_from(list(Direction)),
+    st.integers(min_value=1, max_value=3),
+    st.integers(min_value=1, max_value=3),
+    st.lists(
+        st.tuples(
+            st.integers(min_value=0, max_value=5),
+            st.one_of(st.none(), st.sampled_from([0.0, 15.0, 35.0])),
+        ),
+        min_size=1,
+        max_size=100,
+    ),
+)
+def test_evaluate_never_raises_across_reminders_and_multisample_recovery(
+    direction: Direction,
+    clear_after_samples: int,
+    reminder_minutes: int,
+    steps: list[tuple[int, float | None]],
+) -> None:
+    thresholds = (10.0, 20.0, 30.0)
+    if direction is Direction.FALLING:
+        thresholds = (30.0, 20.0, 10.0)
+    rule = RuleSpec(
+        "fictitious-state-machine",
+        direction,
+        tuple(
+            LevelSpec(name, threshold)
+            for name, threshold in zip(
+                ("warning", "alert", "critical"), thresholds, strict=True
+            )
+        ),
+        hysteresis=1.0,
+        clear_after_samples=clear_after_samples,
+        cooldown=timedelta(minutes=2),
+        reminder_interval=timedelta(minutes=reminder_minutes),
+        reminder_max=3,
+        stale_after=timedelta(minutes=2),
+    )
+    state = RuleState()
+    now = BASE
+    for advance_minutes, value in steps:
+        now += timedelta(minutes=advance_minutes)
+        sample = None if value is None else Sample(value, now)
+        state, _ = evaluate(rule, state, sample, now)
+        assert RuleState.from_dict(state.to_dict()) == state

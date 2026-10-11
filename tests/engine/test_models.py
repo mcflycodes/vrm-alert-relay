@@ -78,6 +78,7 @@ def test_falling_thresholds_must_be_strictly_decreasing() -> None:
         ("warning", float("nan")),
         ("warning", float("inf")),
         ("warning", True),
+        ("warning", 10**400),
     ],
 )
 def test_invalid_levels_raise_value_error(name: str, threshold: float) -> None:
@@ -87,7 +88,7 @@ def test_invalid_levels_raise_value_error(name: str, threshold: float) -> None:
 
 def populated_state() -> RuleState:
     return RuleState(
-        active_level=1,
+        active_level="critical",
         episode=7,
         clear_count=2,
         newest_sample_time=BASE,
@@ -95,9 +96,12 @@ def populated_state() -> RuleState:
         last_evaluated_sample_time=BASE,
         stale=True,
         stale_cycle=3,
+        stale_started_at=BASE - timedelta(minutes=3),
         reminder_count=2,
         last_episode_notification_time=BASE + timedelta(minutes=1),
         episode_started_at=BASE - timedelta(minutes=2),
+        rule_direction=Direction.RISING,
+        level_order=("warning", "critical"),
         level_notification_times=(
             ("critical", BASE + timedelta(minutes=1)),
             ("warning", BASE),
@@ -121,8 +125,8 @@ def test_state_round_trips_through_json_compatible_dict() -> None:
         ("version", 2),
         ("version", 1.0),
         ("version", True),
-        ("active_level", -1),
-        ("active_level", 128),
+        ("active_level", 1),
+        ("active_level", ""),
         ("episode", -1),
         ("episode", True),
         ("clear_count", -1),
@@ -133,9 +137,14 @@ def test_state_round_trips_through_json_compatible_dict() -> None:
         ("last_evaluated_sample_time", 4),
         ("stale", 1),
         ("stale_cycle", -1),
+        ("stale_started_at", "bad"),
         ("reminder_count", -1),
         ("last_episode_notification_time", "bad"),
         ("episode_started_at", "bad"),
+        ("rule_direction", "sideways"),
+        ("rule_direction", 1),
+        ("level_order", "bad"),
+        ("needs_rederive", 1),
         ("level_notification_times", "bad"),
         ("level_escalation_counts", "bad"),
         ("suppressed_escalations", -1),
@@ -185,9 +194,12 @@ def test_state_rejects_missing_extra_and_non_mapping_inputs() -> None:
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"active_level": -1},
+        {"active_level": ""},
         {"episode": -1},
         {"stale": 1},
+        {"needs_rederive": 1},
+        {"rule_direction": "rising"},
+        {"level_order": ("same", "same")},
         {"newest_sample_time": datetime(2030, 1, 1)},
         {"newest_value": float("inf")},
         {"clear_count": 1},
