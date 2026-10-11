@@ -82,7 +82,12 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "PLR2004"]
+"tests/**" = [
+    "S101",
+    "PLR2004",
+    "DTZ001",  # naive datetimes are deliberate test inputs (rejection cases, hypothesis bounds)
+    "FBT001",  # pytest.mark.parametrize injects bool arguments by name
+]
 
 [tool.mypy]
 python_version = "3.13"

@@ -1,7 +1,5 @@
 """Validation and serialization tests for engine domain types."""
 
-# ruff: noqa: S101
-
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, tzinfo
@@ -53,9 +51,7 @@ def valid_rule(**changes: object) -> RuleSpec:
         ({"reminder_max": True}, "reminder_max"),
     ],
 )
-def test_invalid_rule_specs_raise_value_error(
-    changes: dict[str, object], message: str
-) -> None:
+def test_invalid_rule_specs_raise_value_error(changes: dict[str, object], message: str) -> None:
     with pytest.raises(ValueError, match=message):
         valid_rule(**changes)
 
@@ -84,7 +80,7 @@ def test_falling_thresholds_must_be_strictly_decreasing() -> None:
     ],
 )
 def test_invalid_levels_raise_value_error(name: str, threshold: float) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"^level (name|threshold) must be"):
         LevelSpec(name, threshold)
 
 
@@ -278,8 +274,8 @@ def test_normal_state_cannot_claim_an_announced_episode() -> None:
 
 def test_unexpected_validation_error_is_converted_to_state_error() -> None:
     class BrokenTimezone(tzinfo):
-        def utcoffset(self, value: datetime | None) -> timedelta | None:
-            raise ValueError("fictitious broken timezone")
+        def utcoffset(self, value: datetime | None) -> timedelta | None:  # noqa: ARG002  # tzinfo interface
+            raise ValueError("fictitious broken timezone")  # noqa: TRY003  # deliberate failure for the test
 
     broken_time = datetime(2030, 1, 1, tzinfo=BrokenTimezone())
     with pytest.raises(InvalidRuleStateError, match="fictitious broken timezone"):

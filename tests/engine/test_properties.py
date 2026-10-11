@@ -1,7 +1,5 @@
 """Property tests for alert event invariants."""
 
-# ruff: noqa: S101
-
 from __future__ import annotations
 
 from collections import Counter, defaultdict
@@ -48,9 +46,7 @@ def property_rule(direction: Direction = Direction.RISING) -> RuleSpec:
         direction,
         tuple(
             LevelSpec(name, threshold)
-            for name, threshold in zip(
-                ("warning", "alert", "critical"), thresholds, strict=True
-            )
+            for name, threshold in zip(("warning", "alert", "critical"), thresholds, strict=True)
         ),
         hysteresis=1.5,
         clear_after_samples=2,
@@ -71,11 +67,7 @@ def run_steps(
     clocks: list[datetime] = []
     for advance, sample_skew, value in steps:
         now += timedelta(seconds=advance)
-        sample = (
-            None
-            if value is None
-            else Sample(value, now + timedelta(seconds=sample_skew))
-        )
+        sample = None if value is None else Sample(value, now + timedelta(seconds=sample_skew))
         state, emitted = evaluate(rule, state, sample, now)
         events.extend(emitted)
         states.append(state)
@@ -94,9 +86,7 @@ def test_event_ids_are_unique_and_bounded_invariants_hold(
     event_ids = [event.event_id for event in events]
     assert len(event_ids) == len(set(event_ids))
 
-    reminders = Counter(
-        event.episode for event in events if event.kind is EventKind.REMINDER
-    )
+    reminders = Counter(event.episode for event in events if event.kind is EventKind.REMINDER)
     assert all(count <= rule.reminder_max for count in reminders.values())
 
     known_episodes: set[int] = set()
@@ -106,15 +96,11 @@ def test_event_ids_are_unique_and_bounded_invariants_hold(
             known_episodes.add(state.episode)
         previous_episode = state.episode
     assert all(
-        event.episode in known_episodes
-        for event in events
-        if event.kind is EventKind.RECOVERED
+        event.episode in known_episodes for event in events if event.kind is EventKind.RECOVERED
     )
 
     stale_flow = [
-        event.kind
-        for event in events
-        if event.kind in (EventKind.STALE, EventKind.RESTORED)
+        event.kind for event in events if event.kind in (EventKind.STALE, EventKind.RESTORED)
     ]
     assert all(left is not right for left, right in pairwise(stale_flow))
     if stale_flow:
@@ -125,9 +111,7 @@ def test_event_ids_are_unique_and_bounded_invariants_hold(
         if event.kind is EventKind.ESCALATED:
             escalation_times[event.level].append(clock)
     for times in escalation_times.values():
-        assert all(
-            later - earlier >= rule.cooldown for earlier, later in pairwise(times)
-        )
+        assert all(later - earlier >= rule.cooldown for earlier, later in pairwise(times))
 
 
 @settings(max_examples=200, deadline=None, derandomize=True)
@@ -163,13 +147,9 @@ def test_cooldown_bounds_escalations_in_every_sliding_window(
             Sample(10.0 if active else 9.0, now),
             now,
         )
-        for event in events:
-            if event.kind is EventKind.ESCALATED:
-                escalation_times.append(now)
+        escalation_times.extend(now for event in events if event.kind is EventKind.ESCALATED)
 
-    assert all(
-        later - earlier >= cooldown for earlier, later in pairwise(escalation_times)
-    )
+    assert all(later - earlier >= cooldown for earlier, later in pairwise(escalation_times))
 
 
 @settings(max_examples=200, deadline=None, derandomize=True)
@@ -211,9 +191,7 @@ def test_operator_alarm_state_matches_every_announced_recovery(
                 operator_heard_alarm = True
             elif event.kind is EventKind.RECOVERED:
                 operator_heard_alarm = False
-        assert operator_heard_alarm == (
-            state.active_level is not None and state.episode_announced
-        )
+        assert operator_heard_alarm == (state.active_level is not None and state.episode_announced)
 
 
 @settings(max_examples=150, deadline=None, derandomize=True)
@@ -273,9 +251,7 @@ def test_evaluate_never_raises_across_reminders_and_multisample_recovery(
         direction,
         tuple(
             LevelSpec(name, threshold)
-            for name, threshold in zip(
-                ("warning", "alert", "critical"), thresholds, strict=True
-            )
+            for name, threshold in zip(("warning", "alert", "critical"), thresholds, strict=True)
         ),
         hysteresis=1.0,
         clear_after_samples=clear_after_samples,

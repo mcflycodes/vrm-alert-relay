@@ -1,7 +1,5 @@
 """Behaviour tests for deterministic rule evaluation."""
 
-# ruff: noqa: S101
-
 from __future__ import annotations
 
 from dataclasses import replace
@@ -65,9 +63,7 @@ def test_rising_ladder_and_multilevel_jump_emit_highest_only() -> None:
     )
     assert state.active_level == "critical"
     assert state.episode == 1
-    assert [(event.kind, event.level) for event in events] == [
-        (EventKind.ESCALATED, "critical")
-    ]
+    assert [(event.kind, event.level) for event in events] == [(EventKind.ESCALATED, "critical")]
 
     unchanged, events = evaluate(
         rule,
@@ -93,9 +89,7 @@ def test_falling_ladder_crosses_inclusive_thresholds() -> None:
 
     state, events = evaluate(rule, RuleState(), Sample(30.0, BASE), BASE)
     assert state.active_level == "alert"
-    assert [(event.kind, event.level) for event in events] == [
-        (EventKind.ESCALATED, "alert")
-    ]
+    assert [(event.kind, event.level) for event in events] == [(EventKind.ESCALATED, "alert")]
 
     state, events = evaluate(
         rule,
@@ -292,10 +286,7 @@ def test_stale_and_restored_emit_once_and_thresholds_pause() -> None:
 
     state, events = evaluate(rule, state, None, BASE + timedelta(minutes=36))
     assert EventKind.STALE in [event.kind for event in events]
-    assert (
-        next(event.event_id for event in events if event.kind is EventKind.STALE)
-        != stale_id
-    )
+    assert next(event.event_id for event in events if event.kind is EventKind.STALE) != stale_id
     state, events = evaluate(
         rule,
         state,
@@ -497,9 +488,7 @@ def test_removed_and_readded_level_keeps_cooldown_history() -> None:
         stale_after=timedelta(days=1),
     )
     state, first = step(original, RuleState(), 0, 25.0)
-    state, removed_events = evaluate(
-        without_alert, state, None, BASE + timedelta(minutes=1)
-    )
+    state, removed_events = evaluate(without_alert, state, None, BASE + timedelta(minutes=1))
     state, readded_events = step(original, state, 12, 25.0)
 
     assert first == [EventKind.ESCALATED]
@@ -659,9 +648,7 @@ def test_event_ids_are_data_derived_across_clock_drift_and_round_trip() -> None:
     assert first[0].event_id == replayed[0].event_id
 
     _, first = evaluate(rule, replay_state, None, BASE + timedelta(minutes=10))
-    _, replayed = evaluate(
-        rule, replay_state, None, BASE + timedelta(minutes=10, seconds=30)
-    )
+    _, replayed = evaluate(rule, replay_state, None, BASE + timedelta(minutes=10, seconds=30))
     assert first[0].kind is EventKind.REMINDER
     assert first[0].event_id == replayed[0].event_id
 
@@ -669,9 +656,7 @@ def test_event_ids_are_data_derived_across_clock_drift_and_round_trip() -> None:
     prior, _ = evaluate(stale_rule, RuleState(), Sample(5.0, BASE), BASE)
     prior = RuleState.from_dict(prior.to_dict())
     _, first = evaluate(stale_rule, prior, None, BASE + timedelta(minutes=6))
-    _, replayed = evaluate(
-        stale_rule, prior, None, BASE + timedelta(minutes=6, seconds=30)
-    )
+    _, replayed = evaluate(stale_rule, prior, None, BASE + timedelta(minutes=6, seconds=30))
     assert first[0].kind is EventKind.STALE
     assert first[0].event_id == replayed[0].event_id
 
@@ -693,9 +678,7 @@ def test_event_ids_are_data_derived_across_clock_drift_and_round_trip() -> None:
     ("old_rule", "new_rule", "old_value", "new_value", "expected_level"),
     [
         (
-            rising_rule(
-                levels=(LevelSpec("warning", 10.0), LevelSpec("critical", 20.0))
-            ),
+            rising_rule(levels=(LevelSpec("warning", 10.0), LevelSpec("critical", 20.0))),
             rising_rule(levels=(LevelSpec("warning", 10.0),)),
             25.0,
             15.0,
@@ -709,9 +692,7 @@ def test_event_ids_are_data_derived_across_clock_drift_and_round_trip() -> None:
             "caution",
         ),
         (
-            rising_rule(
-                levels=(LevelSpec("warning", 10.0), LevelSpec("critical", 20.0))
-            ),
+            rising_rule(levels=(LevelSpec("warning", 10.0), LevelSpec("critical", 20.0))),
             RuleSpec(
                 "fictitious-temperature",
                 Direction.FALLING,
@@ -778,12 +759,8 @@ def test_top_level_rename_does_not_interrupt_stale_reminders() -> None:
     state, _ = evaluate(old_rule, RuleState(), Sample(11.0, BASE), BASE)
     reminder_minutes: list[int] = []
     for minute in (61, 121, 181):
-        state, events = evaluate(
-            renamed_rule, state, None, BASE + timedelta(minutes=minute)
-        )
-        reminder_minutes.extend(
-            minute for event in events if event.kind is EventKind.REMINDER
-        )
+        state, events = evaluate(renamed_rule, state, None, BASE + timedelta(minutes=minute))
+        reminder_minutes.extend(minute for event in events if event.kind is EventKind.REMINDER)
     assert reminder_minutes == [61, 121, 181]
     assert state.active_level == "critical"
     assert state.needs_rederive
@@ -888,9 +865,7 @@ def test_adding_level_preserves_partial_clear_streak_by_active_name() -> None:
     assert state.clear_count == 1
 
     second_clear = BASE + timedelta(minutes=2)
-    state, events = evaluate(
-        added_rule, state, Sample(15.0, second_clear), second_clear
-    )
+    state, events = evaluate(added_rule, state, Sample(15.0, second_clear), second_clear)
     assert events == []
     assert state.active_level == "alert"
     assert state.clear_count == 0
@@ -985,8 +960,7 @@ def test_level_history_capacity_discards_the_oldest_entry() -> None:
     old_names = tuple(f"old-{index}" for index in range(128))
     state = RuleState(
         level_notification_times=tuple(
-            (name, BASE + timedelta(seconds=index))
-            for index, name in enumerate(old_names)
+            (name, BASE + timedelta(seconds=index)) for index, name in enumerate(old_names)
         ),
     )
     rule = rising_rule(
@@ -1052,12 +1026,8 @@ def test_config_rederive_can_recover_or_wait_for_a_fresh_sample() -> None:
 
 
 def test_config_rederive_does_not_repeat_an_already_notified_level() -> None:
-    old_rule = rising_rule(
-        levels=(LevelSpec("warning", 10.0), LevelSpec("critical", 20.0))
-    )
-    reordered = rising_rule(
-        levels=(LevelSpec("critical", 10.0), LevelSpec("warning", 20.0))
-    )
+    old_rule = rising_rule(levels=(LevelSpec("warning", 10.0), LevelSpec("critical", 20.0)))
+    reordered = rising_rule(levels=(LevelSpec("critical", 10.0), LevelSpec("warning", 20.0)))
     state, _ = evaluate(old_rule, RuleState(), Sample(25.0, BASE), BASE)
     later = BASE + timedelta(minutes=1)
     state, events = evaluate(reordered, state, Sample(15.0, later), later)

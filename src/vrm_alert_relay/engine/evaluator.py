@@ -27,9 +27,7 @@ NO_SAMPLE_DISCRIMINATOR: Final = datetime(1970, 1, 1, tzinfo=UTC)
 
 def _aware(value: object) -> bool:
     return (
-        isinstance(value, datetime)
-        and value.tzinfo is not None
-        and value.utcoffset() is not None
+        isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None
     )
 
 
@@ -58,7 +56,7 @@ def _usable_sample(sample: object, now: datetime) -> Sample | None:
 def _mapping_set_time(
     values: tuple[LevelTime, ...], name: str, timestamp: datetime
 ) -> tuple[LevelTime, ...]:
-    updated = {key: value for key, value in values}
+    updated = dict(values)
     updated[name] = timestamp
     if len(updated) > MAX_LEVELS:
         oldest_name = min(
@@ -69,7 +67,7 @@ def _mapping_set_time(
     return tuple(sorted(updated.items()))
 
 
-def _event_id(
+def _event_id(  # noqa: PLR0913, PLR0917  # identity fields are positional by design
     rule_id: str,
     generation: str,
     episode: int,
@@ -94,7 +92,7 @@ def _event_id(
     return f"evt_{hashlib.sha256(identity).hexdigest()}"
 
 
-def _event(
+def _event(  # noqa: PLR0913  # event construction takes every field explicitly
     rule: RuleSpec,
     state: RuleState,
     kind: EventKind,
@@ -114,7 +112,7 @@ def _event(
         sample_time=sample_time,
         event_id=_event_id(
             rule.rule_id,
-            cast(str, state.generation),
+            cast("str", state.generation),
             state.episode,
             kind,
             level,
@@ -154,11 +152,7 @@ def _active_index(rule: RuleSpec, state: RuleState) -> int | None:
     if state.active_level is None:
         return None
     return next(
-        (
-            index
-            for index, level in enumerate(rule.levels)
-            if level.name == state.active_level
-        ),
+        (index for index, level in enumerate(rule.levels) if level.name == state.active_level),
         None,
     )
 
@@ -184,9 +178,7 @@ def _sanitize_state(rule: RuleSpec, state: RuleState, now: datetime) -> RuleStat
     direction_changed = (
         state.rule_direction is not None and state.rule_direction is not rule.direction
     )
-    active_missing = (
-        state.active_level is not None and state.active_level not in allowed
-    )
+    active_missing = state.active_level is not None and state.active_level not in allowed
     needs_rederive = state.needs_rederive or direction_changed or active_missing
     prior_order = state.level_order
     level_order = prior_order if needs_rederive and prior_order else names
@@ -197,25 +189,16 @@ def _sanitize_state(rule: RuleSpec, state: RuleState, now: datetime) -> RuleStat
         if _elapsed(now, timestamp) <= rule.cooldown
         and _elapsed(timestamp, now) <= FUTURE_TOLERANCE
     )
-    episode_levels = tuple(
-        name for name in state.episode_notified_levels if name in allowed
-    )
+    episode_levels = tuple(name for name in state.episode_notified_levels if name in allowed)
     pending = state.pending_escalation
     if pending is not None and pending not in allowed:
         pending = _provisional_level(rule, state)
-    if (
-        state.active_level is not None
-        and not state.episode_announced
-        and pending is None
-    ):
+    if state.active_level is not None and not state.episode_announced and pending is None:
         pending = _provisional_level(rule, state)
 
     newest_sample_time = state.newest_sample_time
     newest_value = state.newest_value
-    if (
-        newest_sample_time is not None
-        and _elapsed(newest_sample_time, now) > FUTURE_TOLERANCE
-    ):
+    if newest_sample_time is not None and _elapsed(newest_sample_time, now) > FUTURE_TOLERANCE:
         newest_sample_time = None
         newest_value = None
     last_evaluated = state.last_evaluated_sample_time
@@ -228,11 +211,7 @@ def _sanitize_state(rule: RuleSpec, state: RuleState, now: datetime) -> RuleStat
     episode_started = state.episode_started_at
     if state.active_level is not None and episode_started is None:
         episode_started = now
-    if (
-        state.active_level is not None
-        and state.episode_announced
-        and last_notification is None
-    ):
+    if state.active_level is not None and state.episode_announced and last_notification is None:
         last_notification = now
 
     return replace(
@@ -251,7 +230,7 @@ def _sanitize_state(rule: RuleSpec, state: RuleState, now: datetime) -> RuleStat
     )
 
 
-def _send_escalation(
+def _send_escalation(  # noqa: PLR0913  # transition inputs are explicit, not bundled
     rule: RuleSpec,
     state: RuleState,
     level_name: str,
@@ -264,9 +243,7 @@ def _send_escalation(
     notified = tuple(dict.fromkeys((*state.episode_notified_levels, level_name)))
     state = replace(
         state,
-        level_notification_times=_mapping_set_time(
-            state.level_notification_times, level_name, now
-        ),
+        level_notification_times=_mapping_set_time(state.level_notification_times, level_name, now),
         episode_notified_levels=notified,
         escalation_ordinal=ordinal,
         episode_announced=True,
@@ -286,7 +263,7 @@ def _send_escalation(
     )
 
 
-def _attempt_escalation(
+def _attempt_escalation(  # noqa: PLR0913  # transition inputs are explicit, not bundled
     rule: RuleSpec,
     state: RuleState,
     level_name: str,
@@ -312,15 +289,9 @@ def _attempt_escalation(
     )
 
 
-def _recover(
-    rule: RuleSpec, state: RuleState, sample: Sample
-) -> tuple[RuleState, list[Event]]:
+def _recover(rule: RuleSpec, state: RuleState, sample: Sample) -> tuple[RuleState, list[Event]]:
     events: list[Event] = []
-    if (
-        rule.recovery_notify
-        and state.episode_announced
-        and state.active_level is not None
-    ):
+    if rule.recovery_notify and state.episode_announced and state.active_level is not None:
         discriminator = state.episode_started_at or sample.timestamp
         events.append(
             _event(
@@ -395,7 +366,7 @@ def _rederive(
     return state, [event] if event is not None else []
 
 
-def _evaluate_threshold(
+def _evaluate_threshold(  # noqa: C901, PLR0911  # state-machine transitions, deliberately not restructured
     rule: RuleSpec,
     state: RuleState,
     sample: Sample,
@@ -497,7 +468,7 @@ def _maybe_emit_pending(
 ) -> tuple[RuleState, Event | None]:
     if state.pending_escalation is None:
         return state, None
-    level_name = cast(str, _provisional_level(rule, state))
+    level_name = cast("str", _provisional_level(rule, state))
     if state.episode_announced and level_name in state.episode_notified_levels:
         return replace(state, pending_escalation=None), None
     last_time = dict(state.level_notification_times).get(level_name)
@@ -525,9 +496,7 @@ def _maybe_remind(
         or state.reminder_count >= rule.reminder_max
     ):
         return state, None
-    anchor = cast(
-        datetime, state.last_episode_notification_time or state.episode_started_at
-    )
+    anchor = cast("datetime", state.last_episode_notification_time or state.episode_started_at)
     if _elapsed(now, anchor) < rule.reminder_interval:
         return state, None
     count = state.reminder_count + 1
@@ -558,7 +527,7 @@ def evaluate(
     """Evaluate one rule without I/O, mutation, global state, or wall-clock access."""
 
     if not _aware(now):
-        raise ValueError("now must be an aware datetime")
+        raise ValueError("now must be an aware datetime")  # noqa: TRY003  # per-check validation message
     if state.generation is None:
         state = replace(state, generation=now.astimezone(UTC).isoformat())
     state = _sanitize_state(rule, state, now)
@@ -575,9 +544,7 @@ def evaluate(
         )
 
     sample_age = (
-        _elapsed(now, state.newest_sample_time)
-        if state.newest_sample_time is not None
-        else None
+        _elapsed(now, state.newest_sample_time) if state.newest_sample_time is not None else None
     )
     is_fresh = sample_age is not None and sample_age <= rule.stale_after
     if not is_fresh and not state.stale:
