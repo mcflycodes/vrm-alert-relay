@@ -1,0 +1,335 @@
+from __future__ import annotations
+
+import io
+import json
+import logging
+import re
+import warnings
+from collections.abc import Iterator
+from typing import Any
+
+import pytest
+
+from vrm_alert_relay.logs import (
+    REDACTED,
+    JsonFormatter,
+    SecretRegistry,
+    configure_logging,
+    register_secret,
+)
+from vrm_alert_relay.logs.redaction import TRUNCATED
+
+CANARY = "fictitious-api-password-0001"
+CANARY_BEARER = "fictitious-bearer-token-0002"
+PHONE = "+1 202 555 0143"
+TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z")
+
+
+@pytest.fixture(autouse=True)
+def restore_logging() -> Iterator[None]:
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    quiet = {name: logging.getLogger(name).level for name in ("httpx", "httpcore")}
+    yield
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    for handler in handlers:
+        root.addHandler(handler)
+    root.setLevel(level)
+    for name, quiet_level in quiet.items():
+        logging.getLogger(name).setLevel(quiet_level)
+    logging.captureWarnings(False)
+
+
+@pytest.fixture
+def registry() -> SecretRegistry:
+    instance = SecretRegistry()
+    instance.register(CANARY)
+    instance.register(CANARY_BEARER)
+    return instance
+
+
+@pytest.fixture
+def stream(registry: SecretRegistry) -> io.StringIO:
+    buffer = io.StringIO()
+    configure_logging("DEBUG", stream=buffer, registry=registry)
+    return buffer
+
+
+def lines(stream: io.StringIO) -> list[dict[str, Any]]:
+    output = stream.getvalue()
+    assert output.endswith("\n")
+    return [json.loads(line) for line in output.splitlines()]
+
+
+def assert_clean(stream: io.StringIO) -> None:
+    output = stream.getvalue()
+    for leaked in (CANARY, CANARY_BEARER, PHONE, "2025550143", "202 555 0143"):
+        assert leaked not in output
+
+
+def test_one_json_object_per_line(stream: io.StringIO) -> None:
+    log = logging.getLogger("vrm_alert_relay.test")
+    log.info("first")
+    log.warning("second\nline")
+    records = lines(stream)
+    assert len(records) == 2
+    first = records[0]
+    assert set(first) == {"ts", "level", "logger", "msg"}
+    assert TS_RE.fullmatch(first["ts"])
+    assert first["level"] == "INFO"
+    assert first["logger"] == "vrm_alert_relay.test"
+    assert first["msg"] == "first"
+    assert records[1]["msg"] == "second\\nline"
+
+
+def test_extras_are_structured_and_redacted(stream: io.StringIO) -> None:
+    logging.getLogger("t").info(
+        "sending",
+        extra={
+            "rule": "battery_low",
+            "attempt": 2,
+            "recipient": PHONE,
+            "api_password": "keyed-value",
+            "request": {
+                "headers": {"Authorization": f"Bearer {CANARY_BEARER}"},
+                "params": {"x": CANARY},
+            },
+            "url": f"https://voip.example.com/rest.php?api_password={CANARY}&did=2025550143",
+        },
+    )
+    (record,) = lines(stream)
+    assert record["rule"] == "battery_low"
+    assert record["attempt"] == 2
+    assert record["recipient"] == "***0143"
+    assert record["api_password"] == REDACTED
+    assert record["request"] == {
+        "headers": {"Authorization": REDACTED},
+        "params": {"x": REDACTED},
+    }
+    assert record["url"] == f"https://voip.example.com/rest.php?{REDACTED}"
+    assert_clean(stream)
+
+
+def test_extra_name_collisions_are_prefixed(stream: io.StringIO) -> None:
+    logging.getLogger("t").info(
+        "real", extra={"ts": "fake", "level": "fake", "exc": "fake"}
+    )
+    (record,) = lines(stream)
+    assert record["msg"] == "real"
+    assert record["level"] == "INFO"
+    assert record["extra_ts"] == "fake"
+    assert record["extra_level"] == "fake"
+    assert record["extra_exc"] == "fake"
+
+
+def test_message_and_args_redacted(stream: io.StringIO) -> None:
+    log = logging.getLogger("t")
+    log.info("login with %s to %s", CANARY, PHONE)
+    log.info("params %r", {"api_password": "plain", "did": "2025550143"})
+    log.info("header Authorization: Bearer %s", CANARY_BEARER)
+    log.info("GET https://example.com/api?token=%s&x=1", "abc")
+    log.info("bell\x07 escape\x1b[31m rtl\u202e nul\x00")
+    records = lines(stream)
+    assert records[0]["msg"] == f"login with {REDACTED} to ***0143"
+    assert (
+        records[1]["msg"]
+        == f"params {{'api_password': '{REDACTED}', 'did': '***0143'}}"
+    )
+    assert records[2]["msg"] == f"header Authorization: {REDACTED}"
+    assert records[3]["msg"] == f"GET https://example.com/api?{REDACTED}"
+    assert records[4]["msg"] == "bell\\x07 escape\\x1b[31m rtl\\u202e nul\\x00"
+    assert_clean(stream)
+
+
+def test_exception_tracebacks_redacted(stream: io.StringIO) -> None:
+    def fail() -> None:
+        url = f"https://example.com/send?api_password={CANARY}"
+        raise ValueError(
+            f"failed {url} for {PHONE} token={CANARY_BEARER}\ninjected line"
+        )
+
+    try:
+        fail()
+    except ValueError:
+        logging.getLogger("t").exception("delivery failed")
+    (record,) = lines(stream)
+    assert record["msg"] == "delivery failed"
+    assert record["exc"].startswith("Traceback (most recent call last):")
+    assert "ValueError: failed https://example.com/send?[REDACTED]" in record["exc"]
+    assert "***0143" in record["exc"]
+    assert "\n" not in record["exc"]
+    assert_clean(stream)
+
+
+def test_chained_exception_redacted(stream: io.StringIO) -> None:
+    try:
+        try:
+            raise KeyError(CANARY)
+        except KeyError as inner:
+            raise RuntimeError("wrapped") from inner
+    except RuntimeError:
+        logging.getLogger("t").exception("boom")
+    (record,) = lines(stream)
+    assert "KeyError" in record["exc"]
+    assert "RuntimeError: wrapped" in record["exc"]
+    assert_clean(stream)
+
+
+def test_long_exception_keeps_tail(registry: SecretRegistry) -> None:
+    buffer = io.StringIO()
+    configure_logging(stream=buffer, registry=registry, max_exception_length=500)
+    try:
+        raise ValueError("x" * 5000 + " END-OF-MESSAGE")
+    except ValueError:
+        logging.getLogger("t").exception("long")
+    (record,) = lines(buffer)
+    assert len(record["exc"]) == 500
+    assert record["exc"].startswith(TRUNCATED)
+    assert record["exc"].endswith("END-OF-MESSAGE")
+
+
+def test_exc_text_without_exc_info(registry: SecretRegistry) -> None:
+    formatter = JsonFormatter(registry=registry)
+    record = logging.LogRecord("t", logging.ERROR, __file__, 1, "cached", None, None)
+    record.exc_text = f"Traceback: secret {CANARY}"
+    output = json.loads(formatter.format(record))
+    assert output["exc"] == f"Traceback: secret {REDACTED}"
+
+
+def test_stack_info_redacted(stream: io.StringIO) -> None:
+    logging.getLogger("t").info("with stack %s", CANARY, stack_info=True)
+    (record,) = lines(stream)
+    assert record["stack"].startswith("Stack (most recent call last):")
+    assert_clean(stream)
+
+
+def test_long_fields_truncated(registry: SecretRegistry) -> None:
+    buffer = io.StringIO()
+    configure_logging(stream=buffer, registry=registry)
+    logging.getLogger("t").info("m" * 50_000, extra={"field": "f" * 50_000})
+    (record,) = lines(buffer)
+    assert len(record["msg"]) == 2048
+    assert record["msg"].endswith(TRUNCATED)
+    assert len(record["field"]) == 2048
+    assert len(buffer.getvalue()) < 10_000
+
+
+def test_malicious_nested_extras_bounded(stream: io.StringIO) -> None:
+    nested: dict[str, Any] = {"token": "x"}
+    for _ in range(500):
+        nested = {"child": nested, "list": list(range(1000))}
+    logging.getLogger("t").info("nested", extra={"payload": nested})
+    output = stream.getvalue()
+    assert len(output) < 50_000
+    (record,) = lines(stream)
+    assert "payload" in record
+
+
+def test_bad_format_args_do_not_leak(
+    registry: SecretRegistry, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Handled directly: pytest's own capture handler would raise on the bad args.
+    stream = io.StringIO()
+    handler = configure_logging(stream=stream, registry=registry)
+    handler.handle(
+        logging.LogRecord(
+            "t", logging.INFO, __file__, 1, "value %d for " + CANARY, ("x",), None
+        )
+    )
+    (output,) = lines(stream)
+    assert output["msg"] == (
+        f"value %d for {REDACTED} [log arguments could not be formatted]"
+    )
+    assert CANARY not in capsys.readouterr().err
+    assert_clean(stream)
+
+
+def test_formatter_failure_falls_back(
+    stream: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def explode(self: JsonFormatter, record: logging.LogRecord) -> str:
+        raise RuntimeError(CANARY)
+
+    monkeypatch.setattr(JsonFormatter, "_format", explode)
+    logging.getLogger("t").warning("will not format %s", CANARY)
+    (record,) = lines(stream)
+    assert record["msg"] == "log record could not be formatted"
+    assert record["level"] == "WARNING"
+    assert CANARY not in capsys.readouterr().err
+    assert_clean(stream)
+
+
+def test_globally_registered_secret(capsys: pytest.CaptureFixture[str]) -> None:
+    value = "fictitious-global-secret-0099"
+    register_secret(value)
+    configure_logging("INFO")
+    logging.getLogger("t").info("using %s", value)
+    out = capsys.readouterr().out
+    assert value not in out
+    assert json.loads(out)["msg"] == f"using {REDACTED}"
+
+
+def test_configure_replaces_handlers_and_sets_levels() -> None:
+    root = logging.getLogger()
+    stale = logging.StreamHandler(io.StringIO())
+    root.addHandler(stale)
+    handler = configure_logging(logging.DEBUG, stream=io.StringIO())
+    assert root.handlers == [handler]
+    assert isinstance(handler.formatter, JsonFormatter)
+    assert root.level == logging.DEBUG
+    assert logging.getLogger("httpx").level == logging.WARNING
+    assert logging.getLogger("httpcore").level == logging.WARNING
+    configure_logging("error", stream=io.StringIO())
+    assert root.level == logging.ERROR
+    assert logging.getLogger("httpx").level == logging.ERROR
+
+
+def test_level_filtering(stream: io.StringIO) -> None:
+    configure_logging(" warning ", stream=stream)
+    log = logging.getLogger("t")
+    log.info("hidden")
+    log.warning("shown")
+    assert [record["msg"] for record in lines(stream)] == ["shown"]
+
+
+def test_httpx_request_lines_suppressed_and_redacted(stream: io.StringIO) -> None:
+    httpx_log = logging.getLogger("httpx")
+    httpx_log.info(
+        'HTTP Request: GET https://example.com/?api_password=%s "HTTP/1.1 200 OK"',
+        CANARY,
+    )
+    httpx_log.warning(
+        'HTTP Request: GET https://example.com/?api_password=%s "HTTP/1.1 500"', CANARY
+    )
+    records = lines(stream)
+    assert len(records) == 1
+    assert (
+        records[0]["msg"]
+        == f'HTTP Request: GET https://example.com/?{REDACTED} "HTTP/1.1 500"'
+    )
+
+
+def test_warnings_routed_through_logging(stream: io.StringIO) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        warnings.warn(f"careful with {CANARY}", UserWarning, stacklevel=1)
+    (record,) = lines(stream)
+    assert record["logger"] == "py.warnings"
+    assert "UserWarning" in record["msg"]
+    assert_clean(stream)
+
+
+@pytest.mark.parametrize("level", ["LOUD", "", "5x"])
+def test_invalid_level_names(level: str) -> None:
+    with pytest.raises(ValueError, match="invalid log level"):
+        configure_logging(level)
+
+
+def test_invalid_level_types() -> None:
+    with pytest.raises(TypeError):
+        configure_logging(True)
+    with pytest.raises(ValueError, match="invalid log level"):
+        configure_logging(1.5)  # type: ignore[arg-type]

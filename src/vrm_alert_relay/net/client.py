@@ -1,0 +1,451 @@
+"""Hardened outbound HTTP client shared by every adapter.
+
+Guarantees, none of which can be turned off by callers:
+
+- HTTPS only, validated before any I/O; certificate verification always on.
+- Redirects are never followed: any 3xx raises :class:`HttpRedirectRefused`.
+- Proxy and TLS environment variables are ignored (``trust_env=False``).
+- Connect, read, write and pool timeouts, plus an overall per-request deadline
+  checked before the body is read and after every body chunk.
+- The response body is streamed and the request aborts as soon as it exceeds
+  the size cap.
+- Header names and values are validated; CR, LF, NUL and other control
+  characters are rejected.
+- Exceptions carry only the method, the endpoint's display form and the
+  status. Bodies, query strings and header values are never logged.
+"""
+
+from __future__ import annotations
+
+import codecs
+import contextlib
+import json as jsonlib
+import logging
+import math
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
+from time import monotonic
+from types import TracebackType
+from typing import Any, Final, Self
+
+import httpx
+
+from vrm_alert_relay.net.endpoint import Endpoint
+from vrm_alert_relay.net.errors import (
+    HttpDecodeError,
+    HttpRedirectRefused,
+    HttpStatusError,
+    HttpTimeout,
+    HttpTooLarge,
+    HttpTransportError,
+    InvalidHeaderError,
+    InvalidRequestError,
+)
+
+DEFAULT_MAX_RESPONSE_BYTES: Final = 1024 * 1024
+DEFAULT_USER_AGENT: Final = "vrm-alert-relay"
+MAX_HEADER_VALUE_LENGTH: Final = 8192
+MAX_RETRY_AFTER_SECONDS: Final = 86400.0
+
+_ALLOWED_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"})
+_RESERVED_HEADERS = frozenset(
+    {"host", "content-length", "transfer-encoding", "connection"}
+)
+_HEADER_NAME_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,256}")
+_HEADER_VALUE_FORBIDDEN_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+_CHARSET_RE = re.compile(r"charset=\"?([A-Za-z0-9._-]{1,40})", re.IGNORECASE)
+_RETRY_AFTER_SECONDS_RE = re.compile(r"[0-9]{1,10}")
+_TIMEOUT_PHASES: Mapping[type[httpx.TimeoutException], str] = {
+    httpx.ConnectTimeout: "connect",
+    httpx.ReadTimeout: "read",
+    httpx.WriteTimeout: "write",
+    httpx.PoolTimeout: "pool",
+}
+
+QueryValue = str | int | float | bool | None
+QueryParams = (
+    Mapping[str, QueryValue]
+    | list[tuple[str, QueryValue]]
+    | tuple[tuple[str, QueryValue], ...]
+)
+MultipartFile = tuple[str, bytes, str]
+"""A file part: ``(filename, content, content_type)``."""
+MultipartFields = Mapping[str, str | MultipartFile]
+
+_log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class Timeouts:
+    """Per-operation timeouts and the overall per-request deadline, in seconds."""
+
+    connect: float = 5.0
+    read: float = 10.0
+    write: float = 10.0
+    pool: float = 5.0
+    deadline: float = 30.0
+
+    def __post_init__(self) -> None:
+        for name in ("connect", "read", "write", "pool", "deadline"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"timeout {name!r} must be a positive finite number")
+
+
+@dataclass(frozen=True, slots=True)
+class HttpResponse:
+    """A fully read 2xx response. ``repr()`` never includes headers or body."""
+
+    status_code: int
+    headers: httpx.Headers = field(repr=False)
+    content: bytes = field(repr=False)
+
+    def text(self) -> str:
+        """Decode the body using the declared charset, falling back to UTF-8."""
+        encoding = "utf-8"
+        match = _CHARSET_RE.search(self.headers.get("content-type", ""))
+        if match:
+            with contextlib.suppress(LookupError):
+                encoding = codecs.lookup(match.group(1)).name
+        return self.content.decode(encoding, errors="replace")
+
+    def json(self) -> Any:
+        """Parse the body as JSON, raising :class:`HttpDecodeError` on failure."""
+        try:
+            return jsonlib.loads(self.content)
+        except (ValueError, RecursionError):
+            raise HttpDecodeError("response body is not valid JSON") from None
+
+
+class SafeHttpClient:
+    """The only HTTP client adapters may use. See the module docstring."""
+
+    def __init__(
+        self,
+        *,
+        timeouts: Timeouts | None = None,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        user_agent: str = DEFAULT_USER_AGENT,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        self._timeouts = timeouts if timeouts is not None else Timeouts()
+        self._max_response_bytes = _validate_limit(max_response_bytes)
+        default_headers = {"User-Agent": user_agent, "Accept-Encoding": "identity"}
+        default_headers.update(_validate_headers(headers))
+        self._client = httpx.Client(
+            follow_redirects=False,
+            verify=True,
+            trust_env=False,
+            timeout=httpx.Timeout(
+                connect=self._timeouts.connect,
+                read=self._timeouts.read,
+                write=self._timeouts.write,
+                pool=self._timeouts.pool,
+            ),
+            headers=_validate_headers(default_headers),
+        )
+
+    @property
+    def timeouts(self) -> Timeouts:
+        return self._timeouts
+
+    @property
+    def max_response_bytes(self) -> int:
+        return self._max_response_bytes
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def get(
+        self,
+        target: Endpoint | str,
+        *,
+        params: QueryParams | None = None,
+        headers: Mapping[str, str] | None = None,
+        max_response_bytes: int | None = None,
+    ) -> HttpResponse:
+        return self.request(
+            "GET",
+            target,
+            params=params,
+            headers=headers,
+            max_response_bytes=max_response_bytes,
+        )
+
+    def post(
+        self,
+        target: Endpoint | str,
+        *,
+        params: QueryParams | None = None,
+        headers: Mapping[str, str] | None = None,
+        json: Any = None,
+        form: Mapping[str, str] | None = None,
+        multipart: MultipartFields | None = None,
+        max_response_bytes: int | None = None,
+    ) -> HttpResponse:
+        return self.request(
+            "POST",
+            target,
+            params=params,
+            headers=headers,
+            json=json,
+            form=form,
+            multipart=multipart,
+            max_response_bytes=max_response_bytes,
+        )
+
+    def request(
+        self,
+        method: str,
+        target: Endpoint | str,
+        *,
+        params: QueryParams | None = None,
+        headers: Mapping[str, str] | None = None,
+        json: Any = None,
+        form: Mapping[str, str] | None = None,
+        multipart: MultipartFields | None = None,
+        max_response_bytes: int | None = None,
+    ) -> HttpResponse:
+        """Send a request and return the fully read 2xx response.
+
+        At most one of ``json``, ``form`` (URL-encoded) and ``multipart`` may be
+        given. ``params`` are merged into any query string the endpoint already
+        has. Secrets may be passed in any of these; none of them appear in
+        exceptions or logs raised by this client.
+        """
+        endpoint = target if isinstance(target, Endpoint) else Endpoint(target)
+        method = _validate_method(method)
+        limit = (
+            self._max_response_bytes
+            if max_response_bytes is None
+            else _validate_limit(max_response_bytes)
+        )
+        request = self._build_request(
+            method, endpoint, params, headers, json, form, multipart
+        )
+        shown = endpoint.display
+
+        start = monotonic()
+        deadline = start + self._timeouts.deadline
+        try:
+            response = self._client.send(request, stream=True)
+        except httpx.TimeoutException as exc:
+            raise HttpTimeout(method, shown, phase=_timeout_phase(exc)) from None
+        except (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError) as exc:
+            raise HttpTransportError(method, shown, cause=type(exc).__name__) from None
+
+        try:
+            status = response.status_code
+            if 300 <= status < 400:
+                raise HttpRedirectRefused(method, shown, status=status)
+            if not 200 <= status < 300:
+                retry_after = _parse_retry_after(response.headers.get("retry-after"))
+                raise HttpStatusError(
+                    method, shown, status=status, retry_after=retry_after
+                )
+            content = _read_body(response, method, shown, limit, deadline)
+        finally:
+            with contextlib.suppress(httpx.HTTPError, httpx.StreamError):
+                response.close()
+
+        _log.debug(
+            "http request completed",
+            extra={
+                "http_method": method,
+                "http_target": shown,
+                "http_status": status,
+                "http_bytes": len(content),
+                "elapsed_ms": round((monotonic() - start) * 1000),
+            },
+        )
+        return HttpResponse(
+            status_code=status, headers=response.headers, content=content
+        )
+
+    def _build_request(
+        self,
+        method: str,
+        endpoint: Endpoint,
+        params: QueryParams | None,
+        headers: Mapping[str, str] | None,
+        json: Any,
+        form: Mapping[str, str] | None,
+        multipart: MultipartFields | None,
+    ) -> httpx.Request:
+        bodies = sum(body is not None for body in (json, form, multipart))
+        if bodies > 1:
+            raise InvalidRequestError(
+                "only one of json, form and multipart may be given"
+            )
+        files = _multipart_files(multipart) if multipart is not None else None
+        request_headers = _validate_headers(headers)
+        _validate_params(params)
+
+        url = endpoint.url
+        try:
+            if params:
+                url = url.copy_merge_params(params)
+            return self._client.build_request(
+                method,
+                url,
+                headers=request_headers,
+                json=json,
+                data=form,
+                files=files,
+            )
+        except (TypeError, ValueError, RecursionError, httpx.InvalidURL):
+            raise InvalidRequestError(
+                f"request body or parameters could not be encoded: {method} {endpoint.display}"
+            ) from None
+
+
+def _read_body(
+    response: httpx.Response, method: str, shown: str, limit: int, deadline: float
+) -> bytes:
+    declared = response.headers.get("content-length")
+    if (
+        declared is not None
+        and declared.isascii()
+        and declared.isdigit()
+        and int(declared) > limit
+    ):
+        raise HttpTooLarge(method, shown, limit=limit)
+    if monotonic() > deadline:
+        raise HttpTimeout(method, shown, phase="deadline")
+
+    body = bytearray()
+    try:
+        for chunk in response.iter_bytes():
+            body += chunk
+            if len(body) > limit:
+                raise HttpTooLarge(method, shown, limit=limit)
+            if monotonic() > deadline:
+                raise HttpTimeout(method, shown, phase="deadline")
+    except httpx.TimeoutException as exc:
+        raise HttpTimeout(method, shown, phase=_timeout_phase(exc)) from None
+    except (httpx.HTTPError, httpx.StreamError) as exc:
+        raise HttpTransportError(method, shown, cause=type(exc).__name__) from None
+    return bytes(body)
+
+
+def _validate_method(method: object) -> str:
+    if not isinstance(method, str) or method.upper() not in _ALLOWED_METHODS:
+        raise InvalidRequestError("unsupported HTTP method")
+    return method.upper()
+
+
+def _validate_limit(limit: object) -> int:
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("max_response_bytes must be a positive integer")
+    return limit
+
+
+def _validate_params(params: QueryParams | None) -> None:
+    if params is None:
+        return
+    pairs = params.items() if isinstance(params, Mapping) else params
+    for pair in pairs:
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise InvalidRequestError("query parameters must be (name, value) pairs")
+        name, value = pair
+        if not isinstance(name, str) or not isinstance(value, str | int | float | None):
+            raise InvalidRequestError(
+                "query parameter names must be str and values str, int, float, bool or None"
+            )
+
+
+def _validate_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
+    if headers is None:
+        return {}
+    validated: dict[str, str] = {}
+    for name, value in headers.items():
+        if not isinstance(name, str) or not _HEADER_NAME_RE.fullmatch(name):
+            raise InvalidHeaderError("invalid header name")
+        if name.lower() in _RESERVED_HEADERS:
+            raise InvalidHeaderError(f"header {name!r} is managed by the client")
+        _validate_header_value(name, value)
+        validated[name] = value
+    return validated
+
+
+def _validate_header_value(name: str, value: object) -> None:
+    if not isinstance(value, str):
+        raise InvalidHeaderError(f"value of header {name!r} must be a string")
+    if len(value) > MAX_HEADER_VALUE_LENGTH:
+        raise InvalidHeaderError(f"value of header {name!r} is too long")
+    if _HEADER_VALUE_FORBIDDEN_RE.search(value):
+        raise InvalidHeaderError(
+            f"value of header {name!r} contains control characters"
+        )
+
+
+def _multipart_files(
+    multipart: MultipartFields,
+) -> list[tuple[str, tuple[str | None, str | bytes] | tuple[str, bytes, str]]]:
+    if not multipart:
+        raise InvalidRequestError("multipart body must have at least one field")
+    files: list[
+        tuple[str, tuple[str | None, str | bytes] | tuple[str, bytes, str]]
+    ] = []
+    for name, value in multipart.items():
+        if not isinstance(name, str):
+            raise InvalidRequestError("multipart field names must be strings")
+        if isinstance(value, str):
+            files.append((name, (None, value)))
+            continue
+        if (
+            not isinstance(value, tuple)
+            or len(value) != 3
+            or not isinstance(value[0], str)
+            or not isinstance(value[1], bytes)
+            or not isinstance(value[2], str)
+        ):
+            raise InvalidRequestError(
+                f"multipart field {name!r} must be a str or (filename, bytes, content_type)"
+            )
+        _validate_header_value("Content-Type", value[2])
+        files.append((name, value))
+    return files
+
+
+def _timeout_phase(exc: httpx.TimeoutException) -> str:
+    for exc_type, phase in _TIMEOUT_PHASES.items():
+        if isinstance(exc, exc_type):
+            return phase
+    return "unknown"
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    if value is None:
+        return None
+    value = value.strip()
+    if _RETRY_AFTER_SECONDS_RE.fullmatch(value):
+        seconds = float(value)
+    else:
+        try:
+            when = parsedate_to_datetime(value)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        seconds = (when - datetime.now(UTC)).total_seconds()
+    return min(max(seconds, 0.0), MAX_RETRY_AFTER_SECONDS)
