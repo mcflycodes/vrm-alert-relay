@@ -120,6 +120,7 @@ CASES: dict[str, Builder] = {
     "inline_secret": _set(("providers", "voipms", "password"), CANARY),
     "inline_token_phone": _set(("vrm", "token"), PHONE),
     "model_type": _set(("vrm",), CANARY),
+    "mapping_under_leaf": _set(("health", "port"), {CANARY: {PHONE_NAME: 1}}),
     "dict_type": _set(("recipients",), CANARY),
     "tuple_type": _set(("rules",), CANARY),
     "too_long": _rule_recipients(*[CANARY_NAME] * 51),
@@ -177,6 +178,151 @@ CASES: dict[str, Builder] = {
     "yaml_not_mapping": _text(f"- {CANARY}\n- {PHONE}\n"),
     "yaml_not_utf8": _text(f"a: {CANARY} {PHONE}\n".encode() + b"\xff"),
 }
+
+
+def _key(path: tuple[str | int, ...], key: str, value: Any = 1) -> Builder:
+    def build(data: Data, dump: Dump) -> str:
+        target: Any = data
+        for part in path:
+            target = target[part]
+        target[key] = value
+        return dump(data)
+
+    return build
+
+
+def _duplicate(prefix: str, key: str, indent: str = "") -> Builder:
+    return _text(f"{prefix}{indent}'{key}': 1\n{indent}'{key}': 2\n")
+
+
+INLINE_LOOKING_KEY = "fake-secret-CANARY-7Q9X_token"
+
+# The canary as a mapping key in every position. None of these keys pass the
+# recipient-name rule, so none may be shown.
+KEY_CASES: dict[str, Builder] = {
+    "top_level": _key((), CANARY),
+    "top_level_phone": _key((), PHONE_NAME),
+    "vrm": _key(("vrm",), CANARY),
+    "installation": _key(("vrm", "installations", 0), CANARY),
+    "sending": _key(("sending",), PHONE),
+    "providers": _key(("providers",), CANARY, {"enabled": True}),
+    "provider_section": _key(("providers", "voipms"), CANARY),
+    "log_provider": _key(("providers", "log"), CANARY),
+    "rule": _key(("rules", 0), CANARY),
+    "level": _key(("rules", 0, "levels", 1), CANARY),
+    "measurement": _key(("rules", 0, "measurement"), CANARY),
+    "health": _key(("health",), CANARY),
+    "recipient_field": _key(("recipients", "owner_sms"), CANARY),
+    "recipient_name": _key(("recipients",), CANARY, {"provider": "log"}),
+    "recipient_name_phone": _key(("recipients",), PHONE_NAME, {"provider": "voipms"}),
+    "recipient_name_phone_formatted": _key(("recipients",), PHONE, {"provider": "log"}),
+    "recipient_name_digits_inside": _key(
+        ("recipients",), f"owner-{PHONE_NAME}", {"provider": "voipms"}
+    ),
+    "recipient_bad_provider": _key(("recipients",), CANARY, {"provider": CANARY}),
+    "recipient_missing_provider": _key(("recipients",), CANARY, {"phone": PHONE}),
+    "recipient_unknown_field": _key(
+        ("recipients",), PHONE_NAME, {"provider": "log", CANARY: 1}
+    ),
+    "inline_secret_looking_key": _key(("vrm",), INLINE_LOOKING_KEY, CANARY),
+    "nested_under_unknown_key": _key((), CANARY, {PHONE_NAME: {CANARY: 1}}),
+    "duplicate_under_leaf": _text(
+        f"health:\n  port:\n    {CANARY}:\n      '{PHONE_NAME}': 1\n      '{PHONE_NAME}': 2\n"
+    ),
+    "duplicate_top_level": _duplicate("", CANARY),
+    "duplicate_phone": _duplicate("", PHONE_NAME),
+    "duplicate_in_vrm": _duplicate("vrm:\n", CANARY, "  "),
+    "duplicate_recipient_name": _duplicate("recipients:\n", CANARY, "  "),
+    "duplicate_recipient_phone_name": _duplicate("recipients:\n", PHONE_NAME, "  "),
+    "duplicate_under_bad_recipient": _text(
+        f"recipients:\n  {CANARY}:\n    '{PHONE_NAME}': 1\n    '{PHONE_NAME}': 2\n"
+    ),
+    "duplicate_in_rule": _text(f"rules:\n  - {CANARY}: 1\n    {CANARY}: 2\n"),
+    "duplicate_under_unknown": _text(f"{CANARY}:\n  {CANARY}: 1\n  {CANARY}: 2\n"),
+    "merge_under_unknown": _text(f"{CANARY}:\n  <<: {{a: 1}}\n"),
+    "non_string_under_unknown": _text(f"{CANARY}:\n  {PHONE_NAME}: 1\n"),
+    "oversized_under_unknown": _text(f"{CANARY}: [" + ",".join(["1"] * 1001) + "]\n"),
+}
+
+
+@pytest.mark.parametrize("build", KEY_CASES.values(), ids=KEY_CASES.keys())
+def test_config_errors_never_echo_mapping_keys(
+    config_data: Data, to_yaml: Dump, build: Builder, request: pytest.FixtureRequest
+) -> None:
+    text = build(copy.deepcopy(config_data), to_yaml)
+    with pytest.raises(ConfigError) as caught:
+        parse_config(text)
+    _assert_clean(caught.value, caught.value.problems)
+    assert all("(line " in problem for problem in caught.value.problems)
+    if "duplicate" in request.node.callspec.id:
+        assert all("duplicate key" in p for p in caught.value.problems)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            f"{CANARY}: 1\n",
+            "<root>: unrecognized setting (line 1)",
+        ),
+        (
+            f"version: 1\n{CANARY}: 1\n{CANARY}: 2\n",
+            "<root>: duplicate key (line 3)",
+        ),
+        (
+            f"recipients:\n  owner: {{provider: log}}\n  {CANARY}:\n    provider: {CANARY}\n",
+            (
+                "recipients[#1].provider: must be one of "
+                "'voipms', 'homeassistant', 'webhook', 'log' (line 4)"
+            ),
+        ),
+    ],
+    ids=["unknown_key", "duplicate_key", "recipient_key_provider"],
+)
+def test_reviewer_key_repros(text: str, expected: str) -> None:
+    with pytest.raises(ConfigError) as caught:
+        parse_config(text)
+    assert expected in caught.value.problems
+    _assert_clean(caught.value, caught.value.problems)
+
+
+def test_valid_recipient_names_are_intentionally_shown(
+    config_data: Data, to_yaml: Dump
+) -> None:
+    # Operators need to see their own valid names. A name passing the identifier
+    # pattern with no run of five or more digits is shown even if it looks
+    # like a secret; anything else is withheld as possibly mispasted data.
+    config_data["recipients"][CANARY_NAME] = {"provider": "voipms"}
+    with pytest.raises(ConfigError) as caught:
+        parse_config(to_yaml(config_data))
+    assert caught.value.problems == (f"recipients.{CANARY_NAME}.phone: is required",)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        CANARY,
+        PHONE_NAME,
+        f"r{PHONE_NAME}",
+        "a" * 64,
+        "Owner",
+        "-owner",
+        "owner.sms",
+        "",
+    ],
+)
+def test_names_failing_the_display_rule_are_withheld(
+    config_data: Data, to_yaml: Dump, name: str
+) -> None:
+    config_data["recipients"][name] = {"provider": "voipms"}
+    text = to_yaml(config_data)
+    with pytest.raises(ConfigError) as caught:
+        parse_config(text)
+    for problem in caught.value.problems:
+        assert problem.startswith("recipients[#4]")
+        assert "(line " in problem
+        if name:
+            assert name not in problem
 
 
 @pytest.mark.parametrize("build", CASES.values(), ids=CASES.keys())

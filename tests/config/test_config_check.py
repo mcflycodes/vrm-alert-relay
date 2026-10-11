@@ -309,9 +309,7 @@ def test_check_invalid_configuration(config_data: Data, write_config: Write) -> 
 def test_check_missing_file(tmp_path: Path) -> None:
     report = check_config(tmp_path / "absent.yaml")
     assert report.ok is False
-    assert report.problems == (
-        f"{tmp_path / 'absent.yaml'}: configuration file does not exist",
-    )
+    assert report.problems == ("configuration file: does not exist",)
 
 
 def test_check_masks_phone_numbers(config_data: Data, write_config: Write) -> None:

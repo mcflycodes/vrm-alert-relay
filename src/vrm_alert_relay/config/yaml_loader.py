@@ -13,9 +13,15 @@ from yaml.parser import ParserError
 from yaml.reader import ReaderError
 from yaml.scanner import ScannerError
 
-from .errors import ConfigError, format_path
+from ._paths import Loc, SourceMap, describe
+from .errors import ConfigError
 
-__all__ = ["MAX_CONFIG_BYTES", "MAX_NESTING_DEPTH", "parse_yaml"]
+__all__ = [
+    "MAX_CONFIG_BYTES",
+    "MAX_NESTING_DEPTH",
+    "parse_yaml",
+    "parse_yaml_with_source",
+]
 
 MAX_CONFIG_BYTES = 256 * 1024
 MAX_NESTING_DEPTH = 16
@@ -63,39 +69,41 @@ class _StrictLoader(yaml.SafeLoader):
             self._depth -= 1
 
 
-def _check_tree(node: Node, loc: tuple[str | int, ...]) -> None:
+def _check_tree(node: Node, loc: Loc, source: SourceMap) -> None:
+    """Reject unsafe structure and record where every key and item sits.
+
+    Problems name the parent path only; the offending key is identified by its
+    line, never by its text.
+    """
     if isinstance(node, SequenceNode):
         if len(node.value) > MAX_COLLECTION_ITEMS:
             raise _Rejected(
-                f"{format_path(loc)}: more than {MAX_COLLECTION_ITEMS} items"
+                describe(loc, f"more than {MAX_COLLECTION_ITEMS} items", source)
             )
         for index, item in enumerate(node.value):
-            _check_tree(item, (*loc, index))
+            source.lines[(*loc, index)] = _line(item)
+            _check_tree(item, (*loc, index), source)
     elif isinstance(node, MappingNode):
         if len(node.value) > MAX_COLLECTION_ITEMS:
             raise _Rejected(
-                f"{format_path(loc)}: more than {MAX_COLLECTION_ITEMS} keys"
+                describe(loc, f"more than {MAX_COLLECTION_ITEMS} keys", source)
             )
         seen: set[str] = set()
-        for key_node, value_node in node.value:
+        for position, (key_node, value_node) in enumerate(node.value):
+            line = _line(key_node)
             if key_node.tag == _MERGE_TAG:
-                raise _Rejected(
-                    f"{format_path(loc)} (line {_line(key_node)}): "
-                    "YAML merge keys ('<<') are not allowed"
-                )
+                message = "YAML merge keys ('<<') are not allowed"
+                raise _Rejected(describe(loc, message, source, line=line))
             if not isinstance(key_node, ScalarNode) or key_node.tag != _STR_TAG:
-                raise _Rejected(
-                    f"{format_path(loc)} (line {_line(key_node)}): "
-                    "mapping keys must be plain strings"
-                )
+                message = "mapping keys must be plain strings"
+                raise _Rejected(describe(loc, message, source, line=line))
             key = str(key_node.value)
             if key in seen:
-                raise _Rejected(
-                    f"{format_path((*loc, key))} (line {_line(key_node)}): "
-                    "duplicate key"
-                )
+                raise _Rejected(describe(loc, "duplicate key", source, line=line))
             seen.add(key)
-            _check_tree(value_node, (*loc, key))
+            source.lines[(*loc, key)] = line
+            source.positions[(*loc, key)] = position
+            _check_tree(value_node, (*loc, key), source)
 
 
 # Fixed text per PyYAML exception class. PyYAML's own messages quote source
@@ -129,20 +137,25 @@ def _decode(data: bytes) -> str | None:
         return None
 
 
-def _compose(text: str) -> Any:
+def _compose(text: str, source: SourceMap) -> Any:
     loader = _StrictLoader(text)
     try:
         node = loader.get_single_node()
         if node is None:
             return None
-        _check_tree(node, ())
+        _check_tree(node, (), source)
         return loader.construct_document(node)
     finally:
         loader.dispose()
 
 
 def parse_yaml(data: bytes | str) -> Any:
-    """Parse one YAML document into plain Python data, rejecting unsafe input.
+    """Parse one YAML document into plain Python data, rejecting unsafe input."""
+    return parse_yaml_with_source(data)[0]
+
+
+def parse_yaml_with_source(data: bytes | str) -> tuple[Any, SourceMap]:
+    """Like :func:`parse_yaml`, also returning where each key and item sits.
 
     Errors are raised outside ``except`` blocks so no exception holding source
     text is chained onto the :class:`ConfigError`.
@@ -156,8 +169,9 @@ def parse_yaml(data: bytes | str) -> Any:
 
     problem: str | None = None
     result: Any = None
+    source = SourceMap()
     try:
-        result = _compose(text)
+        result = _compose(text, source)
     except _Rejected as exc:
         problem = exc.message
     except yaml.YAMLError as exc:
@@ -168,4 +182,4 @@ def parse_yaml(data: bytes | str) -> Any:
         raise ConfigError([problem])
     if result is None:
         raise ConfigError(["configuration is empty"])
-    return result
+    return result, source

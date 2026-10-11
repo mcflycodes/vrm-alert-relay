@@ -22,6 +22,7 @@ from vrm_alert_relay.config import (
     RelaySecrets,
     Secret,
     SecretFileError,
+    SecretsImmutableError,
     SecretTypeError,
     load_secrets,
     read_secret_file,
@@ -131,6 +132,7 @@ def test_secret_in_pydantic_models_is_masked(fake_secret: str) -> None:
         lambda s: RelaySecrets.model_validate([s]),
         lambda s: RelaySecrets.model_validate_json(json.dumps({"vrm_token": s})),
         lambda s: RelaySecrets(vrm_token=s.encode()),
+        lambda s: RelaySecrets.model_construct(vrm_token=s),
     ],
 )
 def test_plain_values_are_refused_before_pydantic_validation(
@@ -161,6 +163,103 @@ def test_remaining_validation_errors_hold_no_plaintext(fake_secret: str) -> None
     for text in rendered:
         assert fake_secret not in text
     assert error.errors()[0]["type"] == "extra_forbidden"
+
+
+HIDDEN = "RelaySecrets(<hidden>)"
+
+
+def _assert_unchanged(secrets: RelaySecrets, fake_secret: str) -> None:
+    assert secrets.vrm_token is not None
+    assert secrets.vrm_token.reveal() == fake_secret
+    assert secrets.voipms_password is None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda r, s: r.model_copy(update={"vrm_token": s}),
+        lambda r, s: r.model_copy(update={"voipms_password": s}, deep=True),
+        lambda r, s: r.model_copy(update={}),
+        lambda r, s: copy.replace(r, vrm_token=s),
+        lambda r, s: copy.replace(r),
+        lambda r, s: setattr(r, "vrm_token", s),
+        lambda r, s: setattr(r, "voipms_password", Secret(s)),
+        lambda r, s: delattr(r, "vrm_token"),
+        lambda r, s: pickle.dumps(r),
+        lambda r, s: r.__setstate__({"__dict__": {"vrm_token": s}}),
+    ],
+    ids=[
+        "model_copy_update",
+        "model_copy_deep_update",
+        "model_copy_empty_update",
+        "copy_replace",
+        "copy_replace_nothing",
+        "setattr_plain",
+        "setattr_secret",
+        "delattr",
+        "pickle",
+        "setstate",
+    ],
+)
+def test_relay_secrets_refuse_changes(
+    fake_secret: str, change: Callable[[RelaySecrets, str], Any]
+) -> None:
+    secrets = RelaySecrets(vrm_token=Secret(fake_secret))
+    with pytest.raises(SecretsImmutableError) as caught:
+        change(secrets, fake_secret)
+    error = caught.value
+    assert str(error) == (
+        "RelaySecrets cannot be changed, pickled, or built without validation; "
+        "load the secrets again"
+    )
+    assert fake_secret not in repr(error)
+    assert error.__cause__ is None and error.__context__ is None
+    _assert_unchanged(secrets, fake_secret)
+
+
+def test_relay_secrets_without_values_also_refuse_pickling() -> None:
+    with pytest.raises(SecretsImmutableError):
+        pickle.dumps(RelaySecrets())
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [
+        copy.copy,
+        copy.deepcopy,
+        lambda r: r.model_copy(),
+        lambda r: r.model_copy(deep=True),
+        lambda r: r.model_copy(update=None),
+    ],
+    ids=["copy", "deepcopy", "model_copy", "model_copy_deep", "model_copy_none"],
+)
+def test_relay_secrets_copies_hold_only_secrets(
+    fake_secret: str, duplicate: Callable[[RelaySecrets], RelaySecrets]
+) -> None:
+    secrets = RelaySecrets(vrm_token=Secret(fake_secret))
+    duplicated = duplicate(secrets)
+    assert duplicated == secrets
+    assert isinstance(duplicated.vrm_token, Secret)
+    assert repr(duplicated) == str(duplicated) == HIDDEN
+    _assert_unchanged(duplicated, fake_secret)
+
+
+def test_model_construct_refuses_plain_values(fake_secret: str) -> None:
+    with pytest.raises(SecretTypeError):
+        RelaySecrets.model_construct(vrm_token=fake_secret)
+    built = RelaySecrets.model_construct(vrm_token=Secret(fake_secret))
+    _assert_unchanged(built, fake_secret)
+
+
+def test_relay_secrets_text_forms_are_fixed(fake_secret: str) -> None:
+    secrets = RelaySecrets(
+        vrm_token=Secret(fake_secret), voipms_password=Secret(fake_secret)
+    )
+    assert repr(secrets) == str(secrets) == f"{secrets}" == HIDDEN
+    assert list(secrets.__repr_args__()) == []
+    assert list(secrets.__rich_repr__()) == []
+    assert all(not info.repr for info in RelaySecrets.model_fields.values())
+    assert fake_secret not in repr([secrets]) + repr({"s": secrets})
 
 
 # --- read_secret_file ------------------------------------------------------

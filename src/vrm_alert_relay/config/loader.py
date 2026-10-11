@@ -5,12 +5,14 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, NoReturn, Self
 
-from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic_core import ErrorDetails
 
 from ._files import FileProblem, FileReadError, read_regular_file
+from ._paths import SourceMap, describe
 from .errors import ConfigError, format_path
 from .fields import FieldProblem
 from .models import (
@@ -22,10 +24,11 @@ from .models import (
     RelayConfig,
 )
 from .secret import Secret, SecretFileError, SecretTypeError, read_secret_file
-from .yaml_loader import MAX_CONFIG_BYTES, parse_yaml
+from .yaml_loader import MAX_CONFIG_BYTES, parse_yaml_with_source
 
 __all__ = [
     "RelaySecrets",
+    "SecretsImmutableError",
     "config_warnings",
     "load_config",
     "load_secrets",
@@ -46,7 +49,7 @@ _PROVIDER_CHOICES = ", ".join(f"'{name}'" for name in PROVIDER_NAMES)
 # input values are never shown, because they can contain secrets or phone numbers.
 _FIXED_MESSAGES = {
     "missing": "is required",
-    "extra_forbidden": "is not a recognized setting",
+    "extra_forbidden": "unrecognized setting",
     "string_type": "must be a string",
     "bool_type": "must be true or false",
     "int_type": "must be a whole number",
@@ -70,32 +73,86 @@ _BOUND_MESSAGES = {
 _GENERIC_MESSAGE = "is invalid"
 
 
+class SecretsImmutableError(TypeError):
+    """An attempt to change, pickle, or bypass validation of :class:`RelaySecrets`."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "RelaySecrets cannot be changed, pickled, or built without validation; "
+            "load the secrets again"
+        )
+
+
+def _only_secret_values(values: dict[str, Any]) -> None:
+    if not all(value is None or isinstance(value, Secret) for value in values.values()):
+        raise SecretTypeError()
+
+
 class RelaySecrets(BaseModel):
     """Secret values resolved from the files the configuration references.
 
     A field is ``None`` when its provider is not live (or, for ``vrm_token``, when
-    it was not required). Serialization always masks the values. Constructing it
-    with anything other than :class:`Secret` values raises
-    :class:`SecretTypeError` before pydantic validation, so no plaintext can be
-    captured in a ``ValidationError``.
+    it was not required). Serialization, ``str``, and ``repr`` never show the
+    values. Constructing it with anything other than :class:`Secret` values
+    raises :class:`SecretTypeError` before pydantic validation, so no plaintext
+    can be captured in a ``ValidationError``. Updates through ``model_copy``,
+    ``copy.replace``, attribute assignment, and pickling are refused with
+    :class:`SecretsImmutableError`, because they would skip that check.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
-    vrm_token: Secret | None = None
-    voipms_username: Secret | None = None
-    voipms_password: Secret | None = None
-    homeassistant_token: Secret | None = None
-    webhook_auth_header_value: Secret | None = None
+    vrm_token: Secret | None = Field(default=None, repr=False)
+    voipms_username: Secret | None = Field(default=None, repr=False)
+    voipms_password: Secret | None = Field(default=None, repr=False)
+    homeassistant_token: Secret | None = Field(default=None, repr=False)
+    webhook_auth_header_value: Secret | None = Field(default=None, repr=False)
 
     @model_validator(mode="before")
     @classmethod
     def _only_secrets(cls, data: Any) -> Any:
-        if not isinstance(data, dict) or not all(
-            value is None or isinstance(value, Secret) for value in data.values()
-        ):
+        if not isinstance(data, dict):
             raise SecretTypeError()
+        _only_secret_values(data)
         return data
+
+    @classmethod
+    def model_construct(
+        cls, _fields_set: set[str] | None = None, **values: Any
+    ) -> Self:
+        _only_secret_values(values)
+        return super().model_construct(_fields_set, **values)
+
+    def model_copy(
+        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
+    ) -> Self:
+        if update is not None:
+            raise SecretsImmutableError()
+        return super().model_copy(deep=deep)
+
+    def __replace__(self, **changes: Any) -> Self:
+        raise SecretsImmutableError()
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise SecretsImmutableError()
+
+    def __delattr__(self, name: str) -> None:
+        raise SecretsImmutableError()
+
+    def __getstate__(self) -> NoReturn:
+        raise SecretsImmutableError()
+
+    def __setstate__(self, state: Any) -> NoReturn:
+        raise SecretsImmutableError()
+
+    def __repr_args__(self) -> list[tuple[str | None, Any]]:
+        return []
+
+    def __repr__(self) -> str:
+        return "RelaySecrets(<hidden>)"
+
+    def __str__(self) -> str:
+        return "RelaySecrets(<hidden>)"
 
 
 def _error_location(error: ErrorDetails) -> tuple[str | int, ...]:
@@ -136,19 +193,26 @@ def _error_message(error: ErrorDetails, loc: tuple[str | int, ...]) -> str:
     return _FIXED_MESSAGES.get(kind, _GENERIC_MESSAGE)
 
 
-def _validation_problems(exc: ValidationError) -> list[str]:
+def _validation_problems(exc: ValidationError, source: SourceMap) -> list[str]:
     problems: list[str] = []
     for error in exc.errors(
         include_url=False, include_input=False, include_context=True
     ):
         loc = _error_location(error)
-        problems.append(f"{format_path(loc)}: {_error_message(error, loc)}")
+        message = _error_message(error, loc)
+        if error["type"] == "extra_forbidden":
+            # The unrecognized key itself is never shown; its line identifies it.
+            problems.append(
+                describe(loc[:-1], message, source, line=source.line_of(loc))
+            )
+        else:
+            problems.append(describe(loc, message, source))
     return problems
 
 
 def parse_config(data: bytes | str) -> RelayConfig:
     """Parse and validate configuration text. Raises :class:`ConfigError`."""
-    raw = parse_yaml(data)
+    raw, source = parse_yaml_with_source(data)
     if not isinstance(raw, dict):
         raise ConfigError(["configuration must be a YAML mapping at the top level"])
     version = raw.get("version")
@@ -163,17 +227,18 @@ def parse_config(data: bytes | str) -> RelayConfig:
     try:
         return RelayConfig.model_validate(raw)
     except ValidationError as exc:
-        problems = _validation_problems(exc)
+        problems = _validation_problems(exc, source)
     # Raised outside the except block so the ValidationError, which holds raw
     # input values, is not chained as __context__.
     raise ConfigError(problems)
 
 
+# The path is never shown: the operator supplied it and it may hold anything.
 _CONFIG_FILE_PROBLEMS = {
-    FileProblem.MISSING: "configuration file does not exist",
-    FileProblem.PERMISSION_DENIED: "configuration file is not readable (permission denied)",
-    FileProblem.NOT_REGULAR: "configuration path is not a regular file",
-    FileProblem.TOO_LARGE: f"configuration is larger than {MAX_CONFIG_BYTES} bytes",
+    FileProblem.MISSING: "configuration file: does not exist",
+    FileProblem.PERMISSION_DENIED: "configuration file: not readable (permission denied)",
+    FileProblem.NOT_REGULAR: "configuration file: not a regular file",
+    FileProblem.TOO_LARGE: f"configuration file: larger than {MAX_CONFIG_BYTES} bytes",
 }
 
 
@@ -184,9 +249,9 @@ def _read_config_bytes(path: str | os.PathLike[str]) -> bytes:
     except FileReadError as exc:
         failure = exc
     reason = _CONFIG_FILE_PROBLEMS.get(
-        failure.problem, f"configuration file cannot be read ({failure.code})"
+        failure.problem, f"configuration file: cannot be read ({failure.code})"
     )
-    raise ConfigError([f"{os.fspath(path)}: {reason}"])
+    raise ConfigError([reason])
 
 
 def load_config(path: str | os.PathLike[str]) -> RelayConfig:
@@ -206,17 +271,21 @@ def config_warnings(config: RelayConfig) -> list[str]:
             "all messages will be logged only"
         )
     used = {name for rule in config.rules for name in rule.recipients}
+    positions = SourceMap(
+        positions={("recipients", name): i for i, name in enumerate(config.recipients)}
+    )
     for name, recipient in config.recipients.items():
-        path = format_path(("recipients", name))
+        loc = ("recipients", name)
         if recipient.provider != "log" and not config.providers.is_enabled(
             recipient.provider
         ):
-            warnings.append(
-                f"{path}: provider '{recipient.provider}' is not enabled; "
+            message = (
+                f"provider '{recipient.provider}' is not enabled; "
                 "messages to this recipient will be logged only"
             )
+            warnings.append(describe(loc, message, positions))
         if name not in used:
-            warnings.append(f"{path}: not used by any rule")
+            warnings.append(describe(loc, "not used by any rule", positions))
     if not config.rules:
         warnings.append("rules: no rules are configured; nothing will be monitored")
     if (

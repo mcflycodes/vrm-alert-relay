@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import stat
 import threading
 import time
@@ -59,13 +60,25 @@ def test_anchors_and_aliases_are_rejected(problems: Problems, text: str) -> None
 
 def test_duplicate_top_level_key_is_rejected(problems: Problems) -> None:
     assert problems("vrm: {}\nsending: {}\nvrm: {}\n") == (
-        "vrm (line 3): duplicate key",
+        "<root>: duplicate key (line 3)",
     )
 
 
-def test_duplicate_nested_key_reports_its_path(problems: Problems) -> None:
+def test_duplicate_nested_key_reports_its_parent_path(problems: Problems) -> None:
     text = "rules:\n  - id: a\n    levels:\n      - name: x\n        name: y\n"
-    assert problems(text) == ("rules[0].levels[0].name (line 5): duplicate key",)
+    assert problems(text) == ("rules[0].levels[0]: duplicate key (line 5)",)
+
+
+def test_duplicate_key_under_a_recipient_name(problems: Problems) -> None:
+    text = "recipients:\n  owner_sms:\n    phone: a\n    phone: b\n"
+    assert problems(text) == ("recipients.owner_sms: duplicate key (line 4)",)
+
+
+def test_duplicate_key_under_an_unrecognized_key_ends_the_path(
+    problems: Problems,
+) -> None:
+    text = "vrm:\n  installs:\n    x: 1\n    x: 2\n"
+    assert problems(text) == ("vrm: duplicate key (line 4)",)
 
 
 @pytest.mark.parametrize(
@@ -80,12 +93,14 @@ def test_duplicate_nested_key_reports_its_path(problems: Problems) -> None:
 )
 def test_non_string_keys_are_rejected(problems: Problems, text: str) -> None:
     (problem,) = problems(text)
-    assert problem.endswith("mapping keys must be plain strings")
+    assert re.fullmatch(
+        r"(<root>|sending): mapping keys must be plain strings \(line [12]\)", problem
+    )
 
 
 def test_merge_keys_are_rejected(problems: Problems) -> None:
     (problem,) = problems("sending:\n  <<: {enabled: true}\n")
-    assert problem == "sending (line 2): YAML merge keys ('<<') are not allowed"
+    assert problem == "sending: YAML merge keys ('<<') are not allowed (line 2)"
 
 
 @pytest.mark.parametrize(
@@ -129,7 +144,7 @@ def test_oversized_file_is_rejected(write_config: Callable[[Any], Path]) -> None
     with pytest.raises(ConfigError) as caught:
         load_config(path)
     assert caught.value.problems == (
-        f"{path}: configuration is larger than {MAX_CONFIG_BYTES} bytes",
+        f"configuration file: larger than {MAX_CONFIG_BYTES} bytes",
     )
 
 
@@ -242,7 +257,7 @@ def test_load_config_missing_file(tmp_path: Path) -> None:
     path = tmp_path / "absent.yaml"
     with pytest.raises(ConfigError) as caught:
         load_config(path)
-    assert caught.value.problems == (f"{path}: configuration file does not exist",)
+    assert caught.value.problems == ("configuration file: does not exist",)
 
 
 def _load_within(path: Path, seconds: float = 5.0) -> ConfigError:
@@ -268,19 +283,19 @@ def test_load_config_fifo_fails_fast(tmp_path: Path) -> None:
     fifo = tmp_path / "config.yaml"
     os.mkfifo(fifo)
     error = _load_within(fifo)
-    assert error.problems == (f"{fifo}: configuration path is not a regular file",)
+    assert error.problems == ("configuration file: not a regular file",)
 
 
 def test_load_config_directory_fails_fast(tmp_path: Path) -> None:
     error = _load_within(tmp_path)
-    assert error.problems == (f"{tmp_path}: configuration path is not a regular file",)
+    assert error.problems == ("configuration file: not a regular file",)
 
 
 def test_load_config_device_fails_fast() -> None:
     device = Path(os.devnull)
     assert stat.S_ISCHR(device.stat().st_mode)
     error = _load_within(device)
-    assert error.problems == (f"{device}: configuration path is not a regular file",)
+    assert error.problems == ("configuration file: not a regular file",)
 
 
 def test_load_config_oversize_fails_fast(tmp_path: Path) -> None:
@@ -288,15 +303,15 @@ def test_load_config_oversize_fails_fast(tmp_path: Path) -> None:
     path.write_bytes(b"#" * (MAX_CONFIG_BYTES + 1))
     error = _load_within(path)
     assert error.problems == (
-        f"{path}: configuration is larger than {MAX_CONFIG_BYTES} bytes",
+        f"configuration file: larger than {MAX_CONFIG_BYTES} bytes",
     )
 
 
 @pytest.mark.parametrize(
     ("code", "reason"),
     [
-        (errno.EACCES, "configuration file is not readable (permission denied)"),
-        (errno.EIO, "configuration file cannot be read (EIO)"),
+        (errno.EACCES, "configuration file: not readable (permission denied)"),
+        (errno.EIO, "configuration file: cannot be read (EIO)"),
     ],
 )
 def test_load_config_open_errors_use_fixed_messages(
@@ -311,5 +326,19 @@ def test_load_config_open_errors_use_fixed_messages(
     monkeypatch.setattr("vrm_alert_relay.config._files.os.open", fail)
     with pytest.raises(ConfigError) as caught:
         load_config(path)
-    assert caught.value.problems == (f"{path}: {reason}",)
+    assert caught.value.problems == (reason,)
     assert "fake-secret" not in str(caught.value)
+
+
+def test_load_config_never_shows_the_path(tmp_path: Path) -> None:
+    directory = tmp_path / "fake-secret-CANARY-7Q9X +1 202 555 0142\nnext line"
+    directory.mkdir()
+    for path in (directory / "absent.yaml", directory):
+        with pytest.raises(ConfigError) as caught:
+            load_config(path)
+        rendered = (str(caught.value), repr(caught.value), *caught.value.problems)
+        for text in rendered:
+            assert "CANARY" not in text
+            assert "555 0142" not in text
+            assert "next line" not in text
+            assert str(tmp_path) not in text

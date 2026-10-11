@@ -5,6 +5,7 @@ from .errors import ConfigError
 from .fields import PhoneNumber
 from .loader import (
     RelaySecrets,
+    SecretsImmutableError,
     config_warnings,
     load_config,
     load_secrets,
@@ -70,6 +71,7 @@ __all__ = [
     "SecretFile",
     "SecretFileError",
     "SecretTypeError",
+    "SecretsImmutableError",
     "SendingConfig",
     "VoipmsProvider",
     "VoipmsRecipient",

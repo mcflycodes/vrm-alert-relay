@@ -117,37 +117,45 @@ def test_model_dump_round_trips_structure(config_data: Data, parse: Parse) -> No
     assert dumped["rules"][0]["levels"][0]["threshold"] == -12.0
 
 
+def line_of(text: str, needle: str) -> int:
+    return next(n for n, line in enumerate(text.splitlines(), 1) if needle in line)
+
+
 @pytest.mark.parametrize(
-    ("mutate", "expected"),
+    ("mutate", "parent", "key"),
     [
-        (lambda d: d.update(extra=1), "extra: is not a recognized setting"),
-        (
-            lambda d: d["vrm"].update(tokenpath="/x"),
-            "vrm.tokenpath: is not a recognized setting",
-        ),
+        (lambda d: d.update(extra=1), "<root>", "extra"),
+        (lambda d: d["vrm"].update(tokenpath="/x"), "vrm", "tokenpath"),
         (
             lambda d: d["rules"][2]["levels"][1].update(colour="red"),
-            "rules[2].levels[1].colour: is not a recognized setting",
+            "rules[2].levels[1]",
+            "colour",
         ),
         (
             lambda d: d["recipients"]["owner_sms"].update(email="x"),
-            "recipients.owner_sms.email: is not a recognized setting",
+            "recipients.owner_sms",
+            "email",
         ),
-        (
-            lambda d: d["providers"].update(twilio={}),
-            "providers.twilio: is not a recognized setting",
-        ),
+        (lambda d: d["providers"].update(twilio={}), "providers", "twilio"),
         (
             lambda d: d["providers"].update(log={"level": "info"}),
-            "providers.log.level: is not a recognized setting",
+            "providers.log",
+            "level",
         ),
     ],
 )
-def test_unknown_keys_are_rejected(
-    config_data: Data, problems: Problems, mutate: Callable[[Data], None], expected: str
+def test_unknown_keys_are_reported_by_parent_and_line(
+    config_data: Data,
+    problems: Problems,
+    to_yaml: Callable[[Any], str],
+    mutate: Callable[[Data], None],
+    parent: str,
+    key: str,
 ) -> None:
     mutate(config_data)
-    assert problems(config_data) == (expected,)
+    text = to_yaml(config_data)
+    line = line_of(text, f"{key}:")
+    assert problems(text) == (f"{parent}: unrecognized setting (line {line})",)
 
 
 @pytest.mark.parametrize(
@@ -340,11 +348,14 @@ def test_longest_valid_name_is_accepted(config_data: Data, parse: Parse) -> None
 
 
 def test_invalid_recipient_name_is_reported_as_key(
-    config_data: Data, problems: Problems
+    config_data: Data, problems: Problems, to_yaml: Callable[[Any], str]
 ) -> None:
     config_data["recipients"]["Bad Name"] = {"provider": "log"}
-    (problem,) = problems(config_data)
-    assert problem.startswith('recipients["Bad Name"] (key): must be 1-63 lowercase')
+    text = to_yaml(config_data)
+    (problem,) = problems(text)
+    assert problem.startswith("recipients[#4] (key): must be 1-63 lowercase")
+    assert problem.endswith(f"(line {line_of(text, 'Bad Name:')})")
+    assert "Bad" not in problem
 
 
 @pytest.mark.parametrize(
@@ -566,7 +577,8 @@ def test_phone_key_used_as_recipient_name_is_masked(
     config_data["recipients"]["+12025550142"] = {"provider": "log"}
     (problem,) = problems(config_data)
     assert FULL_NUMBER_DIGITS not in problem
-    assert '["***0142"] (key)' in problem
+    assert "0142" not in problem
+    assert problem.startswith("recipients[#4] (key): ")
 
 
 @pytest.mark.parametrize(
@@ -784,17 +796,23 @@ def test_invalid_secret_paths_are_not_echoed(
     ],
 )
 def test_inline_secrets_are_rejected(
-    config_data: Data, problems: Problems, location: tuple[str, ...], key: str
+    config_data: Data,
+    problems: Problems,
+    to_yaml: Callable[[Any], str],
+    location: tuple[str, ...],
+    key: str,
 ) -> None:
     section = config_data
     for part in location:
         section = section[part]
     section[key] = "fake-inline-secret-value"
-    (problem,) = problems(config_data)
-    path = ".".join((*location, key))
+    text = to_yaml(config_data)
+    (problem,) = problems(text)
+    parent = ".".join(location) or "<root>"
     assert problem == (
-        f"{path}: inline secret values are not allowed; put the value in a file "
-        "and reference it with the matching '*_file' setting"
+        f"{parent}: inline secret values are not allowed; put the value in a file "
+        "and reference it with the matching '*_file' setting "
+        f"(line {line_of(text, 'fake-inline-secret-value')})"
     )
 
 
@@ -805,10 +823,8 @@ def test_inline_secret_is_reported_with_other_problems(
     config_data["vrm"]["token"] = inline_value
     config_data["vrm"]["poll_interval"] = 5
     found = problems(config_data)
-    assert sorted(p.split(":")[0] for p in found) == ["vrm.poll_interval", "vrm.token"]
-    assert any(
-        p.startswith("vrm.token: inline secret values are not allowed") for p in found
-    )
+    assert sorted(p.split(":")[0] for p in found) == ["vrm", "vrm.poll_interval"]
+    assert any(p.startswith("vrm: inline secret values are not allowed") for p in found)
     assert all("fake-inline-secret-value" not in p for p in found)
 
 

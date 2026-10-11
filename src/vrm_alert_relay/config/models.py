@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Annotated, Any, Literal, Self, TypeAlias
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
     AfterValidator,
@@ -79,7 +79,7 @@ UNSUPPORTED_VERSION_MESSAGE = (
     f"unsupported configuration version; {SUPPORTED_VERSIONS_TEXT}"
 )
 
-ProviderName: TypeAlias = Literal["voipms", "homeassistant", "webhook", "log"]
+type ProviderName = Literal["voipms", "homeassistant", "webhook", "log"]
 PROVIDER_NAMES: tuple[ProviderName, ...] = ("voipms", "homeassistant", "webhook", "log")
 
 
@@ -158,7 +158,7 @@ class LogRecipient(_Model):
     provider: Literal["log"]
 
 
-Recipient: TypeAlias = Annotated[
+type Recipient = Annotated[
     VoipmsRecipient | HomeAssistantRecipient | WebhookRecipient | LogRecipient,
     Field(discriminator="provider"),
 ]
