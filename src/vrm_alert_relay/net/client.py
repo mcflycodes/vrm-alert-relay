@@ -6,7 +6,9 @@ Guarantees, none of which can be turned off by callers:
 - Redirects are never followed: any 3xx raises :class:`HttpRedirectRefused`.
 - Proxy and TLS environment variables are ignored (``trust_env=False``).
 - Connect, read, write and pool timeouts, plus an absolute per-request deadline
-  enforced on every socket operation by :class:`HardenedTransport`.
+  enforced on name resolution, each connect attempt, the TLS handshake and
+  every socket read and write by :class:`HardenedTransport`.
+- The encoded request body is capped (default 64 KiB) before any I/O.
 - Compression is refused: ``Accept-Encoding: identity`` is always sent and
   any other ``Content-Encoding`` is rejected before the body is read. The raw
   body is streamed and the request aborts as soon as it exceeds the size cap.
@@ -50,9 +52,11 @@ from vrm_alert_relay.net.errors import (
     HttpTransportError,
     InvalidHeaderError,
     InvalidRequestError,
+    RequestTooLargeError,
 )
-from vrm_alert_relay.net.transport import HardenedTransport, deadline_scope
+from vrm_alert_relay.net.transport import DnsTimeout, HardenedTransport, deadline_scope
 
+DEFAULT_MAX_REQUEST_BYTES: Final = 64 * 1024
 DEFAULT_MAX_RESPONSE_BYTES: Final = 1024 * 1024
 DEFAULT_USER_AGENT: Final = "vrm-alert-relay"
 MAX_HEADER_VALUE_LENGTH: Final = 8192
@@ -171,11 +175,15 @@ class SafeHttpClient:
         *,
         timeouts: Timeouts | None = None,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
         user_agent: str = DEFAULT_USER_AGENT,
         headers: Mapping[str, str] | None = None,
     ) -> None:
         self._timeouts = timeouts if timeouts is not None else Timeouts()
         self._max_response_bytes = _validate_limit(max_response_bytes)
+        self._max_request_bytes = _validate_limit(
+            max_request_bytes, "max_request_bytes"
+        )
         _validate_header_value("User-Agent", user_agent)
         default_headers = {"User-Agent": user_agent}
         default_headers.update(_validate_headers(headers))
@@ -201,6 +209,10 @@ class SafeHttpClient:
     @property
     def max_response_bytes(self) -> int:
         return self._max_response_bytes
+
+    @property
+    def max_request_bytes(self) -> int:
+        return self._max_request_bytes
 
     def close(self) -> None:
         self._client.close()
@@ -357,7 +369,7 @@ class SafeHttpClient:
         try:
             if params:
                 url = url.copy_merge_params(params)
-            return self._client.build_request(
+            request = self._client.build_request(
                 method,
                 url,
                 headers=request_headers,
@@ -365,8 +377,15 @@ class SafeHttpClient:
                 data=form,
                 files=files,
             )
+            size = len(request.read())
         except (TypeError, ValueError, RecursionError, httpx.InvalidURL):
             pass
+        else:
+            if size > self._max_request_bytes:
+                raise RequestTooLargeError(
+                    method, endpoint.display, limit=self._max_request_bytes
+                )
+            return request
         raise InvalidRequestError(
             f"request body or parameters could not be encoded: {method} {endpoint.display}"
         )
@@ -413,9 +432,9 @@ def _validate_method(method: object) -> str:
     return method.upper()
 
 
-def _validate_limit(limit: object) -> int:
+def _validate_limit(limit: object, name: str = "max_response_bytes") -> int:
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-        raise ValueError("max_response_bytes must be a positive integer")
+        raise ValueError(f"{name} must be a positive integer")
     return limit
 
 
@@ -488,6 +507,8 @@ def _multipart_files(
 
 
 def _timeout_phase(exc: httpx.TimeoutException, deadline: float) -> str:
+    if isinstance(exc, DnsTimeout):
+        return "dns"
     if deadline - monotonic() <= _DEADLINE_SLACK:
         return "deadline"
     for exc_type, phase in _TIMEOUT_PHASES.items():

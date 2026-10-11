@@ -2,9 +2,8 @@
 
 Applied, in this order, to every string that reaches a log line:
 
-1. exact values registered with :func:`register_secret` or
-   :func:`register_derived_secret`, including their ``repr``, JSON, URL and
-   base64 encodings;
+1. values registered with :func:`register_secret` or
+   :func:`register_derived_secret` (see below);
 2. URL userinfo, query strings and fragments;
 3. values of sensitive keys (``password=...``, ``"token": "..."``,
    ``Authorization: Bearer ...``);
@@ -15,6 +14,31 @@ Applied, in this order, to every string that reaches a log line:
 Structured values (mappings, sequences) are redacted recursively with bounded
 depth, item count and total size, and values under sensitive keys are replaced
 outright.
+
+Registered secrets
+------------------
+
+Each secret is compiled at registration into a matcher that accepts, for
+every character independently, the literal character or any of its
+encodings: percent-encoding of its UTF-8 bytes (hex in either case, ``+``
+for a space), a JSON ``\\uXXXX`` escape (hex in either case, surrogate pairs
+for characters outside the BMP), a JSON short escape (``\\"``, ``\\\\``,
+``\\/``, ``\\n`` and so on) and the Python ``repr`` escapes ``\\'`` and
+``\\xNN``. Mixed and noncanonical encodings therefore still match. The
+standard and URL-safe base64 of the whole value, padded and unpadded, are
+matched exactly.
+
+A literal ``\\`` or ``%`` can also begin an escape, so matching those
+characters can backtrack. To keep matching time bounded, a secret with more
+than ``MAX_AMBIGUOUS_CHARACTERS`` of them gets a matcher that never
+backtracks, plus exact matches of its canonical ``repr``, JSON and URL
+encodings.
+
+Encodings of a composite value are not built from the encodings of its
+parts: base64 of ``user:password`` does not contain base64 of ``password``.
+Adapters must register every credential they derive, such as
+``f"{user}:{password}"`` for HTTP Basic, a full ``Authorization`` value or a
+signature, with :func:`register_derived_secret`.
 """
 
 from __future__ import annotations
@@ -25,12 +49,15 @@ import math
 import re
 import threading
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any, Final, Literal
 from urllib.parse import quote, quote_plus
 
 REDACTED: Final = "[REDACTED]"
 TRUNCATED: Final = "[TRUNCATED]"
 MIN_SECRET_LENGTH: Final = 6
+MAX_SECRET_BYTES: Final = 4096
+MAX_AMBIGUOUS_CHARACTERS: Final = 6
 DEFAULT_MAX_FIELD_LENGTH: Final = 2048
 MAX_DEPTH: Final = 6
 MAX_ITEMS: Final = 50
@@ -70,6 +97,18 @@ _PHONE_RE = re.compile(
 _PHONEISH_RE = re.compile(r"\+?[\d\s().\-]+")
 _NON_DIGIT_RE = re.compile(r"\D")
 _PERCENT_ESCAPE_RE = re.compile(r"%[0-9A-F]{2}")
+_BACKSLASH_ESCAPES: Final = {
+    '"': '\\"',
+    "\\": "\\\\",
+    "/": "\\/",
+    "\b": "\\b",
+    "\f": "\\f",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+    "'": "\\'",
+}
+_AMBIGUOUS: Final = frozenset("\\%")
 
 _ESCAPES: dict[int, str] = {code: f"\\x{code:02x}" for code in range(0x20)}
 _ESCAPES.update({code: f"\\x{code:02x}" for code in range(0x7F, 0xA0)})
@@ -91,40 +130,72 @@ _ESCAPES.update(
 Keep = Literal["head", "tail"]
 
 
+@dataclass(frozen=True, slots=True)
+class _Matcher:
+    pattern: re.Pattern[str]
+    exact: frozenset[str]
+
+
 class SecretRegistry:
-    """A thread-safe set of exact secret values to redact."""
+    """A thread-safe set of secrets to redact. See the module docstring."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._matchers: dict[str, _Matcher] = {}
+        self._patterns: tuple[re.Pattern[str], ...] = ()
+        self._exact: tuple[str, ...] = ()
         self._secrets: tuple[str, ...] = ()
 
     def register(self, value: str) -> None:
-        """Redact ``value`` and its encoded forms. Values under six characters are ignored.
+        """Redact ``value`` in any encoding. Values under six characters are ignored.
 
-        Registered forms: the raw value; its ``repr`` and JSON string escapes
-        (ASCII and non-ASCII); its URL encodings (``quote`` and ``quote_plus``)
-        with upper- and lower-case hex; and its standard and URL-safe base64,
-        with and without padding.
+        Raises :class:`ValueError` for values over ``MAX_SECRET_BYTES`` in
+        UTF-8, which bounds the size of the compiled matcher.
         """
         if not isinstance(value, str):
             raise TypeError("secret must be a string")
         if len(value) < MIN_SECRET_LENGTH:
             return
-        variants = {
-            variant for variant in _variants(value) if len(variant) >= MIN_SECRET_LENGTH
-        }
+        if len(value.encode("utf-8", "surrogatepass")) > MAX_SECRET_BYTES:
+            raise ValueError(f"secret exceeds {MAX_SECRET_BYTES} bytes")
+        if value in self._matchers:
+            return
+        matcher = _compile_matcher(value)
         with self._lock:
-            merged = set(self._secrets) | variants
-            self._secrets = tuple(sorted(merged, key=len, reverse=True))
+            self._matchers[value] = matcher
+            values = sorted(self._matchers, key=len, reverse=True)
+            matchers = [self._matchers[secret] for secret in values]
+            exact = {form for entry in matchers for form in entry.exact}
+            self._patterns = tuple(entry.pattern for entry in matchers)
+            self._exact = tuple(sorted(exact, key=len, reverse=True))
+            self._secrets = tuple(sorted(exact | set(values), key=len, reverse=True))
 
     def clear(self) -> None:
         with self._lock:
+            self._matchers = {}
+            self._patterns = ()
+            self._exact = ()
             self._secrets = ()
 
     @property
     def secrets(self) -> tuple[str, ...]:
-        """Registered values, longest first."""
+        """Registered values and their exact-match encodings, longest first."""
         return self._secrets
+
+    def redact(self, text: str) -> str:
+        """Replace every match of a registered secret with ``[REDACTED]``."""
+        for form in self._exact:
+            if form in text:
+                text = text.replace(form, REDACTED)
+        for pattern in self._patterns:
+            text = pattern.sub(REDACTED, text)
+        return text
+
+    def contains(self, text: str) -> bool:
+        """Whether ``text`` contains a registered secret in any matched encoding."""
+        return any(form in text for form in self._exact) or any(
+            pattern.search(text) for pattern in self._patterns
+        )
 
 
 default_registry = SecretRegistry()
@@ -138,41 +209,90 @@ def register_secret(value: str) -> None:
 def register_derived_secret(value: str) -> None:
     """Register a credential computed from configured secrets.
 
-    Encodings of a combined value are not substrings of the encodings of its
-    parts: base64 of ``user:password`` does not contain base64 of
-    ``password``. Adapters must therefore register every auth value they build,
-    such as ``f"{user}:{password}"``, a full ``Authorization`` header value, or
-    a signature, in addition to the configured secret itself.
+    Composite values such as ``f"{user}:{password}"`` must be registered
+    themselves, in addition to the configured secret: see the module
+    docstring.
     """
     default_registry.register(value)
 
 
 def redact_secrets(text: str, registry: SecretRegistry | None = None) -> str:
     """Replace registered secrets only; no other redaction step."""
-    for secret in (registry or default_registry).secrets:
-        if secret in text:
-            text = text.replace(secret, REDACTED)
-    return text
+    return (registry or default_registry).redact(text)
 
 
-def _variants(value: str) -> set[str]:
-    raw = value.encode("utf-8")
-    variants = {
-        value,
+def contains_secret(text: str, registry: SecretRegistry | None = None) -> bool:
+    return (registry or default_registry).contains(text)
+
+
+def _compile_matcher(value: str) -> _Matcher:
+    raw = value.encode("utf-8", "surrogatepass")
+    exact: set[str] = set()
+    for b64 in (base64.b64encode(raw), base64.urlsafe_b64encode(raw)):
+        text = b64.decode("ascii")
+        exact.update((text, text.rstrip("=")))
+    backtracking = sum(char in _AMBIGUOUS for char in value) <= MAX_AMBIGUOUS_CHARACTERS
+    if not backtracking:
+        exact.update(_canonical_encodings(value))
+    groups = []
+    for char in value:
+        alternatives = "|".join(_character_forms(char))
+        if backtracking and char in _AMBIGUOUS:
+            groups.append(f"(?:{alternatives})")
+        else:
+            groups.append(f"(?>{alternatives})")
+    return _Matcher(
+        pattern=re.compile("".join(groups)),
+        exact=frozenset(form for form in exact if len(form) >= MIN_SECRET_LENGTH),
+    )
+
+
+def _character_forms(char: str) -> list[str]:
+    """Regex alternatives for one character. Only ``\\`` and ``%`` overlap."""
+    code = ord(char)
+    forms = [
+        re.escape(char),
+        "".join(
+            "%" + _hex_pattern(f"{byte:02X}")
+            for byte in char.encode("utf-8", "surrogatepass")
+        ),
+    ]
+    if char == " ":
+        forms.append(r"\+")
+    if code > 0xFFFF:
+        offset = code - 0x10000
+        units = [0xD800 + (offset >> 10), 0xDC00 + (offset & 0x3FF)]
+    else:
+        units = [code]
+    forms.append("".join(r"\\[uU]" + _hex_pattern(f"{unit:04X}") for unit in units))
+    if code < 0x100:
+        forms.append(r"\\x" + _hex_pattern(f"{code:02X}"))
+    if char in _BACKSLASH_ESCAPES:
+        forms.append(re.escape(_BACKSLASH_ESCAPES[char]))
+    return forms
+
+
+def _hex_pattern(digits: str) -> str:
+    return "".join(
+        f"[{digit}{digit.lower()}]" if digit.isalpha() else digit for digit in digits
+    )
+
+
+def _canonical_encodings(value: str) -> set[str]:
+    encodings = {
         repr(value)[1:-1],
         json.dumps(value)[1:-1],
         json.dumps(value, ensure_ascii=False)[1:-1],
     }
-    for encoded in (quote(value, safe=""), quote_plus(value, safe="")):
-        variants.add(encoded)
-        variants.add(
+    for encoded in (
+        quote(value, safe="", errors="surrogatepass"),
+        quote_plus(value, safe="", errors="surrogatepass"),
+    ):
+        encodings.add(encoded)
+        encodings.add(
             _PERCENT_ESCAPE_RE.sub(lambda match: match.group(0).lower(), encoded)
         )
-    for b64 in (base64.b64encode(raw), base64.urlsafe_b64encode(raw)):
-        text = b64.decode("ascii")
-        variants.add(text)
-        variants.add(text.rstrip("="))
-    return variants
+    return encodings
 
 
 def is_sensitive_key(key: str) -> bool:
@@ -274,7 +394,9 @@ class _Redactor:
         if isinstance(value, int):
             return self._int(value)
         if isinstance(value, float):
-            return value if math.isfinite(value) else str(value)
+            if not math.isfinite(value):
+                return str(value)
+            return REDACTED if self._registry.contains(repr(value)) else value
         if isinstance(value, str):
             return self.text(value)
         if isinstance(value, bytes | bytearray | memoryview):

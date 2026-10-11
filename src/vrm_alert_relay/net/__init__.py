@@ -1,6 +1,7 @@
 """Hardened outbound HTTP for VRM and notification-provider adapters."""
 
 from vrm_alert_relay.net.client import (
+    DEFAULT_MAX_REQUEST_BYTES,
     DEFAULT_MAX_RESPONSE_BYTES,
     HttpResponse,
     MultipartFields,
@@ -23,9 +24,11 @@ from vrm_alert_relay.net.errors import (
     InvalidHeaderError,
     InvalidRequestError,
     InvalidUrlError,
+    RequestTooLargeError,
 )
 
 __all__ = [
+    "DEFAULT_MAX_REQUEST_BYTES",
     "DEFAULT_MAX_RESPONSE_BYTES",
     "Endpoint",
     "HttpContentEncodingRefused",
@@ -44,6 +47,7 @@ __all__ = [
     "MultipartFields",
     "MultipartFile",
     "QueryParams",
+    "RequestTooLargeError",
     "SafeHttpClient",
     "Timeouts",
 ]

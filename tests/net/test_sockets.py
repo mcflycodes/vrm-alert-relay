@@ -21,6 +21,8 @@ from vrm_alert_relay.net import (
     Timeouts,
 )
 from vrm_alert_relay.net import client as client_module
+from vrm_alert_relay.net import transport as transport_module
+from vrm_alert_relay.net.transport import AddressInfo
 
 REAL_SOCKETS = True
 DEADLINE = 0.6
@@ -57,12 +59,19 @@ class Server:
     """A threaded server. With ``tls=False`` it accepts TCP and never speaks."""
 
     def __init__(
-        self, ca: trustme.CA, responder: Responder, *, tls: bool = True
+        self,
+        ca: trustme.CA,
+        responder: Responder,
+        *,
+        tls: bool = True,
+        hostname: str = "localhost",
     ) -> None:
         self._context: ssl.SSLContext | None = None
+        self.server_names: list[str | None] = []
         if tls:
             self._context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ca.issue_cert("localhost").configure_cert(self._context)
+            ca.issue_cert(hostname).configure_cert(self._context)
+            self._context.sni_callback = self._record_sni
         self._responder = responder
         self._listener = socket.create_server(("127.0.0.1", 0))
         self._listener.settimeout(0.1)
@@ -76,6 +85,11 @@ class Server:
     @property
     def url(self) -> str:
         return f"https://localhost:{self.port}/api"
+
+    def _record_sni(
+        self, conn: ssl.SSLObject, name: str | None, context: ssl.SSLContext
+    ) -> None:
+        self.server_names.append(name)
 
     def _serve(self) -> None:
         while not self.stop.is_set():
@@ -154,8 +168,10 @@ def trust_test_ca(ca: trustme.CA, monkeypatch: pytest.MonkeyPatch) -> None:
 def serve(ca: trustme.CA) -> Iterator[Callable[..., Server]]:
     servers: list[Server] = []
 
-    def start(responder: Responder, *, tls: bool = True) -> Server:
-        server = Server(ca, responder, tls=tls)
+    def start(
+        responder: Responder, *, tls: bool = True, hostname: str = "localhost"
+    ) -> Server:
+        server = Server(ca, responder, tls=tls, hostname=hostname)
         servers.append(server)
         return server
 
@@ -247,9 +263,45 @@ def test_truncated_body_is_a_transport_error(serve: Callable[..., Server]) -> No
     assert error.cause == "RemoteProtocolError"
 
 
-def test_connection_refused_is_a_transport_error() -> None:
+def closed_port() -> int:
     with socket.create_server(("127.0.0.1", 0)) as probe:
-        port = probe.getsockname()[1]
+        port: int = probe.getsockname()[1]
+    return port
+
+
+def test_address_loop_keeps_hostname_for_sni_and_verification(
+    serve: Callable[..., Server], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = serve(respond(b"{}"), hostname="relay.example.com")
+    refused = closed_port()
+    lookups: list[tuple[str, int]] = []
+
+    def resolve(host: str, port: int) -> list[AddressInfo]:
+        lookups.append((host, port))
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", refused)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", server.port)),
+        ]
+
+    monkeypatch.setattr(transport_module, "_system_resolver", resolve)
+    with SafeHttpClient() as client:
+        response = client.get(f"https://relay.example.com:{server.port}/api")
+        with pytest.raises(HttpTransportError) as excinfo:
+            client.get(f"https://other.example.com:{server.port}/api")
+    assert response.status_code == 200
+    assert excinfo.value.cause == "ConnectError"
+    assert lookups == [
+        ("relay.example.com", server.port),
+        ("other.example.com", server.port),
+    ]
+    assert server.server_names == ["relay.example.com", "other.example.com"]
+    assert len(server.requests) == 1
+    host_header = f"host: relay.example.com:{server.port}\r\n".encode()
+    assert host_header in server.requests[0].lower()
+
+
+def test_connection_refused_is_a_transport_error() -> None:
+    port = closed_port()
     with SafeHttpClient() as client, pytest.raises(HttpTransportError) as excinfo:
         client.get(f"https://127.0.0.1:{port}/api?token={QUERY_CANARY}")
     assert excinfo.value.cause == "ConnectError"

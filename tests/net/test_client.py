@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 from vrm_alert_relay.net import (
+    DEFAULT_MAX_REQUEST_BYTES,
     DEFAULT_MAX_RESPONSE_BYTES,
     Endpoint,
     HttpContentEncodingRefused,
@@ -28,11 +29,12 @@ from vrm_alert_relay.net import (
     InvalidHeaderError,
     InvalidRequestError,
     InvalidUrlError,
+    RequestTooLargeError,
     SafeHttpClient,
     Timeouts,
 )
 from vrm_alert_relay.net import client as client_module
-from vrm_alert_relay.net.transport import HardenedTransport
+from vrm_alert_relay.net.transport import DnsTimeout, HardenedTransport
 
 if TYPE_CHECKING:
     from conftest import StubTransport
@@ -149,8 +151,57 @@ def test_defaults() -> None:
         connect=5.0, read=10.0, write=10.0, pool=5.0, deadline=30.0
     )
     assert client.max_response_bytes == DEFAULT_MAX_RESPONSE_BYTES == 1024 * 1024
+    assert client.max_request_bytes == DEFAULT_MAX_REQUEST_BYTES == 64 * 1024
     client.close()
     assert client._client.is_closed
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_max_request_bytes_validation(limit: Any) -> None:
+    with pytest.raises(
+        ValueError, match="max_request_bytes must be a positive integer"
+    ):
+        SafeHttpClient(max_request_bytes=limit)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"json": {"message": BODY_CANARY + "x" * DEFAULT_MAX_REQUEST_BYTES}},
+        {"form": {"message": BODY_CANARY + "x" * DEFAULT_MAX_REQUEST_BYTES}},
+        {
+            "multipart": {
+                "file": (
+                    "a.bin",
+                    BODY_CANARY.encode() * 5000,
+                    "application/octet-stream",
+                )
+            }
+        },
+    ],
+)
+def test_oversize_request_body_rejected_before_io(
+    client: SafeHttpClient, transport: StubTransport, body: dict[str, Any]
+) -> None:
+    with pytest.raises(RequestTooLargeError) as excinfo:
+        client.post(f"{BASE}?token={QUERY_CANARY}", **body)
+    assert isinstance(excinfo.value, InvalidRequestError)
+    assert excinfo.value.limit == DEFAULT_MAX_REQUEST_BYTES
+    assert str(excinfo.value) == f"request body exceeded 65536 bytes: POST {BASE}"
+    assert_no_canaries(excinfo.value)
+    assert transport.requests == []
+
+
+def test_request_body_cap_is_inclusive_and_configurable(
+    transport: StubTransport,
+) -> None:
+    transport.respond(lambda request: ok())
+    with SafeHttpClient(max_request_bytes=100) as client:
+        client.post(BASE, json="x" * 98)
+        with pytest.raises(RequestTooLargeError):
+            client.post(BASE, json="x" * 99)
+    assert transport.requests[0].content == b'"' + b"x" * 98 + b'"'
+    assert len(transport.requests) == 1
 
 
 @pytest.mark.parametrize(
@@ -543,6 +594,7 @@ def test_retry_after_future_date(
         (httpx.ReadTimeout, "read"),
         (httpx.WriteTimeout, "write"),
         (httpx.PoolTimeout, "pool"),
+        (DnsTimeout, "dns"),
         (httpx.TimeoutException, "unknown"),
     ],
 )

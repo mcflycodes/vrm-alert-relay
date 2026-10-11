@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from datetime import UTC, datetime
 from typing import Final, TextIO
@@ -11,17 +12,21 @@ from typing import Final, TextIO
 from vrm_alert_relay.logs.redaction import (
     DEFAULT_MAX_FIELD_LENGTH,
     MAX_KEY_LENGTH,
+    REDACTED,
     JsonValue,
     SecretRegistry,
     default_registry,
     escape_controls,
     redact_mapping,
-    redact_secrets,
     redact_text,
 )
 
 DEFAULT_MAX_EXCEPTION_LENGTH: Final = 8192
 QUIET_LOGGERS: Final = ("httpx", "httpcore")
+WITHHELD_MESSAGE: Final = "log record withheld by redaction"
+FALLBACK_CODE_KEYS: Final = ("event", "code")
+
+_CODE_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 
 _STANDARD_ATTRS = frozenset(
     logging.LogRecord("", 0, "", 0, "", None, None).__dict__
@@ -36,9 +41,15 @@ class JsonFormatter(logging.Formatter):
     ``extra`` values, then ``exc`` and ``stack`` when present. An extra whose
     name collides with a standard field is emitted as ``extra_<name>``.
     Exception and stack text keep their tail when truncated, since the
-    innermost frame and the message are at the end. Registered secrets are
-    replaced once more in the serialized line, in case a value only appears
-    after JSON escaping.
+    innermost frame and the message are at the end.
+
+    Every key and value is redacted before serialization. The serialized
+    line is then parsed back and each string token (key or value, decoded
+    and JSON-escaped) is checked for registered secrets, without matching
+    across tokens. A line that still contains one is replaced by a record
+    with only ``ts``, ``level``, ``logger``, the ``event`` and ``code``
+    extras when they are short identifiers, and the message
+    ``log record withheld by redaction``.
     """
 
     def __init__(
@@ -56,25 +67,50 @@ class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         try:
             line = self._format(record)
+            leaked = self._leaks(json.loads(line))
         except Exception:  # noqa: BLE001 - a raw record must never reach Handler.handleError
             return self._fallback(record, "log record could not be formatted")
-        final = redact_secrets(line, self._registry)
-        if final == line:
-            return line
-        if _is_json(final):
-            return final
-        return self._fallback(record, "log record withheld by redaction")
+        if leaked:
+            return self._fallback(record, WITHHELD_MESSAGE)
+        return line
+
+    def _leaks(self, parsed: object) -> bool:
+        pending = [parsed]
+        while pending:
+            item = pending.pop()
+            if isinstance(item, dict):
+                pending.extend(item)
+                pending.extend(item.values())
+            elif isinstance(item, list):
+                pending.extend(item)
+            elif self._token_leaks(str(item)):
+                return True
+        return False
+
+    def _token_leaks(self, token: str) -> bool:
+        escaped = json.dumps(token, ensure_ascii=False)[1:-1]
+        return self._registry.contains(token) or self._registry.contains(escaped)
 
     def _fallback(self, record: logging.LogRecord, message: str) -> str:
-        fallback = {
+        fallback: dict[str, str] = {
             "ts": _timestamp(record),
-            "level": escape_controls(str(record.levelname))[:32],
-            "logger": redact_secrets(escape_controls(str(record.name)), self._registry)[
-                :MAX_KEY_LENGTH
-            ],
+            "level": self._metadata(record.levelname, 32),
+            "logger": self._metadata(record.name, MAX_KEY_LENGTH),
             "msg": message,
         }
+        for key in FALLBACK_CODE_KEYS:
+            value = record.__dict__.get(key)
+            if (
+                isinstance(value, str)
+                and _CODE_RE.fullmatch(value)
+                and not self._token_leaks(value)
+            ):
+                fallback[key] = value
         return json.dumps(fallback, ensure_ascii=False, separators=(",", ":"))
+
+    def _metadata(self, value: object, limit: int) -> str:
+        text = escape_controls(str(value))[:limit]
+        return REDACTED if self._token_leaks(text) else text
 
     def _format(self, record: logging.LogRecord) -> str:
         try:
@@ -107,9 +143,7 @@ class JsonFormatter(logging.Formatter):
         if record.stack_info:
             payload["stack"] = self._long_text(self.formatStack(record.stack_info))
 
-        return json.dumps(
-            payload, ensure_ascii=False, separators=(",", ":"), default=str
-        )
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     def _text(self, text: object) -> str:
         return redact_text(
@@ -170,14 +204,6 @@ def _resolve_level(level: int | str) -> int:
         if name in mapping:
             return mapping[name]
     raise ValueError("invalid log level")
-
-
-def _is_json(line: str) -> bool:
-    try:
-        json.loads(line)
-    except ValueError:
-        return False
-    return True
 
 
 def _timestamp(record: logging.LogRecord) -> str:

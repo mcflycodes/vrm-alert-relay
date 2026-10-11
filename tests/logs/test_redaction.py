@@ -11,6 +11,7 @@ import pytest
 from vrm_alert_relay.logs import (
     REDACTED,
     SecretRegistry,
+    contains_secret,
     mask_recipient,
     redact_mapping,
     redact_secrets,
@@ -20,9 +21,11 @@ from vrm_alert_relay.logs import (
 )
 from vrm_alert_relay.logs import redaction as redaction_module
 from vrm_alert_relay.logs.redaction import (
+    MAX_AMBIGUOUS_CHARACTERS,
     MAX_DEPTH,
     MAX_ITEMS,
     MAX_NODES,
+    MAX_SECRET_BYTES,
     TRUNCATED,
     escape_controls,
     is_sensitive_key,
@@ -141,6 +144,142 @@ def test_longest_secret_replaced_first() -> None:
         redact_text("x fictitious-longer-value y", registry=registry)
         == f"x {REDACTED} y"
     )
+
+
+def redacts(secret: str, *rendered: str) -> None:
+    registry = SecretRegistry()
+    registry.register(secret)
+    for text in rendered:
+        result = redact_secrets(f"<{text}>", registry)
+        assert result == f"<{REDACTED}>", text
+        assert contains_secret(text, registry)
+
+
+def test_reviewer_noncanonical_percent_repros() -> None:
+    redacts(
+        "fict /\\pass",
+        "fict%20%2f%5Cpass",
+        "fict%20%2F%5cpass",
+        "fict+%2f%5Cpass",
+        "fict%20/%5cpass",
+        "%66%69%63%74%20%2F%5C%70%61%73%73",
+    )
+
+
+def test_unicode_escapes_in_either_case() -> None:
+    redacts(
+        "fictitiousé",
+        "fictitiousé",
+        "fictitious\\u00E9",
+        "fictitious\\u00e9",
+        "fictitious\\U00E9",
+        "fictitious%C3%A9",
+        "fictitious%c3%a9",
+        "fictitious%C3%a9",
+        "\\u0066\\u0069\\u0063\\u0074itious\\u00E9",
+    )
+
+
+def test_mixed_literal_and_escaped_characters() -> None:
+    redacts(
+        'fict"pa\\ss/x',
+        'fict"pa\\ss/x',
+        'fict\\"pa\\\\ss\\/x',
+        "fict\\u0022pa%5Css/x",
+        'f%69ct"pa\\\\ss%2fx',
+        "fict%22pa\\u005Css\\u002fx",
+    )
+
+
+def test_optional_and_short_escapes() -> None:
+    redacts("fict/pass", "fict\\/pass", "fict/pass", "fict%2Fpass")
+    redacts(
+        "fict\tpass\n", "fict\\tpass\\n", "fict\\u0009pass\\u000A", "fict\\x09pass\\x0a"
+    )
+    redacts("fict'pass", "fict\\'pass", "fict%27pass")
+
+
+def test_surrogate_pairs_and_lone_surrogates() -> None:
+    redacts(
+        "fict\U0001f600pass",
+        "fict\\ud83d\\ude00pass",
+        "fict\\uD83D\\uDE00pass",
+        "fict%F0%9F%98%80pass",
+    )
+    redacts("fict\ud800pass", "fict\\ud800pass", "fict\ud800pass")
+
+
+def test_matcher_is_exact_about_letters() -> None:
+    registry = SecretRegistry()
+    registry.register("fictitious-pass")
+    for text in (
+        "FICTITIOUS-PASS",
+        "fictitious-pas",
+        "fictitious pass",
+        "fictitious%2Bpass",
+    ):
+        assert redact_secrets(text, registry) == text
+        assert not contains_secret(text, registry)
+
+
+def test_secret_size_limit_is_in_utf8_bytes() -> None:
+    registry = SecretRegistry()
+    largest = "f" + "x" * (MAX_SECRET_BYTES - 1)
+    started = time.monotonic()
+    registry.register(largest)
+    assert time.monotonic() - started < 5
+    assert redact_secrets(f"a {largest} b", registry) == f"a {REDACTED} b"
+    with pytest.raises(ValueError, match="4096 bytes"):
+        registry.register(largest + "x")
+    with pytest.raises(ValueError, match="4096 bytes"):
+        registry.register("é" * 2049)
+
+
+def test_repeated_registration_is_a_no_op() -> None:
+    registry = SecretRegistry()
+    registry.register("fictitious-pass")
+    before = registry.secrets
+    registry.register("fictitious-pass")
+    assert registry.secrets == before
+
+
+def test_backslashes_within_backtracking_budget_match_mixed_forms() -> None:
+    value = "ab\\cd\\ef\\gh"
+    assert value.count("\\") <= MAX_AMBIGUOUS_CHARACTERS
+    redacts(
+        value,
+        "ab\\cd\\\\ef\\u005cgh",
+        "ab\\\\cd\\ef%5Cgh",
+        "ab\\x5ccd\\\\ef\\gh",
+    )
+
+
+def test_many_backslashes_use_non_backtracking_matcher() -> None:
+    secret = "fict" + "\\" * (MAX_AMBIGUOUS_CHARACTERS + 1) + "pass"
+    redacts(
+        secret,
+        secret,
+        json.dumps(secret)[1:-1],
+        repr(secret)[1:-1],
+        quote(secret, safe=""),
+        quote(secret, safe="").lower(),
+    )
+    registry = SecretRegistry()
+    registry.register(secret)
+    hostile = ("fict" + "\\" * 5000 + "x") * 4
+    started = time.monotonic()
+    redact_secrets(hostile, registry)
+    assert time.monotonic() - started < 0.5
+
+
+def test_backtracking_is_bounded_for_hostile_input() -> None:
+    secret = "fict" + "\\" * MAX_AMBIGUOUS_CHARACTERS + "pass"
+    registry = SecretRegistry()
+    registry.register(secret)
+    hostile = ("fict" + "\\" * 5000 + "x") * 4
+    started = time.monotonic()
+    assert redact_secrets(hostile, registry) == hostile
+    assert time.monotonic() - started < 0.5
 
 
 def test_register_rejects_non_string() -> None:

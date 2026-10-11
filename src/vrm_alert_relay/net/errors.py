@@ -37,6 +37,14 @@ class InvalidRequestError(HttpError, ValueError):
     """The request could not be built, e.g. conflicting or unserializable bodies."""
 
 
+class RequestTooLargeError(InvalidRequestError):
+    """The encoded request body exceeded the size cap. Raised before any network I/O."""
+
+    def __init__(self, method: str, target: str, *, limit: int) -> None:
+        super().__init__(f"request body exceeded {limit} bytes: {method} {target}")
+        self.limit = limit
+
+
 class HttpRequestError(HttpError):
     """A request was attempted and failed."""
 
@@ -47,7 +55,10 @@ class HttpRequestError(HttpError):
 
 
 class HttpTimeout(HttpRequestError):
-    """A connect, read, write or pool timeout, or the overall deadline, expired."""
+    """A timeout expired. ``phase`` is ``connect``, ``read``, ``write``, ``pool``,
+    ``dns`` (resolution timed out or every resolver worker was busy),
+    ``deadline`` (the overall per-request deadline) or ``unknown``.
+    """
 
     def __init__(self, method: str, target: str, *, phase: str) -> None:
         super().__init__(f"HTTP timeout ({phase})", method, target)

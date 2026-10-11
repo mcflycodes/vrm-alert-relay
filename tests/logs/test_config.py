@@ -19,6 +19,7 @@ from vrm_alert_relay.logs import (
     configure_logging,
     register_secret,
 )
+from vrm_alert_relay.logs.config import WITHHELD_MESSAGE
 from vrm_alert_relay.logs.redaction import TRUNCATED
 
 CANARY = "fictitious-api-password-0001"
@@ -331,27 +332,86 @@ def test_encoded_variants_redacted_in_every_field(
     assert_no_tricky(tricky_stream)
 
 
-def test_final_pass_redacts_serialized_line() -> None:
-    serialized_only = "fictitious\\\\ncomposite"
+def stream_with(*secrets: str) -> io.StringIO:
     registry = SecretRegistry()
-    registry.register(serialized_only)
+    for secret in secrets:
+        registry.register(secret)
     buffer = io.StringIO()
     configure_logging(stream=buffer, registry=registry)
-    logging.getLogger("t").info("value fictitious\ncomposite")
-    (record,) = lines(buffer)
-    assert record["msg"] == f"value {REDACTED}"
-    assert "fictitious" not in buffer.getvalue()
+    return buffer
 
 
-def test_final_pass_withholds_line_it_would_corrupt() -> None:
-    registry = SecretRegistry()
-    registry.register('"msg":"harmless"')
-    buffer = io.StringIO()
-    configure_logging(stream=buffer, registry=registry)
-    logging.getLogger("t").info("harmless")
+def test_secret_spanning_json_tokens_does_not_suppress_record() -> None:
+    buffer = stream_with(
+        '"msg":"monitoring degraded"',
+        '"msg":"harmless"',
+        '"rule":"battery_low"',
+        'degraded","rule"',
+    )
+    log = logging.getLogger("t")
+    log.warning("monitoring degraded", extra={"rule": "battery_low"})
+    log.info("harmless")
+    first, second = lines(buffer)
+    assert first["msg"] == "monitoring degraded"
+    assert first["rule"] == "battery_low"
+    assert second["msg"] == "harmless"
+
+
+def test_secret_revealed_by_json_escaping_withholds_record() -> None:
+    # Field redaction sees a newline; escape_controls and JSON then yield
+    # the registered backslash sequence inside one token.
+    buffer = stream_with("fictitious\\\\ncomposite")
+    logging.getLogger("relay.poll").warning(
+        "value fictitious\ncomposite",
+        extra={"event": "poll.failed", "code": "E42", "detail": "kept out"},
+    )
+    output = buffer.getvalue()
     (record,) = lines(buffer)
-    assert record["msg"] == "log record withheld by redaction"
-    assert record["level"] == "INFO"
+    assert record == {
+        "ts": record["ts"],
+        "level": "WARNING",
+        "logger": "relay.poll",
+        "msg": WITHHELD_MESSAGE,
+        "event": "poll.failed",
+        "code": "E42",
+    }
+    assert TS_RE.fullmatch(record["ts"])
+    assert "fictitious" not in output
+    assert "kept out" not in output
+
+
+def test_fallback_keeps_only_safe_codes_and_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    buffer = stream_with(CANARY)
+
+    def explode(self: JsonFormatter, record: logging.LogRecord) -> str:
+        raise RuntimeError(CANARY)
+
+    monkeypatch.setattr(JsonFormatter, "_format", explode)
+    logging.getLogger(f"relay.{CANARY}").error(
+        "boom", extra={"event": "has spaces", "code": CANARY}
+    )
+    logging.getLogger("relay").error("boom", extra={"event": 42, "code": "x" * 65})
+    first, second = lines(buffer)
+    assert first["logger"] == REDACTED
+    assert first["msg"] == "log record could not be formatted"
+    assert "event" not in first
+    assert "code" not in first
+    assert set(second) == {"ts", "level", "logger", "msg"}
+    assert CANARY not in buffer.getvalue()
+
+
+def test_floats_checked_for_secrets() -> None:
+    buffer = stream_with("123456.789")
+    logging.getLogger("t").info(
+        "reading",
+        extra={"reading": 123456.789, "voltage": 52.4, "ts_epoch": 1760000000.5},
+    )
+    (record,) = lines(buffer)
+    assert record["reading"] == REDACTED
+    assert record["voltage"] == 52.4
+    assert record["ts_epoch"] == 1760000000.5
 
 
 def test_globally_registered_secret(capsys: pytest.CaptureFixture[str]) -> None:

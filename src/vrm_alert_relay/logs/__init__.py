@@ -4,6 +4,7 @@ from vrm_alert_relay.logs.config import JsonFormatter, configure_logging
 from vrm_alert_relay.logs.redaction import (
     REDACTED,
     SecretRegistry,
+    contains_secret,
     mask_recipient,
     redact_mapping,
     redact_secrets,
@@ -18,6 +19,7 @@ __all__ = [
     "JsonFormatter",
     "SecretRegistry",
     "configure_logging",
+    "contains_secret",
     "mask_recipient",
     "redact_mapping",
     "redact_secrets",
