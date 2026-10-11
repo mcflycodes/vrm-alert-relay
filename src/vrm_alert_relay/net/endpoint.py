@@ -23,7 +23,9 @@ PathSegment = str | int
 class Endpoint:
     """An HTTPS base URL validated once, at configuration time.
 
-    Only ``https`` with a non-empty host is accepted. Userinfo, fragments,
+    Only ``https`` with a non-empty host is accepted, unless ``allow_http`` is
+    set, which also accepts plain ``http``; only providers whose operator
+    explicitly opted in may set it. Userinfo, fragments,
     whitespace, control characters and backslashes are rejected. A query
     string is allowed and kept, but never shown by :attr:`display`, ``str()``
     or ``repr()``.
@@ -42,8 +44,8 @@ class Endpoint:
     _url: httpx.URL
     _secret_path: bool
 
-    def __init__(self, url: str, *, secret_path: bool = False) -> None:
-        self._url = _parse(url)
+    def __init__(self, url: str, *, secret_path: bool = False, allow_http: bool = False) -> None:
+        self._url = _parse(url, allow_http=allow_http)
         self._secret_path = secret_path
 
     @classmethod
@@ -57,6 +59,11 @@ class Endpoint:
     def url(self) -> httpx.URL:
         """The full URL, including any query string. Do not log it."""
         return self._url
+
+    @property
+    def scheme(self) -> str:
+        """``https``, or ``http`` for an endpoint created with ``allow_http``."""
+        return self._url.scheme
 
     @property
     def host(self) -> str:
@@ -84,7 +91,7 @@ class Endpoint:
             host = f"[{host}]"
         port = f":{self.port}" if self.port is not None else ""
         path = _REDACTED_PATH if self._secret_path else self.path
-        return f"https://{host}{port}{path}"
+        return f"{self.scheme}://{host}{port}{path}"
 
     def join(self, *segments: PathSegment) -> Endpoint:
         """Return a new endpoint with ``segments`` appended to the path.
@@ -127,7 +134,7 @@ class Endpoint:
         return hash((str(self._url), self._secret_path))
 
 
-def _parse(url: object) -> httpx.URL:  # noqa: C901, PLR0912  # one branch per check, kept flat for review
+def _parse(url: object, *, allow_http: bool) -> httpx.URL:  # noqa: C901, PLR0912  # one branch per check, kept flat for review
     if not isinstance(url, str):
         raise InvalidUrlError("URL must be a string")  # noqa: TRY003  # message is specific to this check
     if not url:
@@ -143,9 +150,10 @@ def _parse(url: object) -> httpx.URL:  # noqa: C901, PLR0912  # one branch per c
     if split is None:
         raise InvalidUrlError("URL could not be parsed")  # noqa: TRY003  # message is specific to this check
     scheme = split.scheme.lower()
-    if scheme != "https":
+    allowed = ("https", "http") if allow_http else ("https",)
+    if scheme not in allowed:
         shown = repr(scheme) if _SCHEME_RE.fullmatch(scheme) else "an unsupported scheme"
-        raise InvalidUrlError(f"URL scheme must be https, not {shown}")  # noqa: TRY003  # message is specific to this check
+        raise InvalidUrlError(f"URL scheme must be {' or '.join(allowed)}, not {shown}")  # noqa: TRY003  # message is specific to this check
     if "@" in split.netloc:
         raise InvalidUrlError("URL must not contain userinfo")  # noqa: TRY003  # message is specific to this check
     try:
@@ -159,14 +167,15 @@ def _parse(url: object) -> httpx.URL:  # noqa: C901, PLR0912  # one branch per c
     if parsed is None:
         raise InvalidUrlError("URL could not be parsed")  # noqa: TRY003  # message is specific to this check
 
-    if parsed.scheme != "https" or parsed.userinfo:  # pragma: no cover - urlsplit checks
+    if parsed.scheme != scheme or parsed.userinfo:  # pragma: no cover - urlsplit checks
         raise InvalidUrlError("URL scheme must be https, without userinfo")  # noqa: TRY003  # message is specific to this check
     host = parsed.raw_host.decode("ascii")
     if not host:
         raise InvalidUrlError("URL must have a host")  # noqa: TRY003  # message is specific to this check
     if not _valid_host(host):
         raise InvalidUrlError("URL host is not a valid hostname or IP address")  # noqa: TRY003  # message is specific to this check
-    if (parsed.port or 443) != (port or 443):  # pragma: no cover - parsers agree
+    default_port = 443 if scheme == "https" else 80
+    if (parsed.port or default_port) != (port or default_port):  # pragma: no cover - parsers agree
         raise InvalidUrlError("URL port could not be parsed")  # noqa: TRY003  # message is specific to this check
     return parsed
 

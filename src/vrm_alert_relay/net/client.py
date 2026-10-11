@@ -3,6 +3,10 @@
 Guarantees, none of which can be turned off by callers:
 
 - HTTPS only, validated before any I/O; certificate verification always on.
+  Two per-client options exist for providers whose operator opted in, and
+  neither weakens any other guarantee: ``ca_file`` replaces the bundled trust
+  store with the given PEM bundle (certificates are still verified, including
+  the hostname), and ``allow_insecure_http`` also accepts plain ``http`` URLs.
 - Redirects are never followed: any 3xx raises :class:`HttpRedirectRefused`.
 - Proxy and TLS environment variables are ignored (``trust_env=False``).
 - Connect, read, write and pool timeouts, plus an absolute per-request deadline
@@ -29,6 +33,7 @@ import json as jsonlib
 import logging
 import math
 import re
+import ssl
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -48,14 +53,16 @@ from vrm_alert_relay.net.errors import (
     HttpTimeout,
     HttpTooLarge,
     HttpTransportError,
+    InvalidCaFileError,
     InvalidHeaderError,
     InvalidRequestError,
+    InvalidUrlError,
     RequestTooLargeError,
 )
 from vrm_alert_relay.net.transport import DnsTimeout, HardenedTransport, deadline_scope
 
 if TYPE_CHECKING:
-    import ssl
+    import os
     from types import TracebackType
 
 DEFAULT_MAX_REQUEST_BYTES: Final = 64 * 1024
@@ -119,6 +126,22 @@ def _tls_context() -> ssl.SSLContext:
     return httpx.create_ssl_context(verify=True, trust_env=False)
 
 
+def load_ca_file(path: str | os.PathLike[str]) -> ssl.SSLContext:
+    """A verifying TLS context that trusts only the PEM certificates in ``path``.
+
+    Hostname checking and certificate verification stay on. Raises
+    :class:`InvalidCaFileError`, whose message never includes the path or the
+    file's content, when the file cannot be read or holds no certificate.
+    """
+    try:
+        return ssl.create_default_context(cafile=path)
+    except (OSError, ValueError, TypeError):
+        pass
+    # Raised outside the except block so no ssl or OS error, which can name
+    # the path, is chained.
+    raise InvalidCaFileError("CA file could not be loaded as PEM certificates")  # noqa: TRY003  # message is specific to this check
+
+
 @dataclass(frozen=True, slots=True)
 class Timeouts:
     """Per-operation timeouts and the overall per-request deadline, in seconds."""
@@ -170,7 +193,7 @@ class HttpResponse:
 class SafeHttpClient:
     """The only HTTP client adapters may use. See the module docstring."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913  # keyword-only client options
         self,
         *,
         timeouts: Timeouts | None = None,
@@ -178,7 +201,12 @@ class SafeHttpClient:
         max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
         user_agent: str = DEFAULT_USER_AGENT,
         headers: Mapping[str, str] | None = None,
+        ca_file: str | os.PathLike[str] | None = None,
+        allow_insecure_http: bool = False,
     ) -> None:
+        if not isinstance(allow_insecure_http, bool):
+            raise TypeError("allow_insecure_http must be a bool")  # noqa: TRY003  # message is specific to this check
+        self._allow_insecure_http = allow_insecure_http
         self._timeouts = timeouts if timeouts is not None else Timeouts()
         self._max_response_bytes = _validate_limit(max_response_bytes)
         self._max_request_bytes = _validate_limit(max_request_bytes, "max_request_bytes")
@@ -188,7 +216,9 @@ class SafeHttpClient:
         default_headers["Accept-Encoding"] = "identity"
         _quiet_library_loggers()
         self._client = httpx.Client(
-            transport=HardenedTransport(ssl_context=_tls_context()),
+            transport=HardenedTransport(
+                ssl_context=_tls_context() if ca_file is None else load_ca_file(ca_file)
+            ),
             follow_redirects=False,
             trust_env=False,
             timeout=httpx.Timeout(
@@ -203,6 +233,10 @@ class SafeHttpClient:
     @property
     def timeouts(self) -> Timeouts:
         return self._timeouts
+
+    @property
+    def allow_insecure_http(self) -> bool:
+        return self._allow_insecure_http
 
     @property
     def max_response_bytes(self) -> int:
@@ -283,7 +317,13 @@ class SafeHttpClient:
         has. Secrets may be passed in any of these; none of them appear in
         exceptions or logs raised by this client.
         """
-        endpoint = target if isinstance(target, Endpoint) else Endpoint(target)
+        endpoint = (
+            target
+            if isinstance(target, Endpoint)
+            else Endpoint(target, allow_http=self._allow_insecure_http)
+        )
+        if endpoint.scheme != "https" and not self._allow_insecure_http:
+            raise InvalidUrlError("plain http is not allowed for this client")  # noqa: TRY003  # message is specific to this check
         method = _validate_method(method)
         limit = (
             self._max_response_bytes
