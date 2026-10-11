@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -15,6 +14,9 @@ from vrm_alert_relay.config._paths import (
     is_displayable_key,
     render_path,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 Data = dict[str, Any]
 
@@ -56,9 +58,7 @@ def test_withheld_keys_use_their_source_position_and_line() -> None:
         positions={("recipients", "2025550142"): 2},
     )
     assert render_path(loc, source) == ("recipients[#2].phone", True)
-    assert describe(loc, "is required", source) == (
-        "recipients[#2].phone: is required (line 9)"
-    )
+    assert describe(loc, "is required", source) == ("recipients[#2].phone: is required (line 9)")
 
 
 def test_line_is_only_added_when_something_is_withheld() -> None:
@@ -128,4 +128,5 @@ def test_errors_withhold_phone_shaped_recipient_names(
     config_data["recipients"][name] = {"provider": "voipms"}
     (problem,) = problems(config_data)
     assert problem.startswith("recipients[#4].phone: is required (line ")
-    assert name not in problem and "0142" not in problem
+    assert name not in problem
+    assert "0142" not in problem

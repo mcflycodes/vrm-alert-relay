@@ -68,13 +68,9 @@ def test_secret_never_appears_in_text_forms(fake_secret: str) -> None:
     assert f"{secret:>12}" == f"  {MASK}"
 
 
-def test_secret_never_appears_in_logs(
-    fake_secret: str, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_secret_never_appears_in_logs(fake_secret: str, caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.INFO):
-        logging.getLogger("test").info(
-            "token is %s / %r", Secret(fake_secret), Secret(fake_secret)
-        )
+        logging.getLogger("test").info("token is %s / %r", Secret(fake_secret), Secret(fake_secret))
     assert fake_secret not in caplog.text
     assert MASK in caplog.text
 
@@ -105,9 +101,7 @@ def test_secret_requires_a_string() -> None:
 
 
 def test_secret_in_pydantic_models_is_masked(fake_secret: str) -> None:
-    secrets = RelaySecrets(
-        vrm_token=Secret(fake_secret), voipms_password=Secret(fake_secret)
-    )
+    secrets = RelaySecrets(vrm_token=Secret(fake_secret), voipms_password=Secret(fake_secret))
     outputs = [
         repr(secrets),
         str(secrets),
@@ -145,7 +139,8 @@ def test_plain_values_are_refused_before_pydantic_validation(
     error = caught.value
     assert str(error) == "secret fields accept only Secret values read from files"
     assert not isinstance(error, pydantic.ValidationError)
-    assert error.__cause__ is None and error.__context__ is None
+    assert error.__cause__ is None
+    assert error.__context__ is None
     assert fake_secret not in repr(error)
 
 
@@ -221,7 +216,8 @@ def test_relay_secrets_refuse_changes(
         "load the secrets again"
     )
     assert fake_secret not in repr(error)
-    assert error.__cause__ is None and error.__context__ is None
+    assert error.__cause__ is None
+    assert error.__context__ is None
     _assert_unchanged(secrets, fake_secret)
 
 
@@ -349,16 +345,15 @@ def test_every_value_entry_point_is_attacked() -> None:
     [attack for _, attack in VALUE_ATTACKS],
     ids=[f"{name}-{i}" for i, (name, _) in enumerate(VALUE_ATTACKS)],
 )
-def test_no_entry_point_yields_plaintext(
-    fake_secret: str, tmp_path: Path, attack: Attack
-) -> None:
+def test_no_entry_point_yields_plaintext(fake_secret: str, tmp_path: Path, attack: Attack) -> None:
     original = RelaySecrets(vrm_token=Secret(fake_secret))
     plaintext = "fake-plaintext-for-entry-point-tests"
     # from_orm is refused by pydantic itself because from_attributes is off.
     refusals = (SecretTypeError, SecretsImmutableError, pydantic.PydanticUserError)
     with pytest.raises(refusals) as caught:
         attack(original, plaintext, tmp_path)
-    assert plaintext not in repr(caught.value) and plaintext not in str(caught.value)
+    assert plaintext not in repr(caught.value)
+    assert plaintext not in str(caught.value)
     assert all(v is None or isinstance(v, Secret) for v in vars(original).values())
     _assert_unchanged(original, fake_secret)
 
@@ -371,9 +366,7 @@ def test_model_construct_refuses_plain_values(fake_secret: str) -> None:
 
 
 def test_relay_secrets_text_forms_are_fixed(fake_secret: str) -> None:
-    secrets = RelaySecrets(
-        vrm_token=Secret(fake_secret), voipms_password=Secret(fake_secret)
-    )
+    secrets = RelaySecrets(vrm_token=Secret(fake_secret), voipms_password=Secret(fake_secret))
     assert repr(secrets) == str(secrets) == f"{secrets}" == HIDDEN
     assert list(secrets.__repr_args__()) == []
     assert list(secrets.__rich_repr__()) == []
@@ -402,9 +395,7 @@ def test_read_secret_file_strips_one_newline(
     assert result.group_or_world_readable is False
 
 
-def test_read_secret_file_accepts_path_objects(
-    secret_file: SecretWriter, fake_secret: str
-) -> None:
+def test_read_secret_file_accepts_path_objects(secret_file: SecretWriter, fake_secret: str) -> None:
     assert read_secret_file(Path(secret_file("s"))).secret.reveal() == fake_secret
 
 
@@ -490,10 +481,7 @@ def test_fifo_is_not_read(secrets_dir: Path) -> None:
 def test_permissive_modes_are_flagged(
     secret_file: SecretWriter, mode: int, permissive: bool
 ) -> None:
-    assert (
-        read_secret_file(secret_file("s", mode=mode)).group_or_world_readable
-        is permissive
-    )
+    assert read_secret_file(secret_file("s", mode=mode)).group_or_world_readable is permissive
 
 
 @pytest.mark.parametrize(
@@ -648,9 +636,7 @@ def test_live_provider_with_missing_secret_fails(
     config_data["providers"]["voipms"]["enabled"] = True
     with pytest.raises(ConfigError) as caught:
         load_secrets(parse(config_data))
-    assert caught.value.problems == (
-        "providers.voipms.password_file: secret file does not exist",
-    )
+    assert caught.value.problems == ("providers.voipms.password_file: secret file does not exist",)
 
 
 def test_missing_vrm_token_fails_at_runtime(config_data: Data, parse: Parse) -> None:
@@ -671,9 +657,13 @@ def test_runtime_errors_never_contain_secret_content(
     text = str(caught.value)
     assert caught.value.problems == (
         "vrm.token_file: secret file contains line breaks or control characters",
-        "providers.homeassistant.token_file: secret file contains line breaks or control characters",
+        (
+            "providers.homeassistant.token_file: "
+            "secret file contains line breaks or control characters"
+        ),
     )
-    assert "fake-" not in text and "second-line" not in text
+    assert "fake-" not in text
+    assert "second-line" not in text
 
 
 def test_permissive_secret_files_produce_warnings(
@@ -683,9 +673,7 @@ def test_permissive_secret_files_produce_warnings(
     config_data["sending"]["enabled"] = True
     config_data["providers"]["homeassistant"]["enabled"] = True
     _, warnings = load_secrets(parse(config_data))
-    permissive = (
-        "secret file is readable by group or others; restrict it to mode 0600 or 0400"
-    )
+    permissive = "secret file is readable by group or others; restrict it to mode 0600 or 0400"
     assert warnings == [
         f"vrm.token_file: {permissive}",
         f"providers.homeassistant.token_file: {permissive}",

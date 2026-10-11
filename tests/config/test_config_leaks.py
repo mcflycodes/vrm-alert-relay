@@ -8,11 +8,9 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Callable
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
-from pydantic_core import ErrorDetails
 
 from vrm_alert_relay.config import (
     ConfigError,
@@ -28,9 +26,7 @@ Dump = Callable[[Any], str]
 Builder = Callable[[Data, Dump], str | bytes]
 
 CANARY = "fake-secret-CANARY-7Q9X"
-CANARY_NAME = (
-    "fake-secret-canary-7q9x"  # passes the name pattern, reaches semantic checks
-)
+CANARY_NAME = "fake-secret-canary-7q9x"  # passes the name pattern, reaches semantic checks
 PHONE = "+1 202 555 0142"
 PHONE_NAME = "2025550142"
 FORBIDDEN = (
@@ -44,6 +40,11 @@ FORBIDDEN = (
     "555 0142",
     "555-0142",
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from pydantic_core import ErrorDetails
 
 
 def _assert_clean(error: BaseException, problems: tuple[str, ...]) -> None:
@@ -129,22 +130,14 @@ CASES: dict[str, Builder] = {
     "version_unsupported": _set(("version",), 2025550142),
     "version_type": _set(("version",), CANARY),
     # field validators
-    "url_userinfo": _set(
-        ("providers", "webhook", "url"), f"https://u:{CANARY}@h.example.com/"
-    ),
-    "url_scheme": _set(
-        ("vrm", "base_url"), f"http://hooks.example.com/?t={CANARY}&p={PHONE}"
-    ),
-    "url_host": _set(
-        ("providers", "homeassistant", "base_url"), f"https://{CANARY}_x/"
-    ),
+    "url_userinfo": _set(("providers", "webhook", "url"), f"https://u:{CANARY}@h.example.com/"),
+    "url_scheme": _set(("vrm", "base_url"), f"http://hooks.example.com/?t={CANARY}&p={PHONE}"),
+    "url_host": _set(("providers", "homeassistant", "base_url"), f"https://{CANARY}_x/"),
     "phone_invalid": _set(("recipients", "owner_sms", "phone"), "+1 102 555 0142"),
     "phone_canary": _set(("recipients", "owner_sms", "phone"), CANARY),
     "did_invalid": _set(("providers", "voipms", "did"), "+44 202 555 0142"),
     "header_name": _set(("providers", "webhook", "auth_header_name"), f"X {CANARY}"),
-    "template_length": _set(
-        ("rules", 0, "levels", 0, "message"), (CANARY + PHONE) * 20
-    ),
+    "template_length": _set(("rules", 0, "levels", 0, "message"), (CANARY + PHONE) * 20),
     "template_line_break": _template_line,
     "secret_path_relative": _set(("vrm", "token_file"), CANARY),
     "secret_path_phone": _set(("providers", "voipms", "password_file"), PHONE),
@@ -221,9 +214,7 @@ KEY_CASES: dict[str, Builder] = {
     ),
     "recipient_bad_provider": _key(("recipients",), CANARY, {"provider": CANARY}),
     "recipient_missing_provider": _key(("recipients",), CANARY, {"phone": PHONE}),
-    "recipient_unknown_field": _key(
-        ("recipients",), PHONE_NAME, {"provider": "log", CANARY: 1}
-    ),
+    "recipient_unknown_field": _key(("recipients",), PHONE_NAME, {"provider": "log", CANARY: 1}),
     "inline_secret_looking_key": _key(("vrm",), INLINE_LOOKING_KEY, CANARY),
     "nested_under_unknown_key": _key((), CANARY, {PHONE_NAME: {CANARY: 1}}),
     "duplicate_under_leaf": _text(
@@ -286,9 +277,7 @@ def test_reviewer_key_repros(text: str, expected: str) -> None:
     _assert_clean(caught.value, caught.value.problems)
 
 
-def test_valid_recipient_names_are_intentionally_shown(
-    config_data: Data, to_yaml: Dump
-) -> None:
+def test_valid_recipient_names_are_intentionally_shown(config_data: Data, to_yaml: Dump) -> None:
     # Operators need to see their own valid names. A name passing the identifier
     # pattern with no run of five or more digits is shown even if it looks
     # like a secret; anything else is withheld as possibly mispasted data.
@@ -326,9 +315,7 @@ def test_names_failing_the_display_rule_are_withheld(
 
 
 @pytest.mark.parametrize("build", CASES.values(), ids=CASES.keys())
-def test_config_errors_never_echo_values(
-    config_data: Data, to_yaml: Dump, build: Builder
-) -> None:
+def test_config_errors_never_echo_values(config_data: Data, to_yaml: Dump, build: Builder) -> None:
     text = build(copy.deepcopy(config_data), to_yaml)
     with pytest.raises(ConfigError) as caught:
         parse_config(text)
@@ -345,9 +332,7 @@ def test_config_errors_never_echo_values(
     ],
     ids=["oversize", "not_utf8", "missing", "directory"],
 )
-def test_config_file_errors_never_echo_content(
-    tmp_path: Path, content: bytes | str | None
-) -> None:
+def test_config_file_errors_never_echo_content(tmp_path: Path, content: bytes | str | None) -> None:
     path = tmp_path / "config.yaml"
     if isinstance(content, bytes):
         path.write_bytes(content)
@@ -420,7 +405,5 @@ def _details(kind: str, ctx: dict[str, Any] | None = None) -> ErrorDetails:
         (_details("some_future_error_type"), "is invalid"),
     ],
 )
-def test_upstream_message_text_is_never_used(
-    details: ErrorDetails, expected: str
-) -> None:
+def test_upstream_message_text_is_never_used(details: ErrorDetails, expected: str) -> None:
     assert _error_message(details, ("x",)) == expected

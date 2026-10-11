@@ -94,9 +94,7 @@ def test_unknown_recipient_raises_key_error(config_data: Data, parse: Parse) -> 
         parse(config_data).delivery_mode("nobody")
 
 
-def test_recipient_of_absent_provider_section_is_dry_run(
-    config_data: Data, parse: Parse
-) -> None:
+def test_recipient_of_absent_provider_section_is_dry_run(config_data: Data, parse: Parse) -> None:
     config_data["sending"]["enabled"] = True
     del config_data["providers"]
     config = parse(config_data)
@@ -148,9 +146,7 @@ def test_check_missing_or_unreadable_vrm_token_is_a_problem(
     assert report.problems == (f"vrm.token_file: {reason}",)
 
 
-def test_structure_only_skips_secret_files(
-    config_data: Data, write_config: Write
-) -> None:
+def test_structure_only_skips_secret_files(config_data: Data, write_config: Write) -> None:
     config_data["sending"]["enabled"] = True
     config_data["providers"]["voipms"]["enabled"] = True
     report = check_config(write_config(config_data), structure_only=True)
@@ -231,9 +227,7 @@ def test_check_live_provider_requires_secret_files(
     config_data["providers"]["voipms"]["enabled"] = True
     report = check_config(write_config(config_data))
     assert report.ok is False
-    assert report.problems == (
-        "providers.voipms.password_file: secret file does not exist",
-    )
+    assert report.problems == ("providers.voipms.password_file: secret file does not exist",)
     assert report.live_providers == ("voipms",)
     assert report.live_recipients == ("owner_sms",)
 
@@ -291,7 +285,8 @@ def test_check_never_reports_secret_content(
     report = check_config(write_config(config_data))
     assert report.ok is False
     text = repr(report)
-    assert "fake-vrm-secret" not in text and "fake-ha-secret" not in text
+    assert "fake-vrm-secret" not in text
+    assert "fake-ha-secret" not in text
     assert len(report.problems) == 2
 
 
@@ -300,9 +295,7 @@ def test_check_invalid_configuration(config_data: Data, write_config: Write) -> 
     report = check_config(write_config(config_data))
     assert report == CheckReport(
         ok=False,
-        problems=(
-            "rules[0].recipients[0]: unknown recipient (not defined under recipients)",
-        ),
+        problems=("rules[0].recipients[0]: unknown recipient (not defined under recipients)",),
     )
 
 
@@ -312,9 +305,7 @@ def test_check_missing_file(tmp_path: Path) -> None:
     assert report.problems == ("configuration file: does not exist",)
 
 
-@pytest.mark.parametrize(
-    "name", ["r2025550142", "202-555-0142", "202_555_0142", "1-202-555-0142"]
-)
+@pytest.mark.parametrize("name", ["r2025550142", "202-555-0142", "202_555_0142", "1-202-555-0142"])
 def test_check_report_lists_phone_shaped_names_by_position(
     config_data: Data, write_config: Write, secret_file: SecretWriter, name: str
 ) -> None:
@@ -332,7 +323,9 @@ def test_check_report_lists_phone_shaped_names_by_position(
     assert report.live_recipients == ("[#3]",)
     assert report.dry_run_recipients == ("owner_sms", "owner_app", "audit", "[#4]")
     text = repr(report)
-    assert name not in text and "0142" not in text and "0199" not in text
+    assert name not in text
+    assert "0142" not in text
+    assert "0199" not in text
 
 
 def test_check_masks_phone_numbers(config_data: Data, write_config: Write) -> None:

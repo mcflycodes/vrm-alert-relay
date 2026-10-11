@@ -18,6 +18,7 @@ from vrm_alert_relay.config import (
     RelayConfig,
     VoipmsRecipient,
 )
+from vrm_alert_relay.config.fields import _check_host
 
 Data = dict[str, Any]
 Parse = Callable[[Any], RelayConfig]
@@ -303,9 +304,7 @@ def test_level_list_bounds(config_data: Data, problems: Problems, parse: Parse) 
     assert problem.startswith("rules[0].levels: ")
 
 
-def test_recipient_list_bounds(
-    config_data: Data, problems: Problems, parse: Parse
-) -> None:
+def test_recipient_list_bounds(config_data: Data, problems: Problems, parse: Parse) -> None:
     config_data["recipients"] = {f"r{i}": {"provider": "log"} for i in range(50)}
     config_data["rules"] = []
     assert len(parse(config_data).recipients) == 50
@@ -314,9 +313,7 @@ def test_recipient_list_bounds(
     assert problem.startswith("recipients: ")
 
 
-def test_rule_needs_at_least_one_recipient(
-    config_data: Data, problems: Problems
-) -> None:
+def test_rule_needs_at_least_one_recipient(config_data: Data, problems: Problems) -> None:
     config_data["rules"][1]["recipients"] = []
     (problem,) = problems(config_data)
     assert problem.startswith("rules[1].recipients: ")
@@ -325,9 +322,7 @@ def test_rule_needs_at_least_one_recipient(
 @pytest.mark.parametrize(
     "name", ["Cabin", "-cabin", "_cabin", "a" * 64, "a b", "", "cabin!", "kühl"]
 )
-def test_invalid_names_are_rejected(
-    config_data: Data, problems: Problems, name: str
-) -> None:
+def test_invalid_names_are_rejected(config_data: Data, problems: Problems, name: str) -> None:
     config_data["vrm"]["installations"][1]["id"] = name
     config_data["rules"][2]["id"] = name
     config_data["rules"][2]["levels"][0]["name"] = name
@@ -413,9 +408,7 @@ def test_duplicates_are_rejected(config_data: Data, problems: Problems) -> None:
     )
 
 
-def test_stale_age_must_exceed_poll_interval(
-    config_data: Data, problems: Problems
-) -> None:
+def test_stale_age_must_exceed_poll_interval(config_data: Data, problems: Problems) -> None:
     config_data["vrm"]["poll_interval"] = 120
     config_data["rules"][0]["stale_after_minutes"] = 2
     assert problems(config_data) == (
@@ -423,9 +416,7 @@ def test_stale_age_must_exceed_poll_interval(
     )
 
 
-def test_hourly_cap_cannot_exceed_daily_cap(
-    config_data: Data, problems: Problems
-) -> None:
+def test_hourly_cap_cannot_exceed_daily_cap(config_data: Data, problems: Problems) -> None:
     config_data["rate_limits"] = {"global_per_hour": 61, "global_per_day": 60}
     assert problems(config_data) == (
         "rate_limits.global_per_hour: must not exceed rate_limits.global_per_day",
@@ -485,9 +476,7 @@ def test_webhook_without_auth_is_valid(config_data: Data, parse: Parse) -> None:
         "+1 (202) 555-0142",
     ],
 )
-def test_phone_numbers_are_normalized(
-    config_data: Data, parse: Parse, value: str
-) -> None:
+def test_phone_numbers_are_normalized(config_data: Data, parse: Parse, value: str) -> None:
     config_data["recipients"]["owner_sms"]["phone"] = value
     phone = parse(config_data).recipients["owner_sms"].phone  # type: ignore[union-attr]
     assert phone.e164 == "+12025550142"
@@ -506,7 +495,7 @@ def test_phone_numbers_are_normalized(
         "2021550142",
         "22025550142",
         "202555014x",
-        "２０２５５５０１４２",
+        "２０２５５５０１４２",  # noqa: RUF001 -- fullwidth digits are the point
         "202 555 0142 ext 9",
         "2025550142" * 4,
         "",
@@ -521,7 +510,7 @@ def test_invalid_phone_numbers_are_rejected_and_masked(
         "recipients.owner_sms.phone: must be a 10-digit NANP number or a +1 E.164 number"
     )
     assert not re.search(r"[0-9]{5}", problem)
-    assert "２０２" not in problem
+    assert "２０２" not in problem  # noqa: RUF001 -- fullwidth digits are the point
     digits = re.sub(r"[^0-9]", "", value)
     if len(digits) >= 4:
         assert problem.endswith(f"(value ending {digits[-4:]})")
@@ -543,16 +532,12 @@ def test_phone_number_object_never_shows_the_full_number() -> None:
 
 
 def test_ipv6_host_fallback_validation() -> None:
-    from vrm_alert_relay.config.fields import _check_host
-
     _check_host("[fd00::10]")
     with pytest.raises(ValueError, match="invalid IPv6 host"):
         _check_host("[not-an-ip]")
 
 
-def test_unquoted_phone_number_is_rejected_with_hint(
-    config_data: Data, problems: Problems
-) -> None:
+def test_unquoted_phone_number_is_rejected_with_hint(config_data: Data, problems: Problems) -> None:
     config_data["recipients"]["owner_sms"]["phone"] = 2025550142
     config_data["providers"]["voipms"]["did"] = 2025550100
     found = problems(config_data)
@@ -571,9 +556,7 @@ def test_invalid_did_is_masked(config_data: Data, problems: Problems) -> None:
     assert problem.endswith("(value ending 0100)")
 
 
-def test_phone_key_used_as_recipient_name_is_masked(
-    config_data: Data, problems: Problems
-) -> None:
+def test_phone_key_used_as_recipient_name_is_masked(config_data: Data, problems: Problems) -> None:
     config_data["recipients"]["+12025550142"] = {"provider": "log"}
     (problem,) = problems(config_data)
     assert FULL_NUMBER_DIGITS not in problem
@@ -589,14 +572,10 @@ def test_invalid_home_assistant_service(
 ) -> None:
     config_data["recipients"]["owner_app"]["service"] = service
     (problem,) = problems(config_data)
-    assert problem.startswith(
-        "recipients.owner_app.service: must be a Home Assistant notify"
-    )
+    assert problem.startswith("recipients.owner_app.service: must be a Home Assistant notify")
 
 
-def test_recipient_provider_discriminator(
-    config_data: Data, problems: Problems
-) -> None:
+def test_recipient_provider_discriminator(config_data: Data, problems: Problems) -> None:
     config_data["recipients"]["owner_sms"] = {"provider": "carrier_pigeon"}
     config_data["recipients"]["owner_app"] = {"service": "mobile_app_test"}
     config_data["recipients"]["hook"] = {"provider": "voipms"}
@@ -672,9 +651,7 @@ def test_invalid_urls_are_rejected_without_echo(
 
 
 def test_url_query_tokens_are_not_echoed(config_data: Data, problems: Problems) -> None:
-    config_data["providers"]["webhook"]["url"] = (
-        "http://hooks.example.com/?token=fake-token-123"
-    )
+    config_data["providers"]["webhook"]["url"] = "http://hooks.example.com/?token=fake-token-123"
     (problem,) = problems(config_data)
     assert "fake-token-123" not in problem
 
@@ -731,9 +708,7 @@ def test_invalid_message_templates(
     assert reason in problem
 
 
-@pytest.mark.parametrize(
-    "escape", ["\\N", "\\L", "\\P", "\\n", "\\r", "\\0", "\\e", "\\x85"]
-)
+@pytest.mark.parametrize("escape", ["\\N", "\\L", "\\P", "\\n", "\\r", "\\0", "\\e", "\\x85"])
 def test_escaped_line_breaks_in_templates_are_rejected(
     config_data: Data, to_yaml: Callable[[Any], str], problems: Problems, escape: str
 ) -> None:
@@ -745,9 +720,7 @@ def test_escaped_line_breaks_in_templates_are_rejected(
     )
 
 
-def test_template_at_length_limit_is_stored_verbatim(
-    config_data: Data, parse: Parse
-) -> None:
+def test_template_at_length_limit_is_stored_verbatim(config_data: Data, parse: Parse) -> None:
     message = "{value} " + "x" * 312
     assert len(message) == 320
     config_data["rules"][2]["levels"][1]["message"] = message
@@ -828,17 +801,13 @@ def test_inline_secret_is_reported_with_other_problems(
     assert all("fake-inline-secret-value" not in p for p in found)
 
 
-def test_names_that_look_like_secret_keys_are_allowed(
-    config_data: Data, parse: Parse
-) -> None:
+def test_names_that_look_like_secret_keys_are_allowed(config_data: Data, parse: Parse) -> None:
     config_data["recipients"]["token"] = {"provider": "log"}
     config_data["rules"][2]["recipients"] = ["token"]
     assert parse(config_data).delivery_mode("token") == "dry_run"
 
 
-@pytest.mark.parametrize(
-    ("bind", "stored"), [("::1", "::1"), ("::", "::"), ("127.000.0.1", None)]
-)
+@pytest.mark.parametrize(("bind", "stored"), [("::1", "::1"), ("::", "::"), ("127.000.0.1", None)])
 def test_health_bind_address(
     config_data: Data, parse: Parse, problems: Problems, bind: str, stored: str | None
 ) -> None:
@@ -892,17 +861,13 @@ def test_unsupported_version_is_reported_alone(
 
 
 @pytest.mark.parametrize("version", ["1", 1.0, True, None])
-def test_version_must_be_an_integer(
-    config_data: Data, problems: Problems, version: object
-) -> None:
+def test_version_must_be_an_integer(config_data: Data, problems: Problems, version: object) -> None:
     config_data["version"] = version
     (problem,) = problems(config_data)
     assert problem.startswith("version: must be a whole number")
 
 
-def test_unsupported_version_rejected_by_direct_validation(
-    config_data: Data, parse: Parse
-) -> None:
+def test_unsupported_version_rejected_by_direct_validation(config_data: Data, parse: Parse) -> None:
     config = parse(config_data)
     assert config.version == 1
     data = copy.deepcopy(config_data)
@@ -911,9 +876,7 @@ def test_unsupported_version_rejected_by_direct_validation(
         RelayConfig.model_validate(data)
 
 
-def test_many_field_problems_are_reported_together(
-    config_data: Data, problems: Problems
-) -> None:
+def test_many_field_problems_are_reported_together(config_data: Data, problems: Problems) -> None:
     config_data["vrm"]["poll_interval"] = 1
     config_data["health"]["port"] = 0
     config_data["rules"][0]["direction"] = "sideways"

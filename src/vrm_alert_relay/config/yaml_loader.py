@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import yaml
 from yaml.composer import ComposerError
 from yaml.constructor import ConstructorError
@@ -31,7 +29,7 @@ _STR_TAG = "tag:yaml.org,2002:str"
 _MERGE_TAG = "tag:yaml.org,2002:merge"
 
 
-class _Rejected(Exception):
+class _UnsafeYamlError(Exception):
     def __init__(self, message: str) -> None:
         self.message = message
         super().__init__(message)
@@ -54,15 +52,14 @@ class _StrictLoader(yaml.SafeLoader):
         if isinstance(event, AliasEvent) or (
             isinstance(event, NodeEvent) and event.anchor is not None
         ):
-            raise _Rejected(
+            raise _UnsafeYamlError(  # noqa: TRY003 -- fixed operator-facing text
                 f"line {_line(event)}: YAML anchors and aliases are not allowed"
             )
         self._depth += 1
         try:
             if self._depth > MAX_NESTING_DEPTH:
-                raise _Rejected(
-                    f"line {_line(event)}: nesting is deeper than "
-                    f"{MAX_NESTING_DEPTH} levels"
+                raise _UnsafeYamlError(  # noqa: TRY003 -- fixed operator-facing text
+                    f"line {_line(event)}: nesting is deeper than {MAX_NESTING_DEPTH} levels"
                 )
             return super().compose_node(parent, index)
         finally:
@@ -77,29 +74,25 @@ def _check_tree(node: Node, loc: Loc, source: SourceMap) -> None:
     """
     if isinstance(node, SequenceNode):
         if len(node.value) > MAX_COLLECTION_ITEMS:
-            raise _Rejected(
-                describe(loc, f"more than {MAX_COLLECTION_ITEMS} items", source)
-            )
+            raise _UnsafeYamlError(describe(loc, f"more than {MAX_COLLECTION_ITEMS} items", source))
         for index, item in enumerate(node.value):
             source.lines[(*loc, index)] = _line(item)
             _check_tree(item, (*loc, index), source)
     elif isinstance(node, MappingNode):
         if len(node.value) > MAX_COLLECTION_ITEMS:
-            raise _Rejected(
-                describe(loc, f"more than {MAX_COLLECTION_ITEMS} keys", source)
-            )
+            raise _UnsafeYamlError(describe(loc, f"more than {MAX_COLLECTION_ITEMS} keys", source))
         seen: set[str] = set()
         for position, (key_node, value_node) in enumerate(node.value):
             line = _line(key_node)
             if key_node.tag == _MERGE_TAG:
                 message = "YAML merge keys ('<<') are not allowed"
-                raise _Rejected(describe(loc, message, source, line=line))
+                raise _UnsafeYamlError(describe(loc, message, source, line=line))
             if not isinstance(key_node, ScalarNode) or key_node.tag != _STR_TAG:
                 message = "mapping keys must be plain strings"
-                raise _Rejected(describe(loc, message, source, line=line))
+                raise _UnsafeYamlError(describe(loc, message, source, line=line))
             key = str(key_node.value)
             if key in seen:
-                raise _Rejected(describe(loc, "duplicate key", source, line=line))
+                raise _UnsafeYamlError(describe(loc, "duplicate key", source, line=line))
             seen.add(key)
             source.lines[(*loc, key)] = line
             source.positions[(*loc, key)] = position
@@ -118,9 +111,7 @@ _YAML_PROBLEMS: tuple[tuple[type[yaml.YAMLError], str], ...] = (
 
 
 def _yaml_problem(exc: yaml.YAMLError) -> str:
-    problem = next(
-        (text for kind, text in _YAML_PROBLEMS if isinstance(exc, kind)), "invalid YAML"
-    )
+    problem = next((text for kind, text in _YAML_PROBLEMS if isinstance(exc, kind)), "invalid YAML")
     where = ""
     if isinstance(exc, yaml.MarkedYAMLError) and exc.problem_mark is not None:
         mark = exc.problem_mark
@@ -137,7 +128,7 @@ def _decode(data: bytes) -> str | None:
         return None
 
 
-def _compose(text: str, source: SourceMap) -> Any:
+def _compose(text: str, source: SourceMap) -> object:
     loader = _StrictLoader(text)
     try:
         node = loader.get_single_node()
@@ -149,12 +140,12 @@ def _compose(text: str, source: SourceMap) -> Any:
         loader.dispose()
 
 
-def parse_yaml(data: bytes | str) -> Any:
+def parse_yaml(data: bytes | str) -> object:
     """Parse one YAML document into plain Python data, rejecting unsafe input."""
     return parse_yaml_with_source(data)[0]
 
 
-def parse_yaml_with_source(data: bytes | str) -> tuple[Any, SourceMap]:
+def parse_yaml_with_source(data: bytes | str) -> tuple[object, SourceMap]:
     """Like :func:`parse_yaml`, also returning where each key and item sits.
 
     Errors are raised outside ``except`` blocks so no exception holding source
@@ -168,11 +159,11 @@ def parse_yaml_with_source(data: bytes | str) -> tuple[Any, SourceMap]:
         raise ConfigError(["configuration is not valid UTF-8"])
 
     problem: str | None = None
-    result: Any = None
+    result: object = None
     source = SourceMap()
     try:
         result = _compose(text, source)
-    except _Rejected as exc:
+    except _UnsafeYamlError as exc:
         problem = exc.message
     except yaml.YAMLError as exc:
         problem = _yaml_problem(exc)

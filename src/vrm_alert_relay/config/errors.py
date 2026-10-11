@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Sequence
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
 
 __all__ = ["ConfigError", "format_path", "mask_digits", "sanitize_identifier"]
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
 _DIGIT_RUN = re.compile(r"\+?[0-9][0-9 ().-]*[0-9]")
 _MAX_KEY_DISPLAY = 64
+# Digit runs this long or longer are masked; shorter ones cannot be phone numbers.
+_MIN_MASKED_DIGITS = 5
 
 
 class ConfigError(Exception):
@@ -35,7 +40,7 @@ def mask_digits(text: str) -> str:
 
     def _mask(match: re.Match[str]) -> str:
         digits = re.sub(r"[^0-9]", "", match.group(0))
-        if len(digits) < 5:
+        if len(digits) < _MIN_MASKED_DIGITS:
             return match.group(0)
         return f"***{digits[-4:]}"
 

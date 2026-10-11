@@ -14,7 +14,10 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
 ]
-dependencies = []
+dependencies = [
+    "pydantic>=2.7,<3",
+    "pyyaml>=6.0.1,<7",
+]
 
 [project.urls]
 Source = "https://github.com/mcflycodes/vrm-alert-relay"
@@ -30,6 +33,7 @@ dev = [
     "pytest",
     "pytest-cov",
     "ruff",
+    "types-pyyaml",
 ]
 
 [build-system]
@@ -81,8 +85,23 @@ select = [
     "W",     # pycodestyle warnings
 ]
 
+[tool.ruff.lint.flake8-type-checking]
+# pydantic resolves model annotations at runtime, so their imports must not be
+# moved into type-checking blocks.
+runtime-evaluated-base-classes = ["pydantic.BaseModel"]
+
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "PLR2004"]
+"tests/**" = [
+    "S101",
+    "PLR2004",
+    "ANN401",   # fixtures and test doubles take arbitrary data
+    "ARG",      # test doubles and parametrized lambdas must match the real signature
+    "FBT001",   # parametrized boolean arguments are passed by name
+    "PLR0913",  # fixtures and parameters are injected by name
+    "PLR0917",  # same, counted as positional arguments
+    "SLF001",   # tests reach into private members on purpose
+    "TRY003",   # test doubles raise with ad-hoc messages
+]
 
 [tool.mypy]
 python_version = "3.13"

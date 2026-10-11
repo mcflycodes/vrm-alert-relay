@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import yaml
 
 from vrm_alert_relay.config import ConfigError, RelayConfig, parse_config
 
-EXAMPLE_CONFIG = (
-    Path(__file__).resolve().parents[2] / "examples" / "config.example.yaml"
-)
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+EXAMPLE_CONFIG = Path(__file__).resolve().parents[2] / "examples" / "config.example.yaml"
 FAKE_CREDENTIAL = "fake-secret-for-tests-only"
 
 
@@ -159,9 +159,7 @@ def write_config(tmp_path: Path) -> Callable[[Any], Path]:
         if isinstance(data, bytes):
             path.write_bytes(data)
         else:
-            path.write_text(
-                data if isinstance(data, str) else dump(data), encoding="utf-8"
-            )
+            path.write_text(data if isinstance(data, str) else dump(data), encoding="utf-8")
         return path
 
     return _write
@@ -171,9 +169,7 @@ def write_config(tmp_path: Path) -> Callable[[Any], Path]:
 def secret_file(secrets_dir: Path) -> Callable[..., str]:
     """Write an obviously fake secret file and return its path."""
 
-    def _write(
-        name: str, content: str | bytes = FAKE_CREDENTIAL + "\n", mode: int = 0o600
-    ) -> str:
+    def _write(name: str, content: str | bytes = FAKE_CREDENTIAL + "\n", mode: int = 0o600) -> str:
         path = secrets_dir / name
         if isinstance(content, bytes):
             path.write_bytes(content)

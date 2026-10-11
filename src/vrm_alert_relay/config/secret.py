@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import hmac
-import os
 import re
 import stat
 from dataclasses import dataclass
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 
-from pydantic import GetCoreSchemaHandler
 from pydantic_core import CoreSchema, core_schema
 
 from ._files import FileProblem, FileReadError, read_regular_file
+
+if TYPE_CHECKING:
+    import os
+
+    from pydantic import GetCoreSchemaHandler
 
 __all__ = [
     "MAX_SECRET_BYTES",
@@ -39,7 +42,7 @@ class Secret:
 
     def __init__(self, value: str) -> None:
         if not isinstance(value, str):
-            raise TypeError("Secret value must be a string")
+            raise TypeError("Secret value must be a string")  # noqa: TRY003 -- fixed text
         self._value = value
 
     def reveal(self) -> str:
@@ -69,7 +72,7 @@ class Secret:
         return self
 
     def __reduce__(self) -> NoReturn:
-        raise TypeError("Secret values cannot be pickled")
+        raise TypeError("Secret values cannot be pickled")  # noqa: TRY003 -- fixed text
 
     @classmethod
     def __get_pydantic_core_schema__(
@@ -148,21 +151,21 @@ def read_secret_file(path: str | os.PathLike[str]) -> SecretFile:
     except FileReadError as exc:
         failure = exc
     if failure is not None:
-        reason = _FILE_PROBLEMS.get(
-            failure.problem, f"secret file cannot be read ({failure.code})"
-        )
+        reason = _FILE_PROBLEMS.get(failure.problem, f"secret file cannot be read ({failure.code})")
         raise SecretFileError(reason, missing=failure.problem is FileProblem.MISSING)
 
     text = _decode(content.data)
     if text is None:
-        raise SecretFileError("secret file is not valid UTF-8")
+        raise SecretFileError("secret file is not valid UTF-8")  # noqa: TRY003 -- fixed text
     if text.endswith("\r\n"):
         text = text[:-2]
     elif text.endswith("\n"):
         text = text[:-1]
     if not text:
-        raise SecretFileError("secret file is empty")
+        raise SecretFileError("secret file is empty")  # noqa: TRY003 -- fixed text
     if _CONTROL.search(text):
-        raise SecretFileError("secret file contains line breaks or control characters")
+        raise SecretFileError(  # noqa: TRY003 -- fixed operator-facing text
+            "secret file contains line breaks or control characters"
+        )
     permissive = bool(content.mode & (stat.S_IRGRP | stat.S_IROTH))
     return SecretFile(secret=Secret(text), group_or_world_readable=permissive)

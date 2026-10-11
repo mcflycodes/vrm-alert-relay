@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import ipaddress
-import os
 import re
 from collections.abc import Mapping
-from typing import Any, NoReturn, Self
+from collections.abc import Set as AbstractSet
+from typing import TYPE_CHECKING, Any, NoReturn, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
-from pydantic_core import ErrorDetails
 
 from ._files import FileProblem, FileReadError, read_regular_file
 from ._paths import SourceMap, describe
 from .errors import ConfigError, format_path
-from .fields import FieldProblem
+from .fields import FieldValueError
 from .models import (
     PROVIDER_NAMES,
     SUPPORTED_VERSIONS,
@@ -25,6 +24,11 @@ from .models import (
 )
 from .secret import Secret, SecretFileError, SecretTypeError, read_secret_file
 from .yaml_loader import MAX_CONFIG_BYTES, parse_yaml_with_source
+
+if TYPE_CHECKING:
+    import os
+
+    from pydantic_core import ErrorDetails
 
 __all__ = [
     "RelaySecrets",
@@ -71,6 +75,11 @@ _BOUND_MESSAGES = {
     "too_long": ("max_length", "must contain at most {} item(s)"),
 }
 _GENERIC_MESSAGE = "is invalid"
+# Pydantic inserts the discriminator value at this index of recipient error locations.
+_RECIPIENT_TAG_INDEX = 2
+
+# The include/exclude types of pydantic's deprecated ``copy``.
+_IncEx = AbstractSet[int] | AbstractSet[str] | Mapping[int, Any] | Mapping[str, Any] | None
 
 
 class SecretsImmutableError(TypeError):
@@ -83,7 +92,7 @@ class SecretsImmutableError(TypeError):
         )
 
 
-def _only_secret_values(values: dict[str, Any]) -> None:
+def _only_secret_values(values: Mapping[str, object]) -> None:
     if not all(value is None or isinstance(value, Secret) for value in values.values()):
         raise SecretTypeError()
 
@@ -111,22 +120,18 @@ class RelaySecrets(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _only_secrets(cls, data: Any) -> Any:
+    def _only_secrets(cls, data: object) -> object:
         if not isinstance(data, dict):
             raise SecretTypeError()
         _only_secret_values(data)
         return data
 
     @classmethod
-    def model_construct(
-        cls, _fields_set: set[str] | None = None, **values: Any
-    ) -> Self:
+    def model_construct(cls, _fields_set: set[str] | None = None, **values: object) -> Self:
         _only_secret_values(values)
         return super().model_construct(_fields_set, **values)
 
-    def model_copy(
-        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
-    ) -> Self:
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
         if update is not None:
             raise SecretsImmutableError()
         return super().model_copy(deep=deep)
@@ -134,8 +139,8 @@ class RelaySecrets(BaseModel):
     def copy(
         self,
         *,
-        include: Any = None,
-        exclude: Any = None,
+        include: _IncEx = None,
+        exclude: _IncEx = None,
         update: dict[str, Any] | None = None,
         deep: bool = False,
     ) -> Self:
@@ -143,10 +148,10 @@ class RelaySecrets(BaseModel):
             raise SecretsImmutableError()
         return super().copy(include=include, exclude=exclude, deep=deep)
 
-    def __replace__(self, **changes: Any) -> Self:
+    def __replace__(self, **changes: object) -> Self:
         raise SecretsImmutableError()
 
-    def __setattr__(self, name: str, value: Any) -> None:
+    def __setattr__(self, name: str, value: object) -> None:
         raise SecretsImmutableError()
 
     def __delattr__(self, name: str) -> None:
@@ -155,7 +160,7 @@ class RelaySecrets(BaseModel):
     def __getstate__(self) -> NoReturn:
         raise SecretsImmutableError()
 
-    def __setstate__(self, state: Any) -> NoReturn:
+    def __setstate__(self, state: object) -> NoReturn:
         raise SecretsImmutableError()
 
     def __repr_args__(self) -> list[tuple[str | None, Any]]:
@@ -170,9 +175,9 @@ class RelaySecrets(BaseModel):
 
 def _error_location(error: ErrorDetails) -> tuple[str | int, ...]:
     loc = tuple(error["loc"])
-    # Pydantic inserts the discriminator value into recipient error locations.
-    if len(loc) >= 3 and loc[0] == "recipients" and loc[2] in PROVIDER_NAMES:
-        loc = (*loc[:2], *loc[3:])
+    tag = _RECIPIENT_TAG_INDEX
+    if len(loc) > tag and loc[0] == "recipients" and loc[tag] in PROVIDER_NAMES:
+        loc = (*loc[:tag], *loc[tag + 1 :])
     if error["type"] in ("union_tag_invalid", "union_tag_not_found"):
         loc = (*loc, "provider")
     return loc
@@ -183,7 +188,7 @@ def _error_message(error: ErrorDetails, loc: tuple[str | int, ...]) -> str:
     ctx = error.get("ctx") or {}
     if kind == "value_error":
         cause = ctx.get("error")
-        return str(cause) if isinstance(cause, FieldProblem) else _GENERIC_MESSAGE
+        return str(cause) if isinstance(cause, FieldValueError) else _GENERIC_MESSAGE
     if kind == "extra_forbidden":
         key = loc[-1] if loc else None
         if isinstance(key, str) and _INLINE_SECRET_KEY.fullmatch(key):
@@ -192,32 +197,28 @@ def _error_message(error: ErrorDetails, loc: tuple[str | int, ...]) -> str:
         return f"is required; {SUPPORTED_VERSIONS_TEXT}"
     if kind == "literal_error":
         expected = ctx.get("expected")
-        return (
-            f"must be one of {expected}"
-            if isinstance(expected, str)
-            else _GENERIC_MESSAGE
-        )
+        return f"must be one of {expected}" if isinstance(expected, str) else _GENERIC_MESSAGE
     if kind in _BOUND_MESSAGES:
-        name, template = _BOUND_MESSAGES[kind]
-        bound = ctx.get(name)
-        if isinstance(bound, int | float) and not isinstance(bound, bool):
-            return template.format(bound)
-        return _GENERIC_MESSAGE
+        return _bound_message(kind, ctx)
     return _FIXED_MESSAGES.get(kind, _GENERIC_MESSAGE)
+
+
+def _bound_message(kind: str, ctx: Mapping[str, object]) -> str:
+    name, template = _BOUND_MESSAGES[kind]
+    bound = ctx.get(name)
+    if isinstance(bound, int | float) and not isinstance(bound, bool):
+        return template.format(bound)
+    return _GENERIC_MESSAGE
 
 
 def _validation_problems(exc: ValidationError, source: SourceMap) -> list[str]:
     problems: list[str] = []
-    for error in exc.errors(
-        include_url=False, include_input=False, include_context=True
-    ):
+    for error in exc.errors(include_url=False, include_input=False, include_context=True):
         loc = _error_location(error)
         message = _error_message(error, loc)
         if error["type"] == "extra_forbidden":
             # The unrecognized key itself is never shown; its line identifies it.
-            problems.append(
-                describe(loc[:-1], message, source, line=source.line_of(loc))
-            )
+            problems.append(describe(loc[:-1], message, source, line=source.line_of(loc)))
         else:
             problems.append(describe(loc, message, source))
     return problems
@@ -289,9 +290,7 @@ def config_warnings(config: RelayConfig) -> list[str]:
     )
     for name, recipient in config.recipients.items():
         loc = ("recipients", name)
-        if recipient.provider != "log" and not config.providers.is_enabled(
-            recipient.provider
-        ):
+        if recipient.provider != "log" and not config.providers.is_enabled(recipient.provider):
             message = (
                 f"provider '{recipient.provider}' is not enabled; "
                 "messages to this recipient will be logged only"
@@ -301,13 +300,8 @@ def config_warnings(config: RelayConfig) -> list[str]:
             warnings.append(describe(loc, "not used by any rule", positions))
     if not config.rules:
         warnings.append("rules: no rules are configured; nothing will be monitored")
-    if (
-        config.health.enabled
-        and not ipaddress.ip_address(config.health.bind).is_loopback
-    ):
-        warnings.append(
-            "health.bind: the health endpoint listens on a non-loopback address"
-        )
+    if config.health.enabled and not ipaddress.ip_address(config.health.bind).is_loopback:
+        warnings.append("health.bind: the health endpoint listens on a non-loopback address")
     return warnings
 
 

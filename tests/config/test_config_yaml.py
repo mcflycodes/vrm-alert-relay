@@ -13,8 +13,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
-from vrm_alert_relay.config import ConfigError, load_config, parse_config
+from vrm_alert_relay.config import ConfigError, load_config, parse_config, yaml_loader
 from vrm_alert_relay.config.yaml_loader import (
     MAX_COLLECTION_ITEMS,
     MAX_CONFIG_BYTES,
@@ -59,9 +60,7 @@ def test_anchors_and_aliases_are_rejected(problems: Problems, text: str) -> None
 
 
 def test_duplicate_top_level_key_is_rejected(problems: Problems) -> None:
-    assert problems("vrm: {}\nsending: {}\nvrm: {}\n") == (
-        "<root>: duplicate key (line 3)",
-    )
+    assert problems("vrm: {}\nsending: {}\nvrm: {}\n") == ("<root>: duplicate key (line 3)",)
 
 
 def test_duplicate_nested_key_reports_its_parent_path(problems: Problems) -> None:
@@ -107,9 +106,7 @@ def test_merge_keys_are_rejected(problems: Problems) -> None:
     "text",
     [
         "a: " + "[" * 40 + "]" * 40 + "\n",
-        "".join("  " * depth + f"k{depth}:\n" for depth in range(30))
-        + "  " * 30
-        + "v\n",
+        "".join("  " * depth + f"k{depth}:\n" for depth in range(30)) + "  " * 30 + "v\n",
         "a: " + "[" * 100_000,
     ],
     ids=["flow", "block", "unterminated"],
@@ -133,9 +130,7 @@ def test_oversized_sequence_is_rejected(problems: Problems) -> None:
 
 
 def test_oversized_mapping_is_rejected(problems: Problems) -> None:
-    text = "recipients:\n" + "".join(
-        f"  r{i}: x\n" for i in range(MAX_COLLECTION_ITEMS + 1)
-    )
+    text = "recipients:\n" + "".join(f"  r{i}: x\n" for i in range(MAX_COLLECTION_ITEMS + 1))
     assert problems(text) == (f"recipients: more than {MAX_COLLECTION_ITEMS} keys",)
 
 
@@ -143,9 +138,7 @@ def test_oversized_file_is_rejected(write_config: Callable[[Any], Path]) -> None
     path = write_config("# padding\n" * (MAX_CONFIG_BYTES // 10 + 1))
     with pytest.raises(ConfigError) as caught:
         load_config(path)
-    assert caught.value.problems == (
-        f"configuration file: larger than {MAX_CONFIG_BYTES} bytes",
-    )
+    assert caught.value.problems == (f"configuration file: larger than {MAX_CONFIG_BYTES} bytes",)
 
 
 @pytest.mark.parametrize("as_bytes", [True, False])
@@ -187,16 +180,12 @@ def test_multiple_documents_are_rejected(problems: Problems) -> None:
         ),
     ],
 )
-def test_yaml_errors_use_fixed_messages(
-    problems: Problems, text: str, expected: str
-) -> None:
+def test_yaml_errors_use_fixed_messages(problems: Problems, text: str, expected: str) -> None:
     assert problems(text) == (expected,)
 
 
 def test_invalid_utf8_is_rejected(problems: Problems) -> None:
-    assert problems(b"sending: {enabled: \xff}\n") == (
-        "configuration is not valid UTF-8",
-    )
+    assert problems(b"sending: {enabled: \xff}\n") == ("configuration is not valid UTF-8",)
 
 
 def test_utf8_byte_order_mark_is_accepted() -> None:
@@ -226,10 +215,6 @@ def test_syntax_errors_do_not_echo_source_lines(problems: Problems) -> None:
 def test_yaml_error_without_mark_has_generic_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import yaml
-
-    from vrm_alert_relay.config import yaml_loader
-
     def explode(self: Any) -> None:
         raise yaml.YAMLError("raw message with fake-secret-for-tests-only")
 
@@ -240,10 +225,6 @@ def test_yaml_error_without_mark_has_generic_message(
 
 
 def test_marked_error_without_problem_mark(monkeypatch: pytest.MonkeyPatch) -> None:
-    import yaml
-
-    from vrm_alert_relay.config import yaml_loader
-
     def explode(self: Any) -> None:
         raise yaml.MarkedYAMLError(context="while testing")
 
@@ -302,9 +283,7 @@ def test_load_config_oversize_fails_fast(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_bytes(b"#" * (MAX_CONFIG_BYTES + 1))
     error = _load_within(path)
-    assert error.problems == (
-        f"configuration file: larger than {MAX_CONFIG_BYTES} bytes",
-    )
+    assert error.problems == (f"configuration file: larger than {MAX_CONFIG_BYTES} bytes",)
 
 
 @pytest.mark.parametrize(

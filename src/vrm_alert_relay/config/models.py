@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import (
     AfterValidator,
@@ -21,7 +21,7 @@ from pydantic import (
 from .errors import ConfigError, format_path
 from .fields import (
     BindAddress,
-    FieldProblem,
+    FieldValueError,
     HaServiceName,
     HeaderName,
     HttpsUrl,
@@ -75,9 +75,7 @@ SUPPORTED_VERSIONS: tuple[int, ...] = (1,)
 SUPPORTED_VERSIONS_TEXT = "this release supports configuration version " + ", ".join(
     str(v) for v in SUPPORTED_VERSIONS
 )
-UNSUPPORTED_VERSION_MESSAGE = (
-    f"unsupported configuration version; {SUPPORTED_VERSIONS_TEXT}"
-)
+UNSUPPORTED_VERSION_MESSAGE = f"unsupported configuration version; {SUPPORTED_VERSIONS_TEXT}"
 
 type ProviderName = Literal["voipms", "homeassistant", "webhook", "log"]
 PROVIDER_NAMES: tuple[ProviderName, ...] = ("voipms", "homeassistant", "webhook", "log")
@@ -85,7 +83,7 @@ PROVIDER_NAMES: tuple[ProviderName, ...] = ("voipms", "homeassistant", "webhook"
 
 def _check_version(value: int) -> int:
     if value not in SUPPORTED_VERSIONS:
-        raise FieldProblem(UNSUPPORTED_VERSION_MESSAGE)
+        raise FieldValueError(UNSUPPORTED_VERSION_MESSAGE)
     return value
 
 
@@ -109,9 +107,7 @@ def _empty_recipients() -> Mapping[str, Recipient]:
 
 
 class _Model(BaseModel):
-    model_config = ConfigDict(
-        extra="forbid", strict=True, frozen=True, hide_input_in_errors=True
-    )
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True, hide_input_in_errors=True)
 
 
 class SendingConfig(_Model):
@@ -199,9 +195,7 @@ class ProvidersConfig(_Model):
         """Whether the provider section enables it. ``log`` is always available."""
         if provider == "log":
             return True
-        section: VoipmsProvider | HomeAssistantProvider | WebhookProvider = getattr(
-            self, provider
-        )
+        section: VoipmsProvider | HomeAssistantProvider | WebhookProvider = getattr(self, provider)
         return section.enabled
 
 
@@ -270,7 +264,7 @@ class RelayConfig(_Model):
     @field_serializer("recipients", mode="wrap")
     def _serialize_recipients(
         self, value: Mapping[str, Recipient], handler: SerializerFunctionWrapHandler
-    ) -> Any:
+    ) -> object:
         return handler(dict(value))
 
     @model_validator(mode="after")
@@ -293,17 +287,11 @@ class RelayConfig(_Model):
         Raises ``KeyError`` for a recipient that is not configured.
         """
         provider = self.recipients[recipient].provider
-        return (
-            DeliveryMode.LIVE
-            if self.provider_is_live(provider)
-            else DeliveryMode.DRY_RUN
-        )
+        return DeliveryMode.LIVE if self.provider_is_live(provider) else DeliveryMode.DRY_RUN
 
     def delivery_modes(self) -> Mapping[str, DeliveryMode]:
         """Delivery mode for every configured recipient."""
-        return MappingProxyType(
-            {name: self.delivery_mode(name) for name in self.recipients}
-        )
+        return MappingProxyType({name: self.delivery_mode(name) for name in self.recipients})
 
     def live_providers(self) -> tuple[ProviderName, ...]:
         return tuple(p for p in PROVIDER_NAMES if self.provider_is_live(p))
@@ -312,9 +300,7 @@ class RelayConfig(_Model):
         return tuple(p for p in PROVIDER_NAMES if not self.provider_is_live(p))
 
 
-def _required(
-    problems: list[str], loc: tuple[str, ...], value: object, why: str
-) -> None:
+def _required(problems: list[str], loc: tuple[str, ...], value: object, why: str) -> None:
     if value is None:
         problems.append(f"{format_path(loc)}: is required {why}")
 
@@ -338,8 +324,7 @@ def _provider_problems(providers: ProvidersConfig) -> list[str]:
         _required(problems, ("providers", "webhook", "url"), webhook.url, when)
     if (webhook.auth_header_name is None) != (webhook.auth_header_value_file is None):
         problems.append(
-            "providers.webhook: auth_header_name and auth_header_value_file "
-            "must be set together"
+            "providers.webhook: auth_header_name and auth_header_value_file must be set together"
         )
     return problems
 
@@ -353,14 +338,24 @@ def _rule_problems(index: int, rule: Rule, config: RelayConfig) -> list[str]:
             f"{format_path((*base, 'installation'))}: unknown installation "
             "(not listed in vrm.installations)"
         )
+    problems.extend(_level_problems(base, rule))
+    problems.extend(_rule_recipient_problems(base, rule, config))
+    if rule.stale_after_minutes * 60 <= config.vrm.poll_interval:
+        problems.append(
+            f"{format_path((*base, 'stale_after_minutes'))}: must be longer than vrm.poll_interval"
+        )
+    return problems
+
+
+def _level_problems(base: tuple[str | int, ...], rule: Rule) -> list[str]:
+    problems: list[str] = []
     level_names: dict[str, int] = {}
     for level_index, level in enumerate(rule.levels):
         level_loc = (*base, "levels", level_index)
         if level.name in level_names:
             first = format_path((*base, "levels", level_names[level.name], "name"))
             problems.append(
-                f"{format_path((*level_loc, 'name'))}: duplicate level name "
-                f"(same as {first})"
+                f"{format_path((*level_loc, 'name'))}: duplicate level name (same as {first})"
             )
         level_names.setdefault(level.name, level_index)
         if level_index == 0:
@@ -376,6 +371,13 @@ def _rule_problems(index: int, rule: Rule, config: RelayConfig) -> list[str]:
                 f"{format_path((*level_loc, 'threshold'))}: must be less than the "
                 "previous level's threshold for a falling rule"
             )
+    return problems
+
+
+def _rule_recipient_problems(
+    base: tuple[str | int, ...], rule: Rule, config: RelayConfig
+) -> list[str]:
+    problems: list[str] = []
     seen_recipients: dict[str, int] = {}
     for recipient_index, name in enumerate(rule.recipients):
         loc = format_path((*base, "recipients", recipient_index))
@@ -385,11 +387,6 @@ def _rule_problems(index: int, rule: Rule, config: RelayConfig) -> list[str]:
         elif name not in config.recipients:
             problems.append(f"{loc}: unknown recipient (not defined under recipients)")
         seen_recipients.setdefault(name, recipient_index)
-    if rule.stale_after_minutes * 60 <= config.vrm.poll_interval:
-        problems.append(
-            f"{format_path((*base, 'stale_after_minutes'))}: must be longer than "
-            "vrm.poll_interval"
-        )
     return problems
 
 
@@ -402,13 +399,10 @@ def _semantic_problems(config: RelayConfig) -> list[str]:
         if inst.id in seen_ids:
             first = format_path(("vrm", "installations", seen_ids[inst.id], "id"))
             problems.append(
-                f"{format_path((*loc, 'id'))}: duplicate installation id "
-                f"(same as {first})"
+                f"{format_path((*loc, 'id'))}: duplicate installation id (same as {first})"
             )
         if inst.site_id in seen_sites:
-            first = format_path(
-                ("vrm", "installations", seen_sites[inst.site_id], "site_id")
-            )
+            first = format_path(("vrm", "installations", seen_sites[inst.site_id], "site_id"))
             problems.append(
                 f"{format_path((*loc, 'site_id'))}: duplicate site_id (same as {first})"
             )
@@ -417,9 +411,7 @@ def _semantic_problems(config: RelayConfig) -> list[str]:
 
     limits = config.rate_limits
     if limits.global_per_hour > limits.global_per_day:
-        problems.append(
-            "rate_limits.global_per_hour: must not exceed rate_limits.global_per_day"
-        )
+        problems.append("rate_limits.global_per_hour: must not exceed rate_limits.global_per_day")
 
     problems.extend(_provider_problems(config.providers))
 
@@ -428,8 +420,7 @@ def _semantic_problems(config: RelayConfig) -> list[str]:
         if rule.id in rule_ids:
             first = format_path(("rules", rule_ids[rule.id], "id"))
             problems.append(
-                f"{format_path(('rules', index, 'id'))}: duplicate rule id "
-                f"(same as {first})"
+                f"{format_path(('rules', index, 'id'))}: duplicate rule id (same as {first})"
             )
         rule_ids.setdefault(rule.id, index)
         problems.extend(_rule_problems(index, rule, config))

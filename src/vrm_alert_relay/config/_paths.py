@@ -74,7 +74,7 @@ def display_name(name: str, position: int | str) -> str:
     return name if is_displayable_key(name) else f"[#{position}]"
 
 
-def _unwrap(annotation: Any) -> Any:
+def _unwrap(annotation: object) -> object:
     while True:
         origin = get_origin(annotation)
         if isinstance(annotation, TypeAliasType):
@@ -90,7 +90,7 @@ def _unwrap(annotation: Any) -> Any:
             return annotation
 
 
-def _model_fields(annotation: Any) -> dict[str, Any] | None:
+def _model_fields(annotation: object) -> dict[str, Any] | None:
     variants = annotation if isinstance(annotation, tuple) else (annotation,)
     fields: dict[str, Any] = {}
     for variant in variants:
@@ -101,23 +101,25 @@ def _model_fields(annotation: Any) -> dict[str, Any] | None:
     return fields
 
 
-def _sequence_item(annotation: Any) -> Any | None:
+def _sequence_item(annotation: object) -> object | None:
     """Item type of ``tuple[X, ...]``, the only list shape in the schema."""
-    return get_args(annotation)[0] if get_origin(annotation) is tuple else None
+    if get_origin(annotation) is not tuple:
+        return None
+    item: object = get_args(annotation)[0]
+    return item
 
 
-def _mapping_value(annotation: Any) -> Any | None:
+def _mapping_value(annotation: object) -> object | None:
     origin = get_origin(annotation)
     if isinstance(origin, type) and issubclass(origin, Mapping):
-        return get_args(annotation)[1]
+        value: object = get_args(annotation)[1]
+        return value
     return None
 
 
-def render_path(
-    loc: Sequence[str | int], source: SourceMap = _NO_SOURCE
-) -> tuple[str, bool]:
+def render_path(loc: Sequence[str | int], source: SourceMap = _NO_SOURCE) -> tuple[str, bool]:
     """Render ``loc`` safely. Returns the text and whether anything was withheld."""
-    annotation: Any = RelayConfig
+    annotation: object = RelayConfig
     text = ""
     withheld = False
     for index, segment in enumerate(loc):

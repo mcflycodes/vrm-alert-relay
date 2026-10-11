@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from vrm_alert_relay.config import (
@@ -12,6 +12,9 @@ from vrm_alert_relay.config import (
     check_config,
     load_config,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def test_example_is_structurally_valid_in_dry_run(example_path: Path) -> None:
@@ -25,18 +28,14 @@ def test_example_is_structurally_valid_in_dry_run(example_path: Path) -> None:
     assert report.live_recipients == ()
 
 
-def test_example_is_ready_once_the_vrm_token_exists(
-    example_path: Path, tmp_path: Path
-) -> None:
+def test_example_is_ready_once_the_vrm_token_exists(example_path: Path, tmp_path: Path) -> None:
     token = tmp_path / "vrm_token"
     token.write_text("fake-vrm-token-value\n")
     token.chmod(0o600)
     text = example_path.read_text(encoding="utf-8")
     assert "token_file: /run/secrets/vrm_token\n" in text
     copy = tmp_path / "config.yaml"
-    copy.write_text(
-        text.replace("/run/secrets/vrm_token", str(token)), encoding="utf-8"
-    )
+    copy.write_text(text.replace("/run/secrets/vrm_token", str(token)), encoding="utf-8")
     report = check_config(copy)
     assert report.ok is True, report.problems
     assert report.ready is True
@@ -85,6 +84,4 @@ def test_example_contains_only_fictitious_values(example_path: Path) -> None:
     hosts = {urlsplit(url).hostname for url in re.findall(r"https://[^\s\"']+", text)}
     assert hosts == allowed_hosts
     assert not re.search(r"\b(?:10|172|192)\.\d+\.\d+\.\d+\b", text)
-    assert all(
-        path.startswith("/run/secrets/") for path in re.findall(r"_file: (\S+)", text)
-    )
+    assert all(path.startswith("/run/secrets/") for path in re.findall(r"_file: (\S+)", text))

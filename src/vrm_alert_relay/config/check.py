@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from ._paths import display_name
 from .errors import ConfigError
 from .loader import _collect_secrets, config_warnings, load_config
 from .models import DeliveryMode, ProviderName
+
+if TYPE_CHECKING:
+    import os
 
 __all__ = ["STRUCTURE_ONLY_NOTE", "CheckReport", "check_config"]
 
@@ -43,9 +46,7 @@ class CheckReport:
     dry_run_recipients: tuple[str, ...] = ()
 
 
-def check_config(
-    path: str | os.PathLike[str], *, structure_only: bool = False
-) -> CheckReport:
+def check_config(path: str | os.PathLike[str], *, structure_only: bool = False) -> CheckReport:
     """Validate the configuration at ``path`` without contacting any service.
 
     Reads only the configuration file and the secret files it references. The
@@ -66,10 +67,7 @@ def check_config(
     secret_warnings: list[str] = []
     if not structure_only:
         _, problems, secret_warnings = _collect_secrets(config, preflight=True)
-    shown = {
-        name: display_name(name, position)
-        for position, name in enumerate(config.recipients)
-    }
+    shown = {name: display_name(name, position) for position, name in enumerate(config.recipients)}
     modes = config.delivery_modes()
     ok = not problems
     return CheckReport(
@@ -84,10 +82,6 @@ def check_config(
         recipients=len(config.recipients),
         live_providers=config.live_providers(),
         dry_run_providers=config.dry_run_providers(),
-        live_recipients=tuple(
-            shown[n] for n, m in modes.items() if m is DeliveryMode.LIVE
-        ),
-        dry_run_recipients=tuple(
-            shown[n] for n, m in modes.items() if m is DeliveryMode.DRY_RUN
-        ),
+        live_recipients=tuple(shown[n] for n, m in modes.items() if m is DeliveryMode.LIVE),
+        dry_run_recipients=tuple(shown[n] for n, m in modes.items() if m is DeliveryMode.DRY_RUN),
     )
