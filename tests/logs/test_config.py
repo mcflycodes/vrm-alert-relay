@@ -19,6 +19,7 @@ from vrm_alert_relay.logs import (
     configure_logging,
     register_secret,
 )
+from vrm_alert_relay.logs import redaction as redaction_module
 from vrm_alert_relay.logs.config import WITHHELD_MESSAGE
 from vrm_alert_relay.logs.redaction import TRUNCATED
 
@@ -190,6 +191,55 @@ def test_long_exception_keeps_tail(registry: SecretRegistry) -> None:
     assert len(record["exc"]) == 500
     assert record["exc"].startswith(TRUNCATED)
     assert record["exc"].endswith("END-OF-MESSAGE")
+
+
+TAIL_LIMIT = 4096
+FAKE_VALUE_UNIT = "fakeVal9Zq"
+FAKE_FRAGMENT = "Zq"
+
+
+def _long_value(length: int, newline_at: int | None = None) -> str:
+    value = (FAKE_VALUE_UNIT * (length // len(FAKE_VALUE_UNIT) + 1))[:length]
+    if newline_at is None:
+        return value
+    return value[:newline_at] + "\n" + value[newline_at + 1 :]
+
+
+@pytest.mark.parametrize(
+    ("opener", "closer", "newline_at"),
+    [
+        ('settings: password="', '"', None),
+        ('{"token": "', '"}', 1800),
+        ("api_key=", "", None),
+        ("Authorization: Bearer ", "", None),
+        ("GET https://example.test/v2/poll?token=", " HTTP/1.1", None),
+    ],
+    ids=["quoted", "quoted-multiline", "bare", "header", "url-query"],
+)
+def test_tail_truncation_inside_long_sensitive_value_does_not_leak(
+    opener: str, closer: str, newline_at: int | None
+) -> None:
+    value = _long_value(3000, newline_at)
+    head = "Traceback (most recent call last):\n" + "  frame line\n" * 40
+    tail = "\n" + "  later frame line\n" * 160 + "RuntimeError: END-OF-TRACE"
+    into_value = len(value) - (TAIL_LIMIT - len(closer) - len(tail))
+    text = head + opener + value + closer + tail
+    cut = len(text) - TAIL_LIMIT
+    value_start = len(head) + len(opener)
+    assert cut - value_start == into_value
+    assert into_value > redaction_module._CUT_CONTEXT
+    assert FAKE_FRAGMENT not in head + tail
+
+    formatter = JsonFormatter(
+        registry=SecretRegistry(), max_exception_length=TAIL_LIMIT
+    )
+    record = logging.LogRecord("t", logging.ERROR, __file__, 1, "failed", None, None)
+    record.exc_text = text
+    output = json.loads(formatter.format(record))
+    assert output["msg"] == "failed"
+    assert output["exc"].startswith(TRUNCATED)
+    assert output["exc"].endswith("RuntimeError: END-OF-TRACE")
+    assert FAKE_FRAGMENT not in output["exc"]
 
 
 def test_exc_text_without_exc_info(registry: SecretRegistry) -> None:

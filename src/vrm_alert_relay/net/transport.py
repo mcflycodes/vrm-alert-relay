@@ -211,10 +211,11 @@ class _BoundedResolver:
     """Runs lookups on ``DNS_WORKERS`` daemon threads and never queues them.
 
     A lookup takes one of ``DNS_WORKERS`` slots before it is handed to a
-    worker, and the worker frees the slot when the resolver returns. A lookup
-    that outlives its deadline therefore keeps its slot, so stalled lookups
-    can occupy at most ``DNS_WORKERS`` threads; while they do, new lookups
-    fail immediately. Workers are daemon threads, so a resolver call that
+    worker, and the worker frees the slot when the resolver returns; a job
+    that cannot be queued, for example because a worker fails to start, frees
+    its slot at once. A lookup that outlives its deadline therefore keeps its
+    slot, so stalled lookups can occupy at most ``DNS_WORKERS`` threads; while
+    they do, new lookups fail immediately. Workers are daemon threads, so a resolver call that
     never returns does not keep the interpreter from exiting.
     """
 
@@ -236,17 +237,21 @@ class _BoundedResolver:
         if not self._slots.acquire(blocking=False):
             raise _CoreDnsTimeout("all resolver workers are busy")
         job = _Lookup(host, port)
-        with self._lock:
-            if self._closed:
-                self._slots.release()
-                raise httpcore.ConnectError("resolver is closed")
-            while len(self._workers) < DNS_WORKERS:
-                worker = threading.Thread(
-                    target=self._work, name="vrm-alert-relay-dns", daemon=True
-                )
-                worker.start()
-                self._workers.append(worker)
-            self._jobs.put(job)
+        try:
+            with self._lock:
+                if self._closed:
+                    raise httpcore.ConnectError("resolver is closed")
+                while len(self._workers) < DNS_WORKERS:
+                    worker = threading.Thread(
+                        target=self._work, name="vrm-alert-relay-dns", daemon=True
+                    )
+                    worker.start()
+                    self._workers.append(worker)
+                self._jobs.put(job)
+        except BaseException:
+            # Until the job is queued no worker will free the slot.
+            self._slots.release()
+            raise
         if not job.done.wait(wait):
             raise _CoreDnsTimeout("name resolution timed out")
         if isinstance(job.error, OSError | UnicodeError):

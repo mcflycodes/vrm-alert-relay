@@ -28,7 +28,7 @@ from vrm_alert_relay.logs import (
     register_derived_secret,
 )
 from vrm_alert_relay.logs import redaction as redaction_module
-from vrm_alert_relay.logs.lattice import Lattice
+from vrm_alert_relay.logs.lattice import Lattice, escape_edges
 from vrm_alert_relay.logs.redaction import (
     MAX_AMBIGUOUS_CHARACTERS,
     MAX_DEPTH,
@@ -262,6 +262,40 @@ def test_number_of_secrets_is_capped() -> None:
     assert redact_secrets("fictitious-secret-extra", registry) == REDACTED
 
 
+def test_concurrent_registration_of_the_same_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = SecretRegistry()
+    compile_matcher = redaction_module._compile_matcher
+    nested = False
+
+    def racing(value: str) -> Any:
+        nonlocal nested
+        matcher = compile_matcher(value)
+        if not nested:
+            nested = True
+            registry.register(value)
+        return matcher
+
+    monkeypatch.setattr(redaction_module, "_compile_matcher", racing)
+    registry.register("fictitious-pass")
+    assert registry.secrets.count("fictitious-pass") == 1
+    assert redact_secrets("x fictitious-pass", registry) == f"x {REDACTED}"
+
+
+def test_trim_keeps_text_that_only_resembles_an_encoded_prefix(
+    registry: SecretRegistry,
+) -> None:
+    encoded = base64.b64encode(CANARY.encode()).decode()
+    lookalike = encoded[0] + "?"
+    assert registry.trim_partial(lookalike + encoded[:5], "head") == lookalike
+
+
+def test_lone_high_surrogate_escape_before_another_escape() -> None:
+    assert escape_edges("\\ud83d\\u0041", 0) == [(6, "\ud83d")]
+    assert escape_edges("\\ud83d\\n", 0) == [(6, "\ud83d")]
+
+
 def test_repeated_registration_is_a_no_op() -> None:
     registry = SecretRegistry()
     registry.register("fictitious-pass")
@@ -317,6 +351,31 @@ def test_known_limitation_escape_heavy_secret_in_mixed_spelling_is_missed() -> N
         assert not contains_secret(text, registry)
     still_matched = "fict" + "%5C" + "\\" * MAX_AMBIGUOUS_CHARACTERS + "pass"
     assert redact_secrets(f"<{still_matched}>", registry) == f"<{REDACTED}>"
+
+
+def test_known_limitation_fully_byte_encoded_safe_ascii_is_missed() -> None:
+    """Documents the escape-heavy limitation for fully percent-encoded text.
+
+    Canonical ``quote`` and ``quote_plus`` output, which leaves unreserved
+    ASCII as it is, is matched; a spelling that also percent-encodes those
+    characters is not. If this starts failing because the value is now
+    redacted, update the module docstring and this test.
+    """
+    secret = "%" * (MAX_AMBIGUOUS_CHARACTERS + 1) + "abc"
+    registry = SecretRegistry()
+    registry.register(secret)
+    for canonical in (
+        secret,
+        quote(secret, safe=""),
+        quote_plus(secret, safe=""),
+        quote(secret, safe="").lower(),
+    ):
+        assert redact_secrets(f"<{canonical}>", registry) == f"<{REDACTED}>"
+    fully_encoded = "".join(f"%{byte:02X}" for byte in secret.encode())
+    assert fully_encoded == "%25%25%25%25%25%25%25%61%62%63"
+    for text in (fully_encoded, fully_encoded.lower()):
+        assert redact_secrets(f"<{text}>", registry) == f"<{text}>"
+        assert not contains_secret(text, registry)
 
 
 def test_backtracking_is_bounded_for_hostile_input() -> None:
@@ -648,6 +707,85 @@ def test_cut_moves_out_of_sensitive_values() -> None:
     assert "0143" not in redact_text(tail_phone, registry=registry, keep="tail")
     url = "https://user:fictitious@example.com/?q=1 "
     assert "user" not in redact_text("z" * (2048 - 12) + url, registry=registry)
+
+
+CONTEXT = redaction_module._CUT_CONTEXT
+
+
+def kept(text: str, position: int) -> str:
+    return text[redaction_module._tail_start(text, position) :]
+
+
+def test_tail_start_keeps_positions_outside_sensitive_values() -> None:
+    assert kept("plain words\nnext line", 12) == "next line"
+    assert kept("plain words and more", 8) == "rds and more"
+    assert kept("Zq" * 10, 5) == ("Zq" * 10)[5:]
+    long_run = "Zq" * 1000
+    assert kept(long_run, 1500) == long_run[1500:]
+    assert kept("it's fine\nZq more", 11) == "q more"
+
+
+def test_tail_start_moves_past_line_bound_values() -> None:
+    text = "x password=Zq123Zq after"
+    assert kept(text, text.index("123")) == " after"
+    header = "Authorization: Bearer " + "Zq" * 2000 + "\nnext"
+    assert kept(header, 100) == "next"
+    url = "see https://example.test/?token=" + "Zq" * 100
+    assert kept(url, len(url) - 50) == ""
+    assert redact_text(url, registry=SecretRegistry(), max_length=60, keep="tail") == (
+        TRUNCATED
+    )
+
+
+def test_tail_start_drops_overlong_lines() -> None:
+    line = "a" * (redaction_module._MAX_LINE_SCAN + 10)
+    assert kept(line + "tail", len(line) - 5) == ""
+    assert kept(line + "\nnext", len(line) - 5) == "next"
+
+
+def test_tail_start_moves_past_open_quoted_values() -> None:
+    text = 'password="' + "A" * 10 + "\n" + "Zq" * 10 + '" after'
+    assert kept(text, text.index("Zq") + 3) == " after"
+    escaped = 'password="a\\"b\nZqZq\\"Zq" after'
+    assert kept(escaped, escaped.index("ZqZq") + 2) == " after"
+    unclosed = 'password="' + "A" * 10 + "\n" + "Zq" * 10
+    assert kept(unclosed, unclosed.index("Zq") + 3) == ""
+
+
+def test_tail_start_treats_unknown_escapes_as_open() -> None:
+    long_run = "x" + "\\" * (CONTEXT + 5) + '"' + "\nZq"
+    assert kept(long_run, len(long_run) - 1) == ""
+    many = 'password="' + '\\"' * (redaction_module._MAX_QUOTE_CANDIDATES + 5)
+    many += "\nZq"
+    assert kept(many, len(many) - 1) == ""
+
+
+def test_tail_start_moves_past_values_after_multiline_separators() -> None:
+    text = "token=\n\n   " + "Zq" * 50 + " after"
+    assert kept(text, text.index("Zq") + 9) == " after"
+    split = "secret\n=" + "Zq" * 20 + " after"
+    assert kept(split, split.index("Zq") + 9) == " after"
+    spaced = "token=" + "\n" * (CONTEXT + 50) + "Zq" * 20 + " after"
+    assert kept(spaced, spaced.index("Zq") + 9) == " after"
+    quoted = "password=" + "\n" * (CONTEXT + 50) + '"' + "Zq" * 20 + "\nZq" + '" after'
+    assert kept(quoted, len(quoted) - 9) == " after"
+
+
+def test_tail_start_withholds_after_too_many_moves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = 'password="' + "A" * 10 + "\n" + "Zq" * 10 + '" after'
+    monkeypatch.setattr(redaction_module, "_MAX_TAIL_STEPS", 1)
+    assert kept(text, text.index("Zq") + 3) == ""
+
+
+def test_tail_truncation_inside_long_values_is_fast() -> None:
+    hostile = ('token="' + "\\" * 3 + "Zq " * 30 + "\n") * 2000
+    start = time.perf_counter()
+    for keep_from in range(0, len(hostile), len(hostile) // 50):
+        kept(hostile, keep_from)
+    redact_text(hostile, registry=SecretRegistry(), keep="tail")
+    assert time.perf_counter() - start < 2.0
 
 
 def test_detection_finds_every_regex_match() -> None:

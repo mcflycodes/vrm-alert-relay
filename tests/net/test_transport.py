@@ -393,6 +393,30 @@ def test_unexpected_resolver_errors_propagate_and_free_the_worker() -> None:
     resolver.close()
 
 
+def test_worker_start_failures_release_their_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failures = DNS_WORKERS
+
+    class FailingThread(threading.Thread):
+        def start(self) -> None:
+            nonlocal failures
+            if failures:
+                failures -= 1
+                raise RuntimeError("can't start new thread")
+            super().start()
+
+    monkeypatch.setattr(threading, "Thread", FailingThread)
+    resolver = transport_module._BoundedResolver(lambda host, port: [address()])
+    for _ in range(DNS_WORKERS):
+        with pytest.raises(RuntimeError, match="start new thread"):
+            resolver.lookup("relay.example.com", 443, 1.0)
+    assert resolver._workers == []
+    assert resolver.lookup("relay.example.com", 443, 1.0) == [address()]
+    assert len(resolver._workers) == DNS_WORKERS
+    resolver.close()
+
+
 def test_resolver_workers_are_daemon_threads_that_stop_on_close() -> None:
     resolver = transport_module._BoundedResolver(lambda host, port: [address()])
     resolver.lookup("relay.example.com", 443, 1.0)

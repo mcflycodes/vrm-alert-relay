@@ -13,7 +13,10 @@ Applied, in this order, to every string that reaches a log line:
 
 A string longer than its limit is cut to the limit before step 1, so
 matching cost is bounded by the field limit. Any part of a secret that runs
-across the cut (in any matched encoding) is dropped with it.
+across the cut (in any matched encoding) is dropped with it. When the tail is
+kept, a cut that may fall inside a sensitive value moves forward past the
+value's end, or to the next line or closing quote when its start lies outside
+the examined context; if there is none, the whole field is withheld.
 
 Structured values (mappings, sequences) are redacted recursively with bounded
 depth, item count and total size, and values under sensitive keys are replaced
@@ -47,9 +50,14 @@ text spells some of those characters with an encoding that itself starts
 with ``\\`` or ``%`` (``\\\\``, ``\\u005c`` or ``\\x5c`` for ``\\``;
 ``%25`` for ``%``) while spelling other characters differently, for
 example the secret ``"fict" + "\\\\" * 7 + "pass"`` written with only its
-first backslash JSON-escaped. Spellings that are entirely
-literal, entirely ``repr``-, JSON- or percent-encoded, or that encode
-``\\`` as ``%5C`` and ``%`` as ``\\u0025`` are still matched.
+first backslash JSON-escaped. Spellings that are entirely literal, that are
+the exact output of ``repr``, ``json.dumps`` (with or without
+``ensure_ascii``) or urllib's ``quote`` and ``quote_plus`` (percent hex in
+either case), or that encode ``\\`` as ``%5C`` and ``%`` as ``\\u0025`` are
+still matched. Those encoders leave unreserved ASCII such as letters and
+digits as they are; a spelling that also encodes those characters is part of
+this limitation, so the secret ``"%%%%%%%abc"`` written fully byte-encoded as
+``%25%25%25%25%25%25%25%61%62%63`` is missed.
 
 Encodings of a composite value are not built from the encodings of its
 parts: base64 of ``user:password`` does not contain base64 of ``password``.
@@ -67,7 +75,7 @@ import re
 import threading
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, cast
 from urllib.parse import quote, quote_plus
 
 from vrm_alert_relay.logs.lattice import Lattice
@@ -117,6 +125,22 @@ _PHONE_RE = re.compile(
 _PHONEISH_RE = re.compile(r"\+?[\d\s().\-]+")
 _CUT_PATTERNS: Final = (_URL_RE, _QUOTED_KV_RE, _HEADER_KV_RE, _BARE_KV_RE, _PHONE_RE)
 _CUT_CONTEXT: Final = 1024
+_MAX_TAIL_STEPS: Final = 32
+_MAX_LINE_SCAN: Final = 8 * _CUT_CONTEXT
+_MAX_QUOTE_CANDIDATES: Final = 64
+_SCHEME = r"(?:bearer|basic|digest|token)"
+_BARE_STOP_RE = re.compile(r"[\s\"'&,;)}\]]")
+_QUOTED_OPEN_RE = re.compile(rf"{_KEY_TEXT}[\"']?\s*[:=]\s*\Z", re.IGNORECASE)
+_BARE_OPEN_RE = re.compile(
+    rf"{_KEY_TEXT}[\"']?\s*[:=]\s*[\"']?(?:{_SCHEME}\s+)?\Z", re.IGNORECASE
+)
+_KEY_END_RE = re.compile(rf"{_KEY_TEXT}[\"']?\s*\Z", re.IGNORECASE)
+_OPEN_TAIL_RE = re.compile(
+    rf"[\w-]{{0,64}}[\"']?\s*(?:[:=]\s*[\"']?)?(?:{_SCHEME}\s+)?", re.IGNORECASE
+)
+_BARE_REST_RE = re.compile(
+    rf"[\"']?\s*(?:[:=]\s*[\"']?)?(?:{_SCHEME}\s+)?[^\s\"'&,;)}}\]]*", re.IGNORECASE
+)
 _NON_DIGIT_RE = re.compile(r"\D")
 _PERCENT_ESCAPE_RE = re.compile(r"%[0-9A-F]{2}")
 _BACKSLASH_ESCAPES: Final = {
@@ -474,10 +498,14 @@ def redact_text(
 def _cut(text: str, limit: int, keep: Keep) -> str:
     """Cut ``text`` to ``limit``, moving the cut out of any URL, key-value or phone number.
 
-    Only matches within ``_CUT_CONTEXT`` characters of the cut are
-    considered, which bounds the cost.
+    With ``keep="head"`` only matches within ``_CUT_CONTEXT`` characters of
+    the cut are considered, which bounds the cost: a construct that starts
+    before them keeps its key in the retained text and is redacted later.
+    With ``keep="tail"`` see :func:`_tail_start`.
     """
-    position = len(text) - limit if keep == "tail" else limit
+    if keep == "tail":
+        return text[_tail_start(text, len(text) - limit) :]
+    position = limit
     low = max(position - _CUT_CONTEXT, 0)
     window = text[low : position + _CUT_CONTEXT]
     relative = position - low
@@ -489,10 +517,151 @@ def _cut(text: str, limit: int, keep: Keep) -> str:
         moved = False
         for start, end in spans:
             if start < relative < end:
-                relative = end if keep == "tail" else start
+                relative = start
                 moved = True
-    position = low + relative
-    return text[position:] if keep == "tail" else text[:position]
+    return text[: low + relative]
+
+
+def _tail_start(text: str, position: int) -> int:
+    """Where text kept from ``position`` to the end may safely start.
+
+    A tail that starts inside a sensitive value has lost the key, header
+    name or URL scheme that later redaction relies on, so the start moves
+    forward until it is shown to be outside every such construct: past the
+    end of a line-bound one (URL, header, bare value, phone number), past the
+    closing quote of a quoted value, past the value after a key whose
+    separator runs across lines. Where that cannot be shown within the
+    bounded context the start moves to the next line or closing quote, and
+    with none left the whole field is withheld. Searches of the discarded
+    text are plain substring scans; regular expressions see at most
+    ``_MAX_LINE_SCAN`` characters of the current line and ``_CUT_CONTEXT``
+    characters before a quote or value.
+    """
+    for _ in range(_MAX_TAIL_STEPS):
+        if position >= len(text):
+            break
+        moved = _after_line_construct(text, position)
+        if moved == position:
+            moved = _after_open_quote(text, position)
+        if moved == position:
+            moved = _after_open_bare_value(text, position)
+        if moved == position:
+            return position
+        position = moved
+    return len(text)
+
+
+def _next_line(text: str, position: int) -> int:
+    ends = [
+        end
+        for end in (text.find("\n", position), text.find("\r", position))
+        if end != -1
+    ]
+    return min(ends) + 1 if ends else len(text)
+
+
+def _after_line_construct(text: str, position: int) -> int:
+    """Move past a URL, key-value or phone number on this line that covers ``position``."""
+    line = max(text.rfind("\n", 0, position), text.rfind("\r", 0, position)) + 1
+    if line == position:
+        return position
+    if position - line > _MAX_LINE_SCAN:
+        return _next_line(text, position)
+    endpos = min(len(text), position + _CUT_CONTEXT)
+    for pattern in _CUT_PATTERNS:
+        for match in pattern.finditer(text, line, endpos):
+            start, end = match.span()
+            if start < position < end:
+                return (
+                    end
+                    if end < endpos or endpos == len(text)
+                    else _next_line(text, position)
+                )
+    return position
+
+
+def _escaped(text: str, index: int) -> bool | None:
+    """Whether the character at ``index`` follows an odd run of backslashes.
+
+    None when the run is longer than ``_CUT_CONTEXT``.
+    """
+    start = max(index - _CUT_CONTEXT, 0)
+    before = text[start:index]
+    run = len(before) - len(before.rstrip("\\"))
+    if run == len(before) and start > 0:
+        return None
+    return run % 2 == 1
+
+
+def _after_open_quote(text: str, position: int) -> int:
+    """Move past the closing quote of a sensitive quoted value open at ``position``.
+
+    Inside such a value every quote of its kind is escaped, so the value
+    opened at the last unescaped quote before ``position``.
+    """
+    for quote_char in "\"'":
+        opened = _last_unescaped(text, quote_char, position)
+        if opened == -1:
+            continue
+        if opened is not None:
+            region_start = max(opened - _CUT_CONTEXT, 0)
+            region = text[region_start:opened]
+            if not _QUOTED_OPEN_RE.search(region) and not (
+                region_start > 0 and _OPEN_TAIL_RE.fullmatch(region)
+            ):
+                continue
+        closing = _next_unescaped(text, quote_char, position)
+        return len(text) if closing == -1 else closing + 1
+    return position
+
+
+def _last_unescaped(text: str, quote_char: str, end: int) -> int | None:
+    """Index of the last unescaped ``quote_char`` before ``end``, -1, or None if unknown."""
+    index = text.rfind(quote_char, 0, end)
+    for _ in range(_MAX_QUOTE_CANDIDATES):
+        if index == -1:
+            return -1
+        escaped = _escaped(text, index)
+        if escaped is None:
+            return None
+        if not escaped:
+            return index
+        index = text.rfind(quote_char, 0, index)
+    return None
+
+
+def _next_unescaped(text: str, quote_char: str, start: int) -> int:
+    """Index of the first certainly unescaped ``quote_char`` from ``start``, or -1."""
+    index = text.find(quote_char, start)
+    while index != -1 and _escaped(text, index) is not False:
+        index = text.find(quote_char, index + 1)
+    return index
+
+
+def _after_open_bare_value(text: str, position: int) -> int:
+    """Move past a bare value whose key ends before the value run around ``position``.
+
+    Covers separators that run across lines (``token=`` then a newline),
+    which :func:`_after_line_construct` cannot see.
+    """
+    region_start = max(position - _CUT_CONTEXT, 0)
+    if position > 0 and not _BARE_STOP_RE.match(text, position - 1):
+        stop = _BARE_STOP_RE.search(text[region_start:position][::-1])
+        if stop is None:
+            return position
+        value = position - stop.start()
+    else:
+        value = position
+    region_start = max(value - _CUT_CONTEXT, 0)
+    region = text[region_start:value]
+    if not (
+        _BARE_OPEN_RE.search(region)
+        or (_KEY_END_RE.search(region) and text[value : value + 1] in (":", "="))
+        or (region_start > 0 and _OPEN_TAIL_RE.fullmatch(region))
+    ):
+        return position
+    rest = cast(re.Match[str], _BARE_REST_RE.match(text, value))
+    return max(rest.end(), position)
 
 
 JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
