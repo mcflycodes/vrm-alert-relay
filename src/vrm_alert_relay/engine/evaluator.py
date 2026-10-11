@@ -14,7 +14,6 @@ from .models import (
     Direction,
     Event,
     EventKind,
-    InvalidRuleStateError,
     LevelCount,
     LevelTime,
     RuleSpec,
@@ -42,15 +41,15 @@ def _usable_sample(sample: object, now: datetime) -> Sample | None:
         return None
     value = sample.value
     timestamp = sample.timestamp
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or not _aware(timestamp)
-    ):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    future_by = _elapsed(timestamp, now)
-    if future_by > FUTURE_TOLERANCE:
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        return None
+    if not finite or not _aware(timestamp):
+        return None
+    if _elapsed(timestamp, now) > FUTURE_TOLERANCE:
         return None
     return sample
 
@@ -67,9 +66,7 @@ def _mapping_increment(
     values: tuple[LevelCount, ...], name: str
 ) -> tuple[tuple[LevelCount, ...], int]:
     updated = {key: value for key, value in values}
-    ordinal = updated.get(name, 0) + 1
-    if ordinal > MAX_COUNTER:
-        ordinal = MAX_COUNTER
+    ordinal = min(updated.get(name, 0) + 1, MAX_COUNTER)
     updated[name] = ordinal
     return tuple(sorted(updated.items())), ordinal
 
@@ -80,9 +77,17 @@ def _event_id(
     kind: EventKind,
     level: str | None,
     ordinal: int,
+    discriminator: datetime,
 ) -> str:
     identity = json.dumps(
-        [rule_id, episode, kind.value, level, ordinal],
+        [
+            rule_id,
+            episode,
+            kind.value,
+            level,
+            ordinal,
+            discriminator.isoformat(),
+        ],
         ensure_ascii=True,
         separators=(",", ":"),
     ).encode()
@@ -98,7 +103,12 @@ def _event(
     ordinal: int,
     value: float | None,
     sample_time: datetime | None,
+    now: datetime,
 ) -> Event:
+    cycle_kind = kind in (EventKind.STALE, EventKind.RESTORED)
+    discriminator = state.stale_started_at if cycle_kind else state.episode_started_at
+    if discriminator is None:
+        discriminator = now
     return Event(
         rule_id=rule.rule_id,
         episode=state.episode,
@@ -106,7 +116,14 @@ def _event(
         level=level,
         value=value,
         sample_time=sample_time,
-        event_id=_event_id(rule.rule_id, state.episode, kind, level, ordinal),
+        event_id=_event_id(
+            rule.rule_id,
+            state.episode,
+            kind,
+            level,
+            ordinal,
+            discriminator,
+        ),
     )
 
 
@@ -136,13 +153,73 @@ def _retained_level(rule: RuleSpec, value: float, maximum: int) -> int | None:
     return result
 
 
+def _active_index(rule: RuleSpec, state: RuleState) -> int | None:
+    if state.active_level is None:
+        return None
+    return next(
+        (
+            index
+            for index, level in enumerate(rule.levels)
+            if level.name == state.active_level
+        ),
+        None,
+    )
+
+
+def _sanitize_state(rule: RuleSpec, state: RuleState, now: datetime) -> RuleState:
+    names = tuple(level.name for level in rule.levels)
+    allowed = set(names)
+    config_changed = (
+        (
+            state.rule_direction is not None
+            and state.rule_direction is not rule.direction
+        )
+        or (bool(state.level_order) and state.level_order != names)
+        or (state.active_level is not None and state.active_level not in allowed)
+    )
+    notification_times = tuple(
+        (name, timestamp)
+        for name, timestamp in state.level_notification_times
+        if name in allowed and timestamp <= now
+    )
+    escalation_counts = tuple(
+        (name, count)
+        for name, count in state.level_escalation_counts
+        if name in allowed
+    )
+    newest_sample_time = state.newest_sample_time
+    newest_value = state.newest_value
+    if (
+        newest_sample_time is not None
+        and _elapsed(newest_sample_time, now) > FUTURE_TOLERANCE
+    ):
+        newest_sample_time = None
+        newest_value = None
+    last_evaluated = state.last_evaluated_sample_time
+    if last_evaluated is not None and _elapsed(last_evaluated, now) > FUTURE_TOLERANCE:
+        last_evaluated = None
+    last_notification = state.last_episode_notification_time
+    if last_notification is not None and last_notification > now:
+        last_notification = now
+    return replace(
+        state,
+        newest_sample_time=newest_sample_time,
+        newest_value=newest_value,
+        last_evaluated_sample_time=last_evaluated,
+        last_episode_notification_time=last_notification,
+        level_notification_times=notification_times,
+        level_escalation_counts=escalation_counts,
+        rule_direction=rule.direction,
+        level_order=names,
+        needs_rederive=state.needs_rederive or config_changed,
+    )
+
+
 def _emit_escalation(
     rule: RuleSpec, state: RuleState, sample: Sample, now: datetime
 ) -> tuple[RuleState, Event | None]:
-    active_level = cast(int, state.active_level)
-    level_name = rule.levels[active_level].name
-    last_times = dict(state.level_notification_times)
-    last_time = last_times.get(level_name)
+    level_name = cast(str, state.active_level)
+    last_time = dict(state.level_notification_times).get(level_name)
     since_last = _elapsed(now, last_time) if last_time is not None else None
     within_cooldown = since_last is not None and since_last < rule.cooldown
     if within_cooldown:
@@ -167,13 +244,81 @@ def _emit_escalation(
         ordinal=ordinal,
         value=float(sample.value),
         sample_time=sample.timestamp,
+        now=now,
     )
 
 
-def _evaluate_threshold(
+def _recover(
     rule: RuleSpec, state: RuleState, sample: Sample, now: datetime
 ) -> tuple[RuleState, list[Event]]:
-    previous_level = state.active_level
+    events: list[Event] = []
+    if rule.recovery_notify and state.active_level is not None:
+        events.append(
+            _event(
+                rule,
+                state,
+                EventKind.RECOVERED,
+                level=None,
+                ordinal=0,
+                value=float(sample.value),
+                sample_time=sample.timestamp,
+                now=now,
+            )
+        )
+    recovered = replace(
+        state,
+        active_level=None,
+        clear_count=0,
+        reminder_count=0,
+        last_episode_notification_time=None,
+        episode_started_at=None,
+        level_notification_times=(),
+        needs_rederive=False,
+        last_evaluated_sample_time=sample.timestamp,
+    )
+    return recovered, events
+
+
+def _rederive(
+    rule: RuleSpec,
+    state: RuleState,
+    sample: Sample,
+    now: datetime,
+    *,
+    allow_clear: bool,
+) -> tuple[RuleState, list[Event]]:
+    entry_level = _entry_level(rule, float(sample.value))
+    if entry_level is None:
+        if not allow_clear:
+            return replace(state, last_evaluated_sample_time=sample.timestamp), []
+        return _recover(rule, state, sample, now)
+    level_name = rule.levels[entry_level].name
+    already_notified = level_name in dict(state.level_notification_times)
+    state = replace(
+        state,
+        active_level=level_name,
+        clear_count=0,
+        needs_rederive=False,
+        last_evaluated_sample_time=sample.timestamp,
+    )
+    if already_notified:
+        return state, []
+    state, event = _emit_escalation(rule, state, sample, now)
+    return state, [event] if event is not None else []
+
+
+def _evaluate_threshold(
+    rule: RuleSpec,
+    state: RuleState,
+    sample: Sample,
+    now: datetime,
+    *,
+    allow_clear: bool,
+) -> tuple[RuleState, list[Event]]:
+    if state.needs_rederive:
+        return _rederive(rule, state, sample, now, allow_clear=allow_clear)
+
+    previous_level = _active_index(rule, state)
     entry_level = _entry_level(rule, float(sample.value))
     events: list[Event] = []
     if previous_level is None:
@@ -185,12 +330,14 @@ def _evaluate_threshold(
             ), events
         state = replace(
             state,
-            active_level=entry_level,
+            active_level=rule.levels[entry_level].name,
             episode=min(state.episode + 1, MAX_COUNTER),
             clear_count=0,
             reminder_count=0,
             last_episode_notification_time=None,
             episode_started_at=now,
+            level_notification_times=(),
+            needs_rederive=False,
             last_evaluated_sample_time=sample.timestamp,
         )
         state, event = _emit_escalation(rule, state, sample, now)
@@ -201,7 +348,7 @@ def _evaluate_threshold(
     if entry_level is not None and entry_level > previous_level:
         state = replace(
             state,
-            active_level=entry_level,
+            active_level=rule.levels[entry_level].name,
             clear_count=0,
             last_evaluated_sample_time=sample.timestamp,
         )
@@ -217,6 +364,8 @@ def _evaluate_threshold(
             clear_count=0,
             last_evaluated_sample_time=sample.timestamp,
         ), events
+    if not allow_clear:
+        return replace(state, last_evaluated_sample_time=sample.timestamp), events
 
     clear_count = min(state.clear_count + 1, MAX_COUNTER)
     if clear_count < rule.clear_after_samples:
@@ -225,34 +374,14 @@ def _evaluate_threshold(
             clear_count=clear_count,
             last_evaluated_sample_time=sample.timestamp,
         ), events
-
-    state = replace(
-        state,
-        active_level=retained_level,
-        clear_count=0,
-        last_evaluated_sample_time=sample.timestamp,
-    )
     if retained_level is not None:
-        return state, events
-
-    if rule.recovery_notify:
-        events.append(
-            _event(
-                rule,
-                state,
-                EventKind.RECOVERED,
-                level=None,
-                ordinal=0,
-                value=float(sample.value),
-                sample_time=sample.timestamp,
-            )
-        )
-    return replace(
-        state,
-        reminder_count=0,
-        last_episode_notification_time=None,
-        episode_started_at=None,
-    ), events
+        return replace(
+            state,
+            active_level=rule.levels[retained_level].name,
+            clear_count=0,
+            last_evaluated_sample_time=sample.timestamp,
+        ), events
+    return _recover(rule, state, sample, now)
 
 
 def _maybe_remind(
@@ -261,14 +390,16 @@ def _maybe_remind(
     active_level = state.active_level
     if (
         rule.reminder_max == 0
-        or active_level is None
-        or active_level != len(rule.levels) - 1
+        or active_level != rule.levels[-1].name
         or state.reminder_count >= rule.reminder_max
     ):
         return state, None
     anchor = state.last_episode_notification_time or state.episode_started_at
-    elapsed = _elapsed(now, anchor) if anchor is not None else None
-    if elapsed is None or elapsed < rule.reminder_interval:
+    if anchor is None:
+        return state, None
+    if anchor > now:
+        return replace(state, last_episode_notification_time=now), None
+    if _elapsed(now, anchor) < rule.reminder_interval:
         return state, None
     count = state.reminder_count + 1
     state = replace(
@@ -280,10 +411,11 @@ def _maybe_remind(
         rule,
         state,
         EventKind.REMINDER,
-        level=rule.levels[active_level].name,
+        level=active_level,
         ordinal=count,
         value=state.newest_value,
         sample_time=state.newest_sample_time,
+        now=now,
     )
 
 
@@ -297,8 +429,7 @@ def evaluate(
 
     if not _aware(now):
         raise ValueError("now must be an aware datetime")
-    if state.active_level is not None and state.active_level >= len(rule.levels):
-        raise InvalidRuleStateError("state active_level does not exist in this rule")
+    state = _sanitize_state(rule, state, now)
     events: list[Event] = []
     usable = _usable_sample(sample, now)
 
@@ -317,52 +448,53 @@ def evaluate(
         else None
     )
     is_fresh = sample_age is not None and sample_age <= rule.stale_after
-    if not is_fresh:
-        if not state.stale:
-            state = replace(
+    if not is_fresh and not state.stale:
+        state = replace(
+            state,
+            stale=True,
+            stale_cycle=min(state.stale_cycle + 1, MAX_COUNTER),
+            stale_started_at=now,
+        )
+        events.append(
+            _event(
+                rule,
                 state,
-                stale=True,
-                stale_cycle=min(state.stale_cycle + 1, MAX_COUNTER),
+                EventKind.STALE,
+                level=state.active_level,
+                ordinal=state.stale_cycle,
+                value=state.newest_value,
+                sample_time=state.newest_sample_time,
+                now=now,
             )
-            events.append(
-                _event(
-                    rule,
-                    state,
-                    EventKind.STALE,
-                    level=(
-                        rule.levels[state.active_level].name
-                        if state.active_level is not None
-                        else None
-                    ),
-                    ordinal=state.stale_cycle,
-                    value=state.newest_value,
-                    sample_time=state.newest_sample_time,
-                )
+        )
+    elif is_fresh and state.stale:
+        events.append(
+            _event(
+                rule,
+                state,
+                EventKind.RESTORED,
+                level=state.active_level,
+                ordinal=state.stale_cycle,
+                value=state.newest_value,
+                sample_time=state.newest_sample_time,
+                now=now,
             )
-    else:
-        if state.stale:
-            state = replace(state, stale=False)
-            events.append(
-                _event(
-                    rule,
-                    state,
-                    EventKind.RESTORED,
-                    level=(
-                        rule.levels[state.active_level].name
-                        if state.active_level is not None
-                        else None
-                    ),
-                    ordinal=state.stale_cycle,
-                    value=state.newest_value,
-                    sample_time=state.newest_sample_time,
-                )
-            )
-        if usable is not None and (
-            state.last_evaluated_sample_time is None
-            or usable.timestamp > state.last_evaluated_sample_time
-        ):
-            state, threshold_events = _evaluate_threshold(rule, state, usable, now)
-            events.extend(threshold_events)
+        )
+        state = replace(state, stale=False, stale_started_at=None)
+
+    if usable is not None and (
+        state.last_evaluated_sample_time is None
+        or usable.timestamp > state.last_evaluated_sample_time
+    ):
+        sample_is_fresh = _elapsed(now, usable.timestamp) <= rule.stale_after
+        state, threshold_events = _evaluate_threshold(
+            rule,
+            state,
+            usable,
+            now,
+            allow_clear=sample_is_fresh,
+        )
+        events.extend(threshold_events)
 
     state, reminder = _maybe_remind(rule, state, now)
     if reminder is not None:
