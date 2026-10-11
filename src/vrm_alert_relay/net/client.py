@@ -129,11 +129,15 @@ def _verifying_context(cafile: str | os.PathLike[str]) -> ssl.SSLContext:
     Built by hand rather than with :func:`ssl.create_default_context` (which
     httpx also uses), because that function honours ``SSLKEYLOGFILE`` and
     would write TLS session secrets to the file it names. This context never
-    has a key log file.
+    has a key log file. Otherwise it matches that function's settings,
+    including its strict X.509 checks and acceptance of a trusted
+    intermediate as an anchor (``VERIFY_X509_STRICT`` and
+    ``VERIFY_X509_PARTIAL_CHAIN``).
     """
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.verify_mode = ssl.CERT_REQUIRED
     context.check_hostname = True
+    context.verify_flags |= ssl.VERIFY_X509_STRICT | ssl.VERIFY_X509_PARTIAL_CHAIN
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_verify_locations(cafile=cafile)
     return context
