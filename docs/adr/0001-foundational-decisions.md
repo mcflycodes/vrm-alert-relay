@@ -15,7 +15,7 @@ Before implementation, the project weighed how strict each security and reliabil
 3. **Review:** every code PR gets one independent cross-vendor review; security-sensitive PRs get a frontier security-focused reviewer; docs-only, test-only, and small fix deltas get a coordinator check.
 4. **Endpoints:** per-provider adapters with documented default endpoints, which the operator can override (HTTPS only), plus a generic webhook provider. Destinations come only from operator configuration. HTTPS, no redirects, timeouts, and response-size caps; private-network destinations allowed.
 5. **Home Assistant:** a first-class HA notify provider and docs in v1; HA sensors (MQTT discovery) as the first post-v1 item.
-6. **Container and supply chain:** distroless, non-root, read-only rootfs, no capabilities, file-based secrets, masked logs; every PR builds, scans (HIGH/CRITICAL block, maintainer-approved, dated exceptions only), and produces an SBOM; published images are signed.
+6. **Container and supply chain:** distroless, non-root, read-only rootfs, no capabilities, file-based secrets, masked logs; every PR builds, scans, and produces an SBOM. HIGH/CRITICAL findings with an available fix block; unfixed findings are reported in the CI summary without blocking. `main` is re-scanned weekly, base-image and other dependency updates arrive as automated pull requests, and published images are signed. This amends the earlier rule that every HIGH/CRITICAL finding blocked unless covered by a maintainer-approved, dated exception: a finding with no upstream fix cannot be resolved by the project, so blocking on it only stalls unrelated work.
 7. **Testing:** behaviour-focused (property-tested rules engine, mocked integrations, named failure scenarios), ≥ 85% overall coverage, near-100% on the rules engine, CI secret scanning plus a local private denylist check. Revisit if defects show the bar is too low.
 8. **Stack:** Python with a small dependency set (HTTP client, schema validation, YAML, stdlib SQLite); Docker/Compose packaging.
 
@@ -30,4 +30,4 @@ Before implementation, the project weighed how strict each security and reliabil
 ## Consequences
 
 - `SECURITY.md` invariants on rate limits, outbound destinations, failure behaviour, and accepted risk are revised to match.
-- Python's distroless base will raise more scanner findings than a Go image would; exceptions require maintainer approval with an expiry date.
+- Python's distroless base will raise more scanner findings than a Go image would. Unfixed findings stay visible in every scan report and the weekly re-scan, and they start blocking as soon as a fix is published; the maintainer merges the resulting base-image update. No blanket ignore file is kept.

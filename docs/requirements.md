@@ -65,7 +65,7 @@ Users are technically capable people who self-host one instance for their own in
 - R27. Structured JSON logs. Never log secrets, authorization headers, or full request URLs; phone numbers show only the last four digits.
 - R28. Optional health endpoint: informational only, loopback-bound by default, no secrets or recipient data; reports last successful poll, state-persistence health, and suppression counts.
 - R29. Container: distroless base, non-root UID, read-only root filesystem, single writable state volume, all capabilities dropped, `no-new-privileges`, secrets as mounted files, no Docker socket. A documented Compose file applies all of these.
-- R30. Supply chain: every PR builds the image, scans it (HIGH/CRITICAL findings block; maintainer-approved, dated exceptions only), and produces an SBOM. Published images are signed.
+- R30. Supply chain: every PR builds the image, scans it, and produces an SBOM. HIGH/CRITICAL findings with an available fix block; unfixed findings are reported without blocking. `main` is re-scanned weekly, base-image updates arrive as automated pull requests, and published images are signed.
 - R31. No telemetry; no outbound requests other than VRM and configured providers.
 
 ### Quality

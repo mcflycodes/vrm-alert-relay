@@ -1,0 +1,54 @@
+name: Scan container image
+description: >-
+  Report every HIGH and CRITICAL finding in the job summary without blocking,
+  then fail on HIGH and CRITICAL findings that have a fix available.
+  Requires the install-scanners action to have run first.
+
+inputs:
+  image:
+    description: Local image reference to scan.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # Non-blocking: lists fixed and unfixed findings so unfixed ones stay visible.
+    - name: Report all HIGH and CRITICAL findings
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+      run: |
+        report="$RUNNER_TEMP/trivy-report.json"
+        if ! "$RUNNER_TEMP/trivy" image --no-progress --severity HIGH,CRITICAL \
+            --format json --output "$report" "$IMAGE"; then
+          echo "::warning::Trivy report scan failed; the blocking scan still runs"
+          exit 0
+        fi
+        {
+          echo "## Image scan: all HIGH and CRITICAL findings"
+          echo
+          jq -r '
+            [.Results[]?.Vulnerabilities[]?] as $v
+            | ($v | map(select(.Status == "fixed")) | map(.VulnerabilityID) | unique | length) as $fixed
+            | ($v | map(.VulnerabilityID) | unique | length) as $total
+            | "\($total) unique findings (\($v | length) rows): \($fixed) with a fix available (blocking), \($total - $fixed) without (reported only).",
+              "",
+              (if $total == 0 then empty else
+                "| Severity | ID | Packages | Status | Fixed in |",
+                "|---|---|---|---|---|",
+                ($v | group_by(.VulnerabilityID)
+                    | sort_by((if .[0].Severity == "CRITICAL" then 0 else 1 end), .[0].VulnerabilityID)
+                    | .[]
+                    | "| \(.[0].Severity) | \(.[0].VulnerabilityID) | \(map(.PkgName) | unique | join(", ")) | \(map(.Status // "unknown") | unique | join(", ")) | \(map(.FixedVersion // "") | map(select(length > 0)) | unique | join(", ") | if . == "" then "-" else . end) |")
+              end)
+          ' "$report"
+        } >> "$GITHUB_STEP_SUMMARY" || echo "::warning::could not write the scan summary"
+
+    # Blocking: only findings with an available fix fail the job.
+    - name: Fail on fixable HIGH and CRITICAL findings
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+      run: |
+        "$RUNNER_TEMP/trivy" image --no-progress --severity HIGH,CRITICAL \
+          --ignore-unfixed --exit-code 1 "$IMAGE"

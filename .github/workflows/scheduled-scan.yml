@@ -1,0 +1,36 @@
+name: Scheduled image scan
+
+# Re-scans main weekly so newly published CVEs surface without a code change.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduled-scan
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  scan:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      IMAGE: vrm-alert-relay:scheduled
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install-scanners
+      - name: Build image
+        run: docker build --pull --tag "$IMAGE" .
+      - uses: ./.github/actions/scan-image
+        with:
+          image: ${{ env.IMAGE }}
