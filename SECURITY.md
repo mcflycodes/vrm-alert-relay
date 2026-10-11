@@ -38,7 +38,7 @@ The service is not intended to accept public commands or arbitrary message submi
 - The project collects no telemetry and makes no network requests beyond the operator-configured VRM and notification-provider integrations.
 - The container runs as a non-root user on a read-only root filesystem with no Docker socket, host namespace, privileged mode, or Linux capabilities. Persistent and secret mounts receive only the access they require.
 - Parsing, queues, history, persistent state, retries, and logs are bounded to prevent resource exhaustion.
-- Failures fail toward alerting. A failure to fetch, parse, persist state, or deliver a notification must not silently suppress alerts: the service reports degraded monitoring and keeps alerting. A rare failure, such as a crash during delivery, may produce a duplicate message, but no failure can generate an arbitrary or unbounded message stream.
+- Failures fail toward alerting. A failure to fetch, parse, persist state, or deliver a notification must not silently suppress alerts: the service reports degraded monitoring and keeps alerting. A rare failure, such as a crash during delivery, may produce a duplicate message, but no failure can generate an arbitrary or unbounded message stream: even when its state storage fails, each process enforces the global rate limit in memory, and provider-side limits are the final backstop.
 - Logs preserve enough information to diagnose alert behavior without exposing complete recipient identifiers or sensitive deployment details.
 
 ## Reportable Findings and Severity Context
@@ -51,7 +51,7 @@ Unauthorized high-volume or attacker-directed messaging, remote code execution, 
 
 - Availability, accuracy, pricing, policy, or delivery behavior of VRM, telecommunications carriers, and configured notification providers
 - A trusted administrator intentionally configuring an incorrect threshold, recipient, provider, or endpoint, including an endpoint on a private network
-- An occasional duplicate message after a crash or ambiguous provider response, within the configured rate limits
+- An occasional duplicate message after a crash, an ambiguous provider response, or a restart while state storage is failing, within the configured rate limits of each process
 - A provider rejecting legitimate traffic because of account registration, balance, quota, carrier filtering, or regulatory requirements
 - Compromise of the deployment host or provider account that occurs independently of VRM Alert Relay
 - The unavoidable disclosure of message content and recipient metadata to the notification provider selected by the operator
