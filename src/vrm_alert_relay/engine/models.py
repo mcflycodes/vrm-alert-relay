@@ -407,6 +407,15 @@ class RuleState:
         if not isinstance(raw_level_order, list) or len(raw_level_order) > MAX_LEVELS:
             raise InvalidRuleStateError("level_order must be a bounded list")
         level_order = tuple(raw_level_order)
+        raw_active_level = data["active_level"]
+        if (
+            isinstance(raw_active_level, str)
+            and level_order
+            and raw_active_level not in level_order
+        ):
+            raise InvalidRuleStateError(
+                "active_level must appear in non-empty level_order"
+            )
         raw_episode_levels = data["episode_notified_levels"]
         if (
             not isinstance(raw_episode_levels, list)
@@ -418,7 +427,7 @@ class RuleState:
         episode_levels = tuple(raw_episode_levels)
         return cls(
             generation=cast(str | None, data["generation"]),
-            active_level=cast(str | None, data["active_level"]),
+            active_level=cast(str | None, raw_active_level),
             episode=cast(int, data["episode"]),
             clear_count=cast(int, data["clear_count"]),
             newest_sample_time=decode_time("newest_sample_time"),

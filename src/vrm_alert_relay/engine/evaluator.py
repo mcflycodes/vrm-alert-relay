@@ -11,6 +11,7 @@ from typing import Final, cast
 
 from .models import (
     MAX_COUNTER,
+    MAX_LEVELS,
     Direction,
     Event,
     EventKind,
@@ -59,6 +60,12 @@ def _mapping_set_time(
 ) -> tuple[LevelTime, ...]:
     updated = {key: value for key, value in values}
     updated[name] = timestamp
+    if len(updated) > MAX_LEVELS:
+        oldest_name = min(
+            (key for key in updated if key != name),
+            key=lambda key: (updated[key], key),
+        )
+        del updated[oldest_name]
     return tuple(sorted(updated.items()))
 
 
@@ -165,7 +172,7 @@ def _provisional_level(rule: RuleSpec, state: RuleState) -> str | None:
     try:
         old_index = state.level_order.index(active)
     except ValueError:
-        return None
+        return rule.levels[-1].name
     if old_index >= len(rule.levels):
         return rule.levels[-1].name
     return rule.levels[old_index].name
@@ -187,7 +194,8 @@ def _sanitize_state(rule: RuleSpec, state: RuleState, now: datetime) -> RuleStat
     notification_times = tuple(
         (name, timestamp)
         for name, timestamp in state.level_notification_times
-        if name in allowed and timestamp <= now
+        if _elapsed(now, timestamp) <= rule.cooldown
+        and _elapsed(timestamp, now) <= FUTURE_TOLERANCE
     )
     episode_levels = tuple(
         name for name in state.episode_notified_levels if name in allowed
@@ -489,9 +497,7 @@ def _maybe_emit_pending(
 ) -> tuple[RuleState, Event | None]:
     if state.pending_escalation is None:
         return state, None
-    level_name = _provisional_level(rule, state)
-    if level_name is None:
-        return replace(state, pending_escalation=None), None
+    level_name = cast(str, _provisional_level(rule, state))
     if state.episode_announced and level_name in state.episode_notified_levels:
         return replace(state, pending_escalation=None), None
     last_time = dict(state.level_notification_times).get(level_name)
@@ -554,7 +560,7 @@ def evaluate(
     if not _aware(now):
         raise ValueError("now must be an aware datetime")
     if state.generation is None:
-        state = replace(state, generation=now.isoformat())
+        state = replace(state, generation=now.astimezone(UTC).isoformat())
     state = _sanitize_state(rule, state, now)
     events: list[Event] = []
     usable = _usable_sample(sample, now)

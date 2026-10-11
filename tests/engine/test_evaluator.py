@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -485,6 +485,35 @@ def test_suppressed_new_episode_escalates_when_cooldown_expires() -> None:
     assert [event.kind for event in recovered_again] == [EventKind.RECOVERED]
 
 
+def test_removed_and_readded_level_keeps_cooldown_history() -> None:
+    original = rising_rule(
+        levels=(LevelSpec("warning", 10.0), LevelSpec("alert", 20.0)),
+        cooldown=timedelta(minutes=15),
+        stale_after=timedelta(days=1),
+    )
+    without_alert = rising_rule(
+        levels=(LevelSpec("warning", 10.0),),
+        cooldown=timedelta(minutes=15),
+        stale_after=timedelta(days=1),
+    )
+    state, first = step(original, RuleState(), 0, 25.0)
+    state, removed_events = evaluate(
+        without_alert, state, None, BASE + timedelta(minutes=1)
+    )
+    state, readded_events = step(original, state, 12, 25.0)
+
+    assert first == [EventKind.ESCALATED]
+    assert removed_events == []
+    assert readded_events == []
+    assert state.pending_escalation == "alert"
+    assert dict(state.level_notification_times)["alert"] == BASE
+
+    state, released = evaluate(original, state, None, BASE + timedelta(minutes=15))
+    assert [event.kind for event in released] == [EventKind.ESCALATED]
+    assert released[0].level == "alert"
+    assert state.pending_escalation is None
+
+
 def test_threshold_oscillation_is_bounded_by_cross_episode_cooldown() -> None:
     rule = rising_rule(
         levels=(LevelSpec("critical", 10.0),),
@@ -760,17 +789,19 @@ def test_top_level_rename_does_not_interrupt_stale_reminders() -> None:
     assert state.needs_rederive
 
 
-def test_missing_active_level_without_old_index_fails_safe() -> None:
+def test_missing_active_level_without_old_index_fails_toward_top_level() -> None:
     rule = rising_rule(levels=(LevelSpec("critical", 10.0),))
     state = RuleState(
         active_level="removed",
         episode=1,
-        pending_escalation="critical",
         rule_direction=Direction.RISING,
     )
     state, events = evaluate(rule, state, None, BASE)
-    assert [event.kind for event in events] == [EventKind.STALE]
-    assert events[0].level is None
+    assert [event.kind for event in events] == [
+        EventKind.STALE,
+        EventKind.ESCALATED,
+    ]
+    assert [event.level for event in events] == ["critical", "critical"]
     assert state.pending_escalation is None
 
 
@@ -890,7 +921,7 @@ def test_escalation_ordinal_prevents_id_reuse_across_level_renames() -> None:
     state, first = evaluate(first_rule, RuleState(), Sample(11.0, BASE), BASE)
     second_at = BASE + timedelta(minutes=1)
     state, second = evaluate(second_rule, state, Sample(11.0, second_at), second_at)
-    third_at = BASE + timedelta(minutes=2)
+    third_at = BASE + timedelta(minutes=16)
     state, third = evaluate(first_rule, state, Sample(11.0, third_at), third_at)
 
     assert [event.level for event in (*first, *second, *third)] == [
@@ -950,15 +981,43 @@ def test_non_numeric_sample_is_treated_as_absent(bad_value: object) -> None:
     assert [event.kind for event in events] == [EventKind.STALE]
 
 
-def test_level_histories_are_pruned_to_current_rule_names() -> None:
+def test_level_history_capacity_discards_the_oldest_entry() -> None:
     old_names = tuple(f"old-{index}" for index in range(128))
     state = RuleState(
-        level_notification_times=tuple((name, BASE) for name in old_names),
+        level_notification_times=tuple(
+            (name, BASE + timedelta(seconds=index))
+            for index, name in enumerate(old_names)
+        ),
     )
-    rule = rising_rule(levels=(LevelSpec("critical", 10.0),))
-    state, events = evaluate(rule, state, Sample(11.0, BASE), BASE)
-    assert [name for name, _ in state.level_notification_times] == ["critical"]
+    rule = rising_rule(
+        levels=(LevelSpec("critical", 10.0),),
+        cooldown=timedelta(days=365),
+    )
+    now = BASE + timedelta(seconds=200)
+    state, events = evaluate(rule, state, Sample(11.0, now), now)
+    retained_names = {name for name, _ in state.level_notification_times}
+    assert len(retained_names) == 128
+    assert "critical" in retained_names
+    assert "old-0" not in retained_names
     assert [event.kind for event in events] == [EventKind.ESCALATED]
+
+
+def test_level_history_is_pruned_by_age_and_future_tolerance() -> None:
+    now = BASE + timedelta(minutes=20)
+    state = RuleState(
+        level_notification_times=(
+            ("expired", BASE),
+            ("recent-removed", now - timedelta(minutes=5)),
+            ("slightly-future", now + timedelta(seconds=60)),
+            ("far-future", now + timedelta(seconds=61)),
+        ),
+    )
+    rule = rising_rule(cooldown=timedelta(minutes=15))
+    state, _ = evaluate(rule, state, None, now)
+    assert {name for name, _ in state.level_notification_times} == {
+        "recent-removed",
+        "slightly-future",
+    }
 
 
 def test_config_rederive_can_recover_or_wait_for_a_fresh_sample() -> None:
@@ -1044,3 +1103,13 @@ def test_startup_stale_event_ids_use_persisted_generation() -> None:
     _, first_replay = evaluate(rule, persisted, None, stale_at)
     _, second_replay = evaluate(rule, persisted, None, stale_at + timedelta(seconds=30))
     assert first_replay[0].event_id == second_replay[0].event_id
+
+
+def test_generation_is_canonicalized_to_utc() -> None:
+    rule = rising_rule()
+    offset = timezone(timedelta(hours=-7))
+    same_instant = BASE.astimezone(offset)
+    first_state, first = evaluate(rule, RuleState(), None, BASE)
+    second_state, second = evaluate(rule, RuleState(), None, same_instant)
+    assert first_state.generation == second_state.generation == BASE.isoformat()
+    assert first[0].event_id == second[0].event_id
