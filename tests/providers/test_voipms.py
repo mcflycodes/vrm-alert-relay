@@ -228,7 +228,7 @@ def test_transport_failures(
         (429, SendStatus.FAILED, True),
         (401, SendStatus.FAILED, False),
         (404, SendStatus.FAILED, False),
-        (302, SendStatus.FAILED, False),
+        (302, SendStatus.AMBIGUOUS, True),
     ],
 )
 def test_http_status_failures(
@@ -327,14 +327,14 @@ def record(**overrides: Any) -> dict[str, Any]:
         "message": MESSAGE.text,
     }
     base.update(overrides)
-    return base
+    return {key: value for key, value in base.items() if value is not ...}
 
 
-def test_reconcile_by_window_finds_the_sent_message(
+def test_reconcile_window_query_parameters(
     provider: VoipmsSmsProvider, transport: StubTransport
 ) -> None:
-    transport.json({"status": "success", "sms": [record()]})
-    assert provider.reconcile(query()) is ReconcileStatus.DELIVERED
+    transport.json({"status": "no_sms"})
+    assert provider.reconcile(query()) is ReconcileStatus.NOT_DELIVERED
     fields = multipart_fields(transport.requests[0])
     assert fields["method"] == "getSMS"
     assert (fields["did"], fields["contact"], fields["type"]) == ("2025550100", "2025550142", "0")
@@ -343,27 +343,24 @@ def test_reconcile_by_window_finds_the_sent_message(
     assert "sms" not in fields
 
 
-def test_reconcile_by_id(provider: VoipmsSmsProvider, transport: StubTransport) -> None:
-    transport.json({"status": "success", "sms": [record(id=777, message="different text")]})
-    assert provider.reconcile(query("777")) is ReconcileStatus.DELIVERED
-    fields = multipart_fields(transport.requests[0])
-    assert fields["sms"] == "777"
-    assert "from" not in fields
-
-
-def test_reconcile_by_id_without_a_match_is_unknown(
+def test_same_text_without_an_id_is_never_delivered(
     provider: VoipmsSmsProvider, transport: StubTransport
 ) -> None:
-    transport.json({"status": "success", "sms": [record(id="778")]})
-    assert provider.reconcile(query("777")) is ReconcileStatus.UNKNOWN
+    """An earlier, distinct SMS with the same DID, contact and text in the
+    window must not suppress the retry of this one."""
+    transport.json({"status": "success", "sms": [record(), record(id="778")]})
+    assert provider.reconcile(query()) is ReconcileStatus.UNKNOWN
 
 
-def test_reconcile_ignores_an_invalid_known_id(
-    provider: VoipmsSmsProvider, transport: StubTransport
+@pytest.mark.parametrize(
+    "records",
+    [[], [record(message="another message")], ["not a record", 7, None]],
+)
+def test_without_an_id_only_no_sms_is_not_delivered(
+    provider: VoipmsSmsProvider, transport: StubTransport, records: list[object]
 ) -> None:
-    transport.json({"status": "no_sms"})
-    assert provider.reconcile(query("not-an-id")) is ReconcileStatus.NOT_DELIVERED
-    assert "sms" not in multipart_fields(transport.requests[0])
+    transport.json({"status": "success", "sms": records})
+    assert provider.reconcile(query()) is ReconcileStatus.UNKNOWN
 
 
 @pytest.mark.parametrize(
@@ -380,48 +377,85 @@ def test_reconcile_no_sms(
     assert provider.reconcile(query(message_id)) is outcome
 
 
+@pytest.mark.parametrize("record_id", ["777", 777])
+def test_exact_id_match_is_delivered(
+    provider: VoipmsSmsProvider, transport: StubTransport, record_id: object
+) -> None:
+    transport.json({"status": "success", "sms": [record(id=record_id, message="other text")]})
+    assert provider.reconcile(query("777")) is ReconcileStatus.DELIVERED
+    fields = multipart_fields(transport.requests[0])
+    assert fields["sms"] == "777"
+    assert "from" not in fields
+
+
+@pytest.mark.parametrize("message_type", ["0", 0])
+def test_outbound_type_forms(
+    provider: VoipmsSmsProvider, transport: StubTransport, message_type: object
+) -> None:
+    transport.json({"status": "success", "sms": [record(type=message_type)]})
+    assert provider.reconcile(query("777")) is ReconcileStatus.DELIVERED
+
+
 @pytest.mark.parametrize(
-    "records",
+    "bad",
     [
-        [],
-        [record(message="another message")],
-        [record(date="2026-01-15 11:40:00")],
-        [record(date="2026-01-16 00:00:01")],
-        [record(contact="2025550199")],
-        [record(did="2025550198")],
-        [record(type="1")],
-        ["not a record", 7, None],
+        record(type=...),
+        record(type="1"),
+        record(type=1),
+        record(type=False),
+        record(type=None),
+        record(type="00"),
+        record(did=...),
+        record(did="2025550198"),
+        record(did=True),
+        record(did=2025550100.0),
+        record(contact=...),
+        record(contact="2025550199"),
+        record(contact="+12025550142"),
+        record(contact=None),
     ],
 )
-def test_reconcile_without_a_match_is_not_delivered(
+def test_id_match_with_missing_or_wrong_route_is_unknown(
+    provider: VoipmsSmsProvider, transport: StubTransport, bad: dict[str, Any]
+) -> None:
+    transport.json({"status": "success", "sms": [bad]})
+    assert provider.reconcile(query("777")) is ReconcileStatus.UNKNOWN
+
+
+def test_numeric_route_fields_are_accepted(
+    provider: VoipmsSmsProvider, transport: StubTransport
+) -> None:
+    transport.json(
+        {"status": "success", "sms": [record(did=2025550100, contact=2025550142, type=0)]}
+    )
+    assert provider.reconcile(query("777")) is ReconcileStatus.DELIVERED
+
+
+@pytest.mark.parametrize(
+    "records",
+    [[], [record(id="778")], [record(id=None)], ["junk"], [record(id="7770")]],
+)
+def test_id_not_found_is_unknown(
     provider: VoipmsSmsProvider, transport: StubTransport, records: list[object]
 ) -> None:
     transport.json({"status": "success", "sms": records})
-    assert provider.reconcile(query()) is ReconcileStatus.NOT_DELIVERED
+    assert provider.reconcile(query("777")) is ReconcileStatus.UNKNOWN
 
 
-@pytest.mark.parametrize("date", ["15/01/2026 12:00", None, 1736942405])
-def test_reconcile_with_an_unreadable_date_is_unknown(
-    provider: VoipmsSmsProvider, transport: StubTransport, date: object
-) -> None:
-    transport.json({"status": "success", "sms": [record(date=date)]})
-    assert provider.reconcile(query()) is ReconcileStatus.UNKNOWN
-
-
-def test_reconcile_matches_the_trimmed_text(
+def test_reconcile_ignores_an_invalid_known_id(
     provider: VoipmsSmsProvider, transport: StubTransport
 ) -> None:
-    long_text = "z" * 400
-    transport.json({"status": "success", "sms": [record(message=sms_text(long_text))]})
-    assert provider.reconcile(query(text=long_text)) is ReconcileStatus.DELIVERED
+    transport.json({"status": "no_sms"})
+    assert provider.reconcile(query("not-an-id")) is ReconcileStatus.NOT_DELIVERED
+    assert "sms" not in multipart_fields(transport.requests[0])
 
 
 def test_reconcile_examines_a_bounded_number_of_records(
     provider: VoipmsSmsProvider, transport: StubTransport
 ) -> None:
-    filler = [record(message="other")] * RECONCILE_LIMIT
+    filler = [record(id="1")] * RECONCILE_LIMIT
     transport.json({"status": "success", "sms": [*filler, record()]})
-    assert provider.reconcile(query()) is ReconcileStatus.NOT_DELIVERED
+    assert provider.reconcile(query("777")) is ReconcileStatus.UNKNOWN
 
 
 @pytest.mark.parametrize(
@@ -438,12 +472,14 @@ def test_reconcile_uncertain_answers_are_unknown(
 ) -> None:
     transport.json(payload)
     assert provider.reconcile(query()) is ReconcileStatus.UNKNOWN
+    assert provider.reconcile(query("777")) is ReconcileStatus.UNKNOWN
 
 
 @pytest.mark.parametrize(
     "respond",
     [
         lambda _r: httpx.Response(500),
+        lambda _r: httpx.Response(302, headers={"Location": "https://evil.example.test/"}),
         lambda _r: httpx.Response(200, content=b"<soap/>"),
     ],
 )
@@ -489,5 +525,7 @@ def test_reconcile_never_queries_another_number(
 ) -> None:
     transport.json({"status": "success", "sms": [record(contact="2025550199")]})
     other = VoipmsRecipient(provider="voipms", phone=PhoneNumber.parse("2025550143"))
-    provider.reconcile(ReconcileQuery(MESSAGE, other, None, NOW))
+    assert provider.reconcile(ReconcileQuery(MESSAGE, other, "777", NOW)) is (
+        ReconcileStatus.UNKNOWN
+    )
     assert multipart_fields(transport.requests[0])["contact"] == "2025550143"

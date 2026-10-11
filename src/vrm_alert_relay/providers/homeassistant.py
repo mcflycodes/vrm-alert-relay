@@ -11,7 +11,8 @@ log redaction registry when the provider is built.
 A 2xx response is delivered. 401 and 403 (bad or under-privileged token),
 like other 4xx answers except 408, 425 and 429, fail without retry; a 5xx,
 a timeout after the request was sent or an unreadable response is
-ambiguous. Home Assistant offers no lookup, so there is no reconcile.
+ambiguous, and so is a redirect, which is never followed. Home Assistant
+offers no lookup, so there is no reconcile.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from vrm_alert_relay.config.fields import HaServiceName
 from vrm_alert_relay.delivery.protocol import SendResult, SendStatus, sanitize_text
 from vrm_alert_relay.logs.redaction import SecretRegistry, register_derived_secret, register_secret
 from vrm_alert_relay.net import Endpoint, HttpError
+from vrm_alert_relay.providers._display import describe_recipient
 from vrm_alert_relay.providers._http import DELIVERED, FAILED, result_for_error
 
 if TYPE_CHECKING:
@@ -56,6 +58,12 @@ class HomeAssistantNotifyProvider:
     ) -> None:
         self._http = http
         self._base = Endpoint(base_url, allow_http=http.allow_insecure_http)
+        # Requests use a copy whose path is hidden in the HTTP client's logs and
+        # errors, because the path ends in the service name, which can carry a
+        # phone-like identifier (mobile_app_<number>).
+        self._request_base = Endpoint(
+            base_url, secret_path=True, allow_http=http.allow_insecure_http
+        )
         self._token = token
         self._title = sanitize_text(title, 64)
         header = f"Bearer {token.reveal()}"
@@ -76,7 +84,7 @@ class HomeAssistantNotifyProvider:
             service = _SERVICE_NAME.validate_python(recipient.service)
         except ValidationError:
             return self._outcome(message, FAILED, "invalid_service")
-        endpoint = self._base.join("api", "services", "notify", service)
+        endpoint = self._request_base.join("api", "services", "notify", service)
         payload = {"message": sanitize_text(message.text), "title": self._title}
         try:
             self._http.post(
@@ -86,11 +94,15 @@ class HomeAssistantNotifyProvider:
                 max_response_bytes=MAX_RESPONSE_BYTES,
             )
         except HttpError as error:
-            return self._outcome(message, result_for_error(error), type(error).__name__, service)
-        return self._outcome(message, DELIVERED, "accepted", service)
+            return self._outcome(message, result_for_error(error), type(error).__name__, recipient)
+        return self._outcome(message, DELIVERED, "accepted", recipient)
 
     def _outcome(
-        self, message: Message, result: SendResult, reason: str, service: str | None = None
+        self,
+        message: Message,
+        result: SendResult,
+        reason: str,
+        recipient: HomeAssistantRecipient | None = None,
     ) -> SendResult:
         _log.log(
             logging.INFO if result.status is SendStatus.DELIVERED else logging.WARNING,
@@ -100,7 +112,7 @@ class HomeAssistantNotifyProvider:
                 "event": f"provider.{result.status.value}",
                 "provider": "homeassistant",
                 "delivery_id": message.delivery_id,
-                "recipient": None if service is None else f"notify.{service}",
+                "recipient": None if recipient is None else describe_recipient(recipient),
                 "retryable": result.retryable,
                 "reason": reason,
             },

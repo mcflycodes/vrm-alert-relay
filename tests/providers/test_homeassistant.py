@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
@@ -107,8 +107,8 @@ def test_registers_with_the_default_registry(
         (429, SendStatus.FAILED, True),
         (500, SendStatus.AMBIGUOUS, True),
         (502, SendStatus.AMBIGUOUS, True),
-        (301, SendStatus.FAILED, False),
-        (307, SendStatus.FAILED, False),
+        (301, SendStatus.AMBIGUOUS, True),
+        (307, SendStatus.AMBIGUOUS, True),
     ],
 )
 def test_statuses(
@@ -190,3 +190,26 @@ def test_plain_http_needs_an_opted_in_client(
 
 def test_repr_has_no_token(provider: HomeAssistantNotifyProvider) -> None:
     assert repr(provider) == f"HomeAssistantNotifyProvider('{HA_URL}/')"
+
+
+@pytest.mark.parametrize(
+    "respond",
+    [
+        lambda _r: httpx.Response(200, json=[]),
+        lambda _r: httpx.Response(500),
+    ],
+)
+def test_logs_mask_service_names_with_many_digits(
+    provider: HomeAssistantNotifyProvider,
+    transport: StubTransport,
+    caplog: pytest.LogCaptureFixture,
+    respond: Any,
+) -> None:
+    recipient = HomeAssistantRecipient(provider="homeassistant", service="mobile_app_2025550199")
+    transport.respond(respond)
+    with caplog.at_level(logging.DEBUG):
+        provider.send(MESSAGE, recipient)
+    assert transport.requests[0].url.path == "/api/services/notify/mobile_app_2025550199"
+    record = next(r for r in caplog.records if r.name.endswith("homeassistant"))
+    assert record.recipient == "notify.[#***0199]"  # type: ignore[attr-defined]
+    assert all("2025550199" not in repr(r.__dict__) for r in caplog.records)

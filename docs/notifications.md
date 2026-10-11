@@ -34,7 +34,8 @@ A field the notification does not carry is shown as `n/a` (`{unit}` is left empt
 ### Safety of rendered text
 
 - Substitution is a single pass: a value that contains `{rule}` is inserted as the literal text `{rule}`.
-- Every value is stripped of control, format and line-separator characters, has its whitespace collapsed, and is cut to a per-field limit (64 characters for labels and names) before it is inserted. Labels come from VRM data and are treated as untrusted.
+- Every value is stripped of control, format and line-separator characters, has its whitespace collapsed, and is cut to a per-field limit (64 characters for labels and names) before it is inserted.
+- `{label}` and `{unit}` can come from VRM data and are treated as untrusted: links in them are made visibly non-clickable. `https://evil.example.test/x` is shown as `hxxps[:]//evil[.]example[.]test/x`, `tel:` and similar schemes as `tel[:]`, and the dots of domain names and IP addresses as `[.]`. Text you write in a template is left as it is.
 - The rendered text is at most 480 characters. Providers may shorten it further; SMS is limited to 160.
 - A template produces only text. Recipients and destinations come only from the configuration; nothing in a template, a label or a provider response can add or change one.
 
@@ -62,7 +63,7 @@ Real sending needs both `sending.enabled: true` and the provider's own `enabled:
 
 ### `log`
 
-Writes one structured log record per message (`"event": "provider.dry_run"`) with the provider, a log-safe description of the recipient (phone numbers show only the last four digits), the delivery id and the text as the provider would send it. It never contacts any service.
+Writes one structured log record per message (`"event": "provider.dry_run"`) with the provider, a log-safe description of the recipient (phone numbers show only the last four digits, and a Home Assistant service name with five or more digits is shown as a placeholder such as `notify.[#***0199]`), the delivery id and the text as the provider would send it. It never contacts any service.
 
 ### `voipms`
 
@@ -71,7 +72,7 @@ Sends SMS through the VoIP.ms REST API (`https://voip.ms/api/v1/rest.php` by def
 - Each call is an HTTPS `POST` with a `multipart/form-data` body carrying the API username, API password, method and arguments. Credentials never appear in a URL.
 - A message counts as sent only when the JSON `status` is exactly `success`. VoIP.ms reports errors as HTTP 200 with another status: refusals such as `invalid_credentials`, `invalid_dst` or `sms_toolong` fail without retry; `limit_reached`, `api_limit_exceeded`, `method_maintenance` and `sms_failed` are retried. An unrecognized status, an unreadable response, or a failure after the request was sent is treated as ambiguous.
 - Messages are trimmed to 160 characters, ending in `...`.
-- An ambiguous attempt is looked up with `getSMS` before any retry: by message id when known, otherwise among messages sent from the DID to the recipient around the attempt time with the same text.
+- An ambiguous attempt is looked up with `getSMS` before any retry. It counts as sent only when VoIP.ms returns a sent message from the DID to the recipient with exactly the attempt's message id. Without an id, an empty result for the days around the attempt counts as not sent; a message with the same text is not proof, because it may be an earlier one, so the attempt is retried within the retry limit.
 - VoIP.ms sends SMS only to US and Canadian numbers; the configuration accepts only those.
 - VoIP.ms is always reached over HTTPS with the bundled trust store. It has no `ca_file` or `allow_insecure_http` setting.
 
@@ -79,7 +80,7 @@ Sends SMS through the VoIP.ms REST API (`https://voip.ms/api/v1/rest.php` by def
 
 Calls a Home Assistant `notify` service: `POST {base_url}/api/services/notify/<service>` with `Authorization: Bearer <token>` and the JSON body `{"message": "...", "title": "VRM Alert Relay"}`. Use a long-lived access token of a dedicated, non-admin Home Assistant user.
 
-A 2xx answer is success. 401 and 403 mean the token is wrong or lacks permission and are not retried; neither are other 4xx answers except 408, 425 and 429. A 5xx answer or a timeout after the request was sent is ambiguous and retried.
+A 2xx answer is success. 401 and 403 mean the token is wrong or lacks permission and are not retried; neither are other 4xx answers except 408, 425 and 429. A 5xx answer, a redirect (which is never followed) or a timeout after the request was sent is ambiguous and retried.
 
 ### `webhook`
 

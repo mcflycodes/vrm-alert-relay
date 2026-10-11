@@ -5,11 +5,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from vrm_alert_relay.config import (
-    HomeAssistantRecipient,
-    VoipmsRecipient,
-    WebhookRecipient,
-)
+from vrm_alert_relay.config import VoipmsRecipient
+from vrm_alert_relay.providers._display import describe_recipient
 from vrm_alert_relay.providers._http import DELIVERED
 from vrm_alert_relay.providers.voipms import sms_text
 
@@ -20,17 +17,6 @@ if TYPE_CHECKING:
 __all__ = ["DryRunLogProvider", "describe_recipient"]
 
 _log = logging.getLogger(__name__)
-
-
-def describe_recipient(recipient: Recipient) -> str:
-    """A log-safe description: phone numbers show only their last four digits."""
-    if isinstance(recipient, VoipmsRecipient):
-        return f"sms:{recipient.phone.masked}"
-    if isinstance(recipient, HomeAssistantRecipient):
-        return f"notify.{recipient.service}"
-    if isinstance(recipient, WebhookRecipient):
-        return "webhook"
-    return "log"
 
 
 class DryRunLogProvider:

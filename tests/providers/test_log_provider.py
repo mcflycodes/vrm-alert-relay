@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import pytest
 from provider_helpers import HA, HOOK, LOG, MESSAGE, SMS, StubTransport, assert_no_secrets
 
+from vrm_alert_relay.config import HomeAssistantRecipient
 from vrm_alert_relay.delivery.protocol import Message, Provider, SendStatus
 from vrm_alert_relay.providers import DryRunLogProvider, describe_recipient
 
@@ -57,3 +58,15 @@ def test_sms_dry_run_shows_the_trimmed_text(caplog: pytest.LogCaptureFixture) ->
 
 def test_repr() -> None:
     assert repr(DryRunLogProvider()) == "DryRunLogProvider()"
+
+
+DIGIT_SERVICE = HomeAssistantRecipient(provider="homeassistant", service="mobile_app_2025550199")
+
+
+def test_service_names_with_many_digits_are_masked(caplog: pytest.LogCaptureFixture) -> None:
+    assert describe_recipient(DIGIT_SERVICE) == "notify.[#***0199]"
+    with caplog.at_level(logging.INFO):
+        DryRunLogProvider().send(MESSAGE, DIGIT_SERVICE)
+    (record,) = caplog.records
+    assert record.recipient == "notify.[#***0199]"  # type: ignore[attr-defined]
+    assert "2025550199" not in repr(record.__dict__)

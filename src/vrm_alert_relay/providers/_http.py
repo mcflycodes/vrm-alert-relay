@@ -58,9 +58,11 @@ def result_for_error(error: HttpError) -> SendResult:
     """The outcome of a request that raised ``error``."""
     if isinstance(error, HttpStatusError):
         return result_for_status(error.status)
-    if isinstance(
-        error, HttpRedirectRefused | InvalidUrlError | InvalidHeaderError | InvalidRequestError
-    ):
+    if isinstance(error, HttpRedirectRefused):
+        # The request reached the endpoint, which may have acted on it before
+        # answering with a redirect. The redirect itself is never followed.
+        return AMBIGUOUS
+    if isinstance(error, InvalidUrlError | InvalidHeaderError | InvalidRequestError):
         return FAILED
     if isinstance(error, HttpTimeout):
         return FAILED_RETRYABLE if error.phase in _PRE_SEND_PHASES else AMBIGUOUS

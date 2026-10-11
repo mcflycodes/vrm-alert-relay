@@ -14,16 +14,16 @@ VoIP.ms reports errors as HTTP 200 with a JSON ``status`` other than
 unreadable body or a failure after the request was sent is ``AMBIGUOUS``.
 
 :meth:`VoipmsSmsProvider.reconcile` looks an ambiguous attempt up with
-``getSMS``: by the message ID when one is known, otherwise among messages
-sent from the DID to the recipient in a window around the attempt with
-exactly the text that was sent.
+``getSMS``. Only an exact match on the message ID counts as delivered; without
+an ID, only a definitive empty result counts as not delivered, and anything
+else is unknown, so the engine retries within its bounds.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, timedelta
 from typing import TYPE_CHECKING, Final
 
 from vrm_alert_relay.config import VoipmsRecipient
@@ -31,6 +31,7 @@ from vrm_alert_relay.config.models import DEFAULT_VOIPMS_BASE_URL
 from vrm_alert_relay.delivery.protocol import ReconcileStatus, SendResult, SendStatus
 from vrm_alert_relay.logs.redaction import SecretRegistry, register_secret
 from vrm_alert_relay.net import Endpoint, HttpDecodeError, HttpError
+from vrm_alert_relay.providers._display import describe_recipient
 from vrm_alert_relay.providers._http import (
     AMBIGUOUS,
     FAILED,
@@ -59,7 +60,7 @@ RECONCILE_LIMIT: Final = 100
 """The most ``getSMS`` records requested, and examined, per lookup."""
 RECONCILE_BEFORE: Final = timedelta(minutes=10)
 RECONCILE_AFTER: Final = timedelta(hours=6)
-"""A sent message matches an attempt when stamped within this window of it."""
+"""Without a message ID, the lookup covers the dates of this window around the attempt."""
 
 NON_RETRYABLE_STATUSES: Final = frozenset(
     {
@@ -87,7 +88,6 @@ _TRIM_MARK: Final = "..."
 _SUCCESS: Final = "success"
 _NO_SMS: Final = "no_sms"
 _MESSAGE_ID: Final = re.compile(r"[0-9]{1,20}")
-_DATE_FORMAT: Final = "%Y-%m-%d %H:%M:%S"
 _SENT_TYPE: Final = "0"
 
 _log = logging.getLogger(__name__)
@@ -205,6 +205,15 @@ class VoipmsSmsProvider:
         return result
 
     def reconcile(self, query: ReconcileQuery) -> ReconcileStatus:
+        """Look up an ambiguous attempt.
+
+        ``DELIVERED`` only when ``getSMS`` returns a record with exactly the
+        provider message ID of the attempt, sent from the DID to this
+        recipient. Without an ID, a definitive empty result (``no_sms``) for
+        the window around the attempt is ``NOT_DELIVERED``; anything else,
+        including a record with the same text, is ``UNKNOWN``, because an
+        earlier, distinct message with the same text cannot be told apart.
+        """
         recipient = query.recipient
         if not isinstance(recipient, VoipmsRecipient):
             return ReconcileStatus.UNKNOWN
@@ -234,42 +243,29 @@ class VoipmsSmsProvider:
         records = payload.get("sms") if isinstance(payload, dict) else None
         if status != _SUCCESS or not isinstance(records, list):
             return self._log_reconcile(query, ReconcileStatus.UNKNOWN, _known(status))
-        outcome = self._match(records[:RECONCILE_LIMIT], query, recipient, known_id)
-        return self._log_reconcile(query, outcome, "lookup")
+        if known_id is None:
+            return self._log_reconcile(query, ReconcileStatus.UNKNOWN, "no_message_id")
+        return self._log_reconcile(query, *self._find_id(records, recipient, known_id))
 
-    def _match(
-        self,
-        records: list[object],
-        query: ReconcileQuery,
-        recipient: VoipmsRecipient,
-        known_id: str | None,
-    ) -> ReconcileStatus:
-        expected = sms_text(query.message.text)
-        attempted = query.attempted_at.astimezone(UTC)
-        uncertain = False
-        for record in records:
-            if not isinstance(record, dict) or not self._same_route(record, recipient):
-                continue
-            if known_id is not None:
-                if _message_id(record.get("id")) == known_id:
-                    return ReconcileStatus.DELIVERED
-                continue
-            if record.get("message") != expected:
-                continue
-            sent_at = _parse_date(record.get("date"))
-            if sent_at is None:
-                uncertain = True
-            elif attempted - RECONCILE_BEFORE <= sent_at <= attempted + RECONCILE_AFTER:
-                return ReconcileStatus.DELIVERED
-        if uncertain or known_id is not None:
-            return ReconcileStatus.UNKNOWN
-        return ReconcileStatus.NOT_DELIVERED
+    def _find_id(
+        self, records: list[object], recipient: VoipmsRecipient, known_id: str
+    ) -> tuple[ReconcileStatus, str]:
+        for record in records[:RECONCILE_LIMIT]:
+            if isinstance(record, dict) and _message_id(record.get("id")) == known_id:
+                if self._same_route(record, recipient):
+                    return ReconcileStatus.DELIVERED, "id_match"
+                return ReconcileStatus.UNKNOWN, "id_route_mismatch"
+        return ReconcileStatus.UNKNOWN, "id_not_found"
 
     def _same_route(self, record: Mapping[object, object], recipient: VoipmsRecipient) -> bool:
+        """Whether the record is outbound from the DID to the recipient.
+
+        ``did``, ``contact`` and ``type`` must all be present and exact.
+        """
         return (
-            str(record.get("did")) == self._did.national
-            and str(record.get("contact")) == recipient.phone.national
-            and str(record.get("type", _SENT_TYPE)) == _SENT_TYPE
+            _digits(record.get("did")) == self._did.national
+            and _digits(record.get("contact")) == recipient.phone.national
+            and _is_outbound(record.get("type"))
         )
 
     def _log_outcome(
@@ -288,7 +284,7 @@ class VoipmsSmsProvider:
                 "event": f"provider.{result.status.value}",
                 "provider": "voipms",
                 "delivery_id": message.delivery_id,
-                "recipient": None if recipient is None else f"sms:{recipient.phone.masked}",
+                "recipient": None if recipient is None else describe_recipient(recipient),
                 "retryable": result.retryable,
                 "reason": reason,
             },
@@ -311,10 +307,14 @@ class VoipmsSmsProvider:
         return outcome
 
 
-def _parse_date(value: object) -> datetime | None:
-    if not isinstance(value, str):
+def _digits(value: object) -> str | None:
+    if isinstance(value, bool):
         return None
-    try:
-        return datetime.strptime(value, _DATE_FORMAT).replace(tzinfo=UTC)
-    except ValueError:
-        return None
+    if isinstance(value, int) and value >= 0:
+        return str(value)
+    return value if isinstance(value, str) and value.isascii() and value.isdigit() else None
+
+
+def _is_outbound(value: object) -> bool:
+    """VoIP.ms ``type``: ``0`` (or ``"0"``) for a sent message. Anything else is not."""
+    return value == _SENT_TYPE or (type(value) is int and value == 0)

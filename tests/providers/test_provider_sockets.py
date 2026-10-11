@@ -130,5 +130,6 @@ def test_webhook_redirect_is_refused_end_to_end(serve: Start) -> None:
     )
     with build_providers(relay, RelaySecrets()) as built:
         result = built.providers["webhook"].send(MESSAGE, HOOK)
-    assert (result.status, result.retryable) == (SendStatus.FAILED, False)
+    # The POST reached the receiver, so the outcome is unknown; never followed.
+    assert (result.status, result.retryable) == (SendStatus.AMBIGUOUS, True)
     assert len(server.requests) == 1
