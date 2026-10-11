@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 import logging
@@ -7,6 +8,7 @@ import re
 import warnings
 from collections.abc import Iterator
 from typing import Any
+from urllib.parse import quote, quote_plus
 
 import pytest
 
@@ -260,6 +262,96 @@ def test_formatter_failure_falls_back(
     assert record["level"] == "WARNING"
     assert CANARY not in capsys.readouterr().err
     assert_clean(stream)
+
+
+TRICKY = 'fictitious"pa\\ss/wörd'
+
+
+class HostileStr:
+    def __str__(self) -> str:
+        return json.dumps({"detail": TRICKY})
+
+    def __repr__(self) -> str:
+        return f"HostileStr({TRICKY!r}, {base64.b64encode(TRICKY.encode()).decode()})"
+
+
+@pytest.fixture
+def tricky_stream() -> io.StringIO:
+    registry = SecretRegistry()
+    registry.register(TRICKY)
+    buffer = io.StringIO()
+    configure_logging("DEBUG", stream=buffer, registry=registry)
+    return buffer
+
+
+def assert_no_tricky(stream: io.StringIO) -> None:
+    output = stream.getvalue()
+    for line in output.splitlines():
+        json.loads(line)
+    assert "fictitious" not in output
+    assert "w\\u00f6rd" not in output
+    assert "wörd" not in output
+
+
+def test_hostile_str_and_repr_redacted(tricky_stream: io.StringIO) -> None:
+    hostile = HostileStr()
+    log = logging.getLogger("t")
+    log.info("str %s", hostile)
+    log.info("repr %r", hostile)
+    log.info("extra", extra={"obj": hostile, "nested": {"items": [hostile]}})
+    log.info(hostile)  # type: ignore[arg-type]
+    records = lines(tricky_stream)
+    assert records[0]["msg"] == f'str {{"detail": "{REDACTED}"}}'
+    assert records[1]["msg"] == f"repr HostileStr('{REDACTED}', {REDACTED})"
+    assert_no_tricky(tricky_stream)
+
+
+@pytest.mark.parametrize(
+    "rendered",
+    [
+        json.dumps(TRICKY),
+        json.dumps(TRICKY, ensure_ascii=False),
+        repr(TRICKY),
+        quote(TRICKY, safe=""),
+        quote(TRICKY, safe="").lower(),
+        quote_plus(TRICKY, safe="").lower(),
+        base64.b64encode(TRICKY.encode()).decode(),
+        base64.urlsafe_b64encode(TRICKY.encode()).decode().rstrip("="),
+    ],
+)
+def test_encoded_variants_redacted_in_every_field(
+    tricky_stream: io.StringIO, rendered: str
+) -> None:
+    try:
+        raise ValueError(rendered)
+    except ValueError:
+        logging.getLogger("t").exception(
+            "value %s", rendered, extra={"field": rendered, "list": [rendered]}
+        )
+    assert_no_tricky(tricky_stream)
+
+
+def test_final_pass_redacts_serialized_line() -> None:
+    serialized_only = "fictitious\\\\ncomposite"
+    registry = SecretRegistry()
+    registry.register(serialized_only)
+    buffer = io.StringIO()
+    configure_logging(stream=buffer, registry=registry)
+    logging.getLogger("t").info("value fictitious\ncomposite")
+    (record,) = lines(buffer)
+    assert record["msg"] == f"value {REDACTED}"
+    assert "fictitious" not in buffer.getvalue()
+
+
+def test_final_pass_withholds_line_it_would_corrupt() -> None:
+    registry = SecretRegistry()
+    registry.register('"msg":"harmless"')
+    buffer = io.StringIO()
+    configure_logging(stream=buffer, registry=registry)
+    logging.getLogger("t").info("harmless")
+    (record,) = lines(buffer)
+    assert record["msg"] == "log record withheld by redaction"
+    assert record["level"] == "INFO"
 
 
 def test_globally_registered_secret(capsys: pytest.CaptureFixture[str]) -> None:

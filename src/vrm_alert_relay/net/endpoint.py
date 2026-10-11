@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from urllib.parse import quote, urlsplit
+from urllib.parse import SplitResult, quote, urlsplit
 
 import httpx
 
@@ -141,10 +141,9 @@ def _parse(url: object) -> httpx.URL:
     if "#" in url:
         raise InvalidUrlError("URL must not contain a fragment")
 
-    try:
-        split = urlsplit(url)
-    except ValueError:
-        raise InvalidUrlError("URL could not be parsed") from None
+    split = _urlsplit(url)
+    if split is None:
+        raise InvalidUrlError("URL could not be parsed")
     scheme = split.scheme.lower()
     if scheme != "https":
         shown = (
@@ -160,10 +159,9 @@ def _parse(url: object) -> httpx.URL:
     if port is not None and not 1 <= port <= 65535:
         raise InvalidUrlError("URL port must be between 1 and 65535")
 
-    try:
-        parsed = httpx.URL(url)
-    except (httpx.InvalidURL, ValueError, TypeError):
-        raise InvalidUrlError("URL could not be parsed") from None
+    parsed = _httpx_url(url)
+    if parsed is None:
+        raise InvalidUrlError("URL could not be parsed")
 
     if (
         parsed.scheme != "https" or parsed.userinfo
@@ -177,6 +175,20 @@ def _parse(url: object) -> httpx.URL:
     if (parsed.port or 443) != (port or 443):  # pragma: no cover - parsers agree
         raise InvalidUrlError("URL port could not be parsed")
     return parsed
+
+
+def _urlsplit(url: str) -> SplitResult | None:
+    try:
+        return urlsplit(url)
+    except ValueError:
+        return None
+
+
+def _httpx_url(url: str) -> httpx.URL | None:
+    try:
+        return httpx.URL(url)
+    except (httpx.InvalidURL, ValueError, TypeError):
+        return None
 
 
 def _valid_host(host: str) -> bool:

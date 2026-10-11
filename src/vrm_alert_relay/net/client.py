@@ -5,14 +5,18 @@ Guarantees, none of which can be turned off by callers:
 - HTTPS only, validated before any I/O; certificate verification always on.
 - Redirects are never followed: any 3xx raises :class:`HttpRedirectRefused`.
 - Proxy and TLS environment variables are ignored (``trust_env=False``).
-- Connect, read, write and pool timeouts, plus an overall per-request deadline
-  checked before the body is read and after every body chunk.
-- The response body is streamed and the request aborts as soon as it exceeds
-  the size cap.
+- Connect, read, write and pool timeouts, plus an absolute per-request deadline
+  enforced on every socket operation by :class:`HardenedTransport`.
+- Compression is refused: ``Accept-Encoding: identity`` is always sent and
+  any other ``Content-Encoding`` is rejected before the body is read. The raw
+  body is streamed and the request aborts as soon as it exceeds the size cap.
 - Header names and values are validated; CR, LF, NUL and other control
   characters are rejected.
 - Exceptions carry only the method, the endpoint's display form and the
-  status. Bodies, query strings and header values are never logged.
+  status, and have no ``__cause__`` or ``__context__``. Bodies, query strings
+  and header values are never logged, and the httpx and httpcore loggers are
+  limited to WARNING and above because their records embed full URLs and
+  response headers.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ import json as jsonlib
 import logging
 import math
 import re
+import ssl
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -35,7 +40,9 @@ import httpx
 
 from vrm_alert_relay.net.endpoint import Endpoint
 from vrm_alert_relay.net.errors import (
+    HttpContentEncodingRefused,
     HttpDecodeError,
+    HttpError,
     HttpRedirectRefused,
     HttpStatusError,
     HttpTimeout,
@@ -44,6 +51,7 @@ from vrm_alert_relay.net.errors import (
     InvalidHeaderError,
     InvalidRequestError,
 )
+from vrm_alert_relay.net.transport import HardenedTransport, deadline_scope
 
 DEFAULT_MAX_RESPONSE_BYTES: Final = 1024 * 1024
 DEFAULT_USER_AGENT: Final = "vrm-alert-relay"
@@ -52,7 +60,17 @@ MAX_RETRY_AFTER_SECONDS: Final = 86400.0
 
 _ALLOWED_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"})
 _RESERVED_HEADERS = frozenset(
-    {"host", "content-length", "transfer-encoding", "connection"}
+    {"host", "content-length", "transfer-encoding", "connection", "accept-encoding"}
+)
+_DEADLINE_SLACK = 0.05
+_LIBRARY_LOGGERS = (
+    "httpx",
+    "httpcore",
+    "httpcore.connection",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.socks",
 )
 _HEADER_NAME_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,256}")
 _HEADER_VALUE_FORBIDDEN_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
@@ -76,6 +94,25 @@ MultipartFile = tuple[str, bytes, str]
 MultipartFields = Mapping[str, str | MultipartFile]
 
 _log = logging.getLogger(__name__)
+
+
+class _WarningsOnly(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.WARNING
+
+
+_LIBRARY_FILTER = _WarningsOnly()
+
+
+def _quiet_library_loggers() -> None:
+    for name in _LIBRARY_LOGGERS:
+        logger = logging.getLogger(name)
+        if _LIBRARY_FILTER not in logger.filters:
+            logger.addFilter(_LIBRARY_FILTER)
+
+
+def _tls_context() -> ssl.SSLContext:
+    return httpx.create_ssl_context(verify=True, trust_env=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +159,8 @@ class HttpResponse:
         try:
             return jsonlib.loads(self.content)
         except (ValueError, RecursionError):
-            raise HttpDecodeError("response body is not valid JSON") from None
+            pass
+        raise HttpDecodeError("response body is not valid JSON")
 
 
 class SafeHttpClient:
@@ -138,11 +176,14 @@ class SafeHttpClient:
     ) -> None:
         self._timeouts = timeouts if timeouts is not None else Timeouts()
         self._max_response_bytes = _validate_limit(max_response_bytes)
-        default_headers = {"User-Agent": user_agent, "Accept-Encoding": "identity"}
+        _validate_header_value("User-Agent", user_agent)
+        default_headers = {"User-Agent": user_agent}
         default_headers.update(_validate_headers(headers))
+        default_headers["Accept-Encoding"] = "identity"
+        _quiet_library_loggers()
         self._client = httpx.Client(
+            transport=HardenedTransport(ssl_context=_tls_context()),
             follow_redirects=False,
-            verify=True,
             trust_env=False,
             timeout=httpx.Timeout(
                 connect=self._timeouts.connect,
@@ -150,7 +191,7 @@ class SafeHttpClient:
                 write=self._timeouts.write,
                 pool=self._timeouts.pool,
             ),
-            headers=_validate_headers(default_headers),
+            headers=default_headers,
         )
 
     @property
@@ -246,26 +287,23 @@ class SafeHttpClient:
 
         start = monotonic()
         deadline = start + self._timeouts.deadline
-        try:
-            response = self._client.send(request, stream=True)
-        except httpx.TimeoutException as exc:
-            raise HttpTimeout(method, shown, phase=_timeout_phase(exc)) from None
-        except (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError) as exc:
-            raise HttpTransportError(method, shown, cause=type(exc).__name__) from None
-
-        try:
-            status = response.status_code
-            if 300 <= status < 400:
-                raise HttpRedirectRefused(method, shown, status=status)
-            if not 200 <= status < 300:
-                retry_after = _parse_retry_after(response.headers.get("retry-after"))
-                raise HttpStatusError(
-                    method, shown, status=status, retry_after=retry_after
-                )
-            content = _read_body(response, method, shown, limit, deadline)
-        finally:
-            with contextlib.suppress(httpx.HTTPError, httpx.StreamError):
-                response.close()
+        with deadline_scope(deadline):
+            response = self._send(request, method, shown, deadline)
+            try:
+                status = response.status_code
+                if 300 <= status < 400:
+                    raise HttpRedirectRefused(method, shown, status=status)
+                if not 200 <= status < 300:
+                    retry_after = _parse_retry_after(
+                        response.headers.get("retry-after")
+                    )
+                    raise HttpStatusError(
+                        method, shown, status=status, retry_after=retry_after
+                    )
+                content = _read_body(response, method, shown, limit, deadline)
+            finally:
+                with contextlib.suppress(httpx.HTTPError, httpx.StreamError):
+                    response.close()
 
         _log.debug(
             "http request completed",
@@ -280,6 +318,21 @@ class SafeHttpClient:
         return HttpResponse(
             status_code=status, headers=response.headers, content=content
         )
+
+    def _send(
+        self, request: httpx.Request, method: str, shown: str, deadline: float
+    ) -> httpx.Response:
+        # The sanitized error is raised after the except block so that it has
+        # no __context__ pointing at httpx's exception, whose text has the URL.
+        try:
+            return self._client.send(request, stream=True)
+        except httpx.TimeoutException as exc:
+            error: HttpError = HttpTimeout(
+                method, shown, phase=_timeout_phase(exc, deadline)
+            )
+        except (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError) as exc:
+            error = HttpTransportError(method, shown, cause=type(exc).__name__)
+        raise error
 
     def _build_request(
         self,
@@ -313,14 +366,18 @@ class SafeHttpClient:
                 files=files,
             )
         except (TypeError, ValueError, RecursionError, httpx.InvalidURL):
-            raise InvalidRequestError(
-                f"request body or parameters could not be encoded: {method} {endpoint.display}"
-            ) from None
+            pass
+        raise InvalidRequestError(
+            f"request body or parameters could not be encoded: {method} {endpoint.display}"
+        )
 
 
 def _read_body(
     response: httpx.Response, method: str, shown: str, limit: int, deadline: float
 ) -> bytes:
+    encodings = response.headers.get_list("content-encoding", split_commas=True)
+    if any(token.strip().lower() not in ("", "identity") for token in encodings):
+        raise HttpContentEncodingRefused(method, shown)
     declared = response.headers.get("content-length")
     if (
         declared is not None
@@ -334,17 +391,20 @@ def _read_body(
 
     body = bytearray()
     try:
-        for chunk in response.iter_bytes():
+        for chunk in response.iter_raw():
             body += chunk
             if len(body) > limit:
                 raise HttpTooLarge(method, shown, limit=limit)
             if monotonic() > deadline:
                 raise HttpTimeout(method, shown, phase="deadline")
+        return bytes(body)
     except httpx.TimeoutException as exc:
-        raise HttpTimeout(method, shown, phase=_timeout_phase(exc)) from None
+        error: HttpError = HttpTimeout(
+            method, shown, phase=_timeout_phase(exc, deadline)
+        )
     except (httpx.HTTPError, httpx.StreamError) as exc:
-        raise HttpTransportError(method, shown, cause=type(exc).__name__) from None
-    return bytes(body)
+        error = HttpTransportError(method, shown, cause=type(exc).__name__)
+    raise error
 
 
 def _validate_method(method: object) -> str:
@@ -427,7 +487,9 @@ def _multipart_files(
     return files
 
 
-def _timeout_phase(exc: httpx.TimeoutException) -> str:
+def _timeout_phase(exc: httpx.TimeoutException, deadline: float) -> str:
+    if deadline - monotonic() <= _DEADLINE_SLACK:
+        return "deadline"
     for exc_type, phase in _TIMEOUT_PHASES.items():
         if isinstance(exc, exc_type):
             return phase

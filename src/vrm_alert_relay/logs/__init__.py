@@ -6,8 +6,10 @@ from vrm_alert_relay.logs.redaction import (
     SecretRegistry,
     mask_recipient,
     redact_mapping,
+    redact_secrets,
     redact_text,
     redact_value,
+    register_derived_secret,
     register_secret,
 )
 
@@ -18,7 +20,9 @@ __all__ = [
     "configure_logging",
     "mask_recipient",
     "redact_mapping",
+    "redact_secrets",
     "redact_text",
     "redact_value",
+    "register_derived_secret",
     "register_secret",
 ]

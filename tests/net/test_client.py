@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gzip
 import json
 import logging
+import ssl
 import traceback
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -14,6 +16,7 @@ import pytest
 from vrm_alert_relay.net import (
     DEFAULT_MAX_RESPONSE_BYTES,
     Endpoint,
+    HttpContentEncodingRefused,
     HttpDecodeError,
     HttpError,
     HttpRedirectRefused,
@@ -29,6 +32,7 @@ from vrm_alert_relay.net import (
     Timeouts,
 )
 from vrm_alert_relay.net import client as client_module
+from vrm_alert_relay.net.transport import HardenedTransport
 
 if TYPE_CHECKING:
     from conftest import StubTransport
@@ -70,6 +74,8 @@ def ok(content: bytes = b"{}", **kwargs: Any) -> httpx.Response:
 
 
 def assert_no_canaries(exc: BaseException) -> None:
+    assert exc.__context__ is None
+    assert exc.__cause__ is None
     rendered = [
         str(exc),
         repr(exc),
@@ -103,8 +109,9 @@ def test_underlying_client_is_hardened(monkeypatch: pytest.MonkeyPatch) -> None:
     with SafeHttpClient():
         pass
     assert captured["follow_redirects"] is False
-    assert captured["verify"] is True
     assert captured["trust_env"] is False
+    assert isinstance(captured["transport"], HardenedTransport)
+    assert captured["headers"]["Accept-Encoding"] == "identity"
     timeout = captured["timeout"]
     assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (
         5.0,
@@ -112,6 +119,14 @@ def test_underlying_client_is_hardened(monkeypatch: pytest.MonkeyPatch) -> None:
         10.0,
         5.0,
     )
+
+
+def test_tls_context_verifies_certificates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SSL_CERT_FILE", "/nonexistent/ca.pem")
+    context = client_module._tls_context()
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+    assert context.minimum_version >= ssl.TLSVersion.TLSv1_2
 
 
 def test_proxy_and_tls_environment_is_ignored(
@@ -396,6 +411,8 @@ def test_bad_urls_rejected_before_io(
         {"Host": "evil.example"},
         {"Content-Length": "0"},
         {"Transfer-Encoding": "chunked"},
+        {"Accept-Encoding": "gzip"},
+        {"accept-encoding": "identity"},
     ],
 )
 def test_bad_headers_rejected_before_io(
@@ -546,7 +563,7 @@ def test_timeouts_are_mapped(
     assert excinfo.value.phase == phase
     assert str(excinfo.value) == f"HTTP timeout ({phase}): GET {BASE}"
     assert excinfo.value.__cause__ is None
-    assert excinfo.value.__suppress_context__ is True
+    assert excinfo.value.__context__ is None
     assert_no_canaries(excinfo.value)
 
 
@@ -742,8 +759,110 @@ def test_debug_log_has_no_secrets_or_body(
     assert len(records) == 1
     record = records[0]
     assert record.getMessage() == "http request completed"
+    assert record.args == ()
+    extras = set(record.__dict__) - set(
+        logging.LogRecord("", 0, "", 0, "", None, None).__dict__
+    )
+    assert extras <= {
+        "http_method",
+        "http_target",
+        "http_status",
+        "http_bytes",
+        "elapsed_ms",
+        "message",
+        "asctime",
+    }
     assert record.__dict__["http_target"] == BASE
     assert record.__dict__["http_status"] == 200
     dumped = repr(record.__dict__)
     for secret in CANARIES:
         assert secret not in dumped
+
+
+def test_library_loggers_cannot_emit_urls_or_headers(
+    client: SafeHttpClient, transport: StubTransport, caplog: pytest.LogCaptureFixture
+) -> None:
+    transport.respond(lambda request: ok(headers={"set-cookie": HEADER_CANARY}))
+    with caplog.at_level(logging.DEBUG):
+        client.get(f"{BASE}?token={QUERY_CANARY}")
+        logging.getLogger("httpx").info("HTTP Request: GET %s", QUERY_CANARY)
+        logging.getLogger("httpcore.http11").debug("headers %s", HEADER_CANARY)
+        logging.getLogger("httpx").warning("still visible")
+    library = [r for r in caplog.records if r.name.startswith(("httpx", "httpcore"))]
+    assert [r.getMessage() for r in library] == ["still visible"]
+    assert QUERY_CANARY not in caplog.text
+    assert HEADER_CANARY not in caplog.text
+
+
+def test_library_logger_filter_installed_once() -> None:
+    SafeHttpClient().close()
+    SafeHttpClient().close()
+    for name in client_module._LIBRARY_LOGGERS:
+        filters = logging.getLogger(name).filters
+        assert filters.count(client_module._LIBRARY_FILTER) == 1
+
+
+# Compression
+
+
+@pytest.mark.parametrize(
+    "encoding", ["gzip", "GZIP", "br", "deflate", "identity, gzip", "zstd"]
+)
+def test_compressed_response_refused_before_reading(
+    client: SafeHttpClient, transport: StubTransport, encoding: str
+) -> None:
+    stream = ChunkStream(gzip.compress(b"\x00" * (32 * 1024 * 1024)), count=1)
+    transport.respond(
+        lambda request: httpx.Response(
+            200, headers={"content-encoding": encoding}, stream=stream
+        )
+    )
+    with pytest.raises(HttpContentEncodingRefused) as excinfo:
+        client.get(f"{BASE}?token={QUERY_CANARY}")
+    assert str(excinfo.value) == f"HTTP response content-encoding refused: GET {BASE}"
+    assert stream.yielded == 0
+    assert_no_canaries(excinfo.value)
+
+
+@pytest.mark.parametrize("encoding", ["identity", "Identity", ""])
+def test_identity_encoding_accepted(
+    client: SafeHttpClient, transport: StubTransport, encoding: str
+) -> None:
+    transport.respond(
+        lambda request: ok(b"plain", headers={"content-encoding": encoding})
+    )
+    assert client.get(BASE).content == b"plain"
+
+
+def test_undeclared_compressed_body_is_never_decoded(
+    client: SafeHttpClient, transport: StubTransport
+) -> None:
+    bomb = gzip.compress(b"\x00" * (32 * 1024 * 1024))
+    assert len(bomb) < 64 * 1024
+    transport.respond(lambda request: ok(bomb))
+    response = client.get(BASE)
+    assert response.content == bomb
+
+
+def test_caller_cannot_override_accept_encoding() -> None:
+    with pytest.raises(InvalidHeaderError, match="managed by the client"):
+        SafeHttpClient(headers={"Accept-Encoding": "gzip, br"})
+    with pytest.raises(InvalidHeaderError, match="managed by the client"):
+        SafeHttpClient(headers={"ACCEPT-ENCODING": "identity"})
+
+
+# Exception chaining
+
+
+def test_validation_errors_have_no_context(client: SafeHttpClient) -> None:
+    for call in (
+        lambda: client.get("https://[::1/"),
+        lambda: client.get("https://" + "é" * 70 + ".example/"),
+        lambda: client.post(BASE, json={"value": float("nan")}),
+        lambda: HttpResponse(200, httpx.Headers(), b"not json").json(),
+    ):
+        with pytest.raises(HttpError) as excinfo:
+            call()
+        assert excinfo.value.__context__ is None
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__suppress_context__ is False

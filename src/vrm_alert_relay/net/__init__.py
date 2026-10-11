@@ -11,6 +11,7 @@ from vrm_alert_relay.net.client import (
 )
 from vrm_alert_relay.net.endpoint import Endpoint
 from vrm_alert_relay.net.errors import (
+    HttpContentEncodingRefused,
     HttpDecodeError,
     HttpError,
     HttpRedirectRefused,
@@ -27,6 +28,7 @@ from vrm_alert_relay.net.errors import (
 __all__ = [
     "DEFAULT_MAX_RESPONSE_BYTES",
     "Endpoint",
+    "HttpContentEncodingRefused",
     "HttpDecodeError",
     "HttpError",
     "HttpRedirectRefused",

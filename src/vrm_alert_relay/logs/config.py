@@ -16,6 +16,7 @@ from vrm_alert_relay.logs.redaction import (
     default_registry,
     escape_controls,
     redact_mapping,
+    redact_secrets,
     redact_text,
 )
 
@@ -35,7 +36,9 @@ class JsonFormatter(logging.Formatter):
     ``extra`` values, then ``exc`` and ``stack`` when present. An extra whose
     name collides with a standard field is emitted as ``extra_<name>``.
     Exception and stack text keep their tail when truncated, since the
-    innermost frame and the message are at the end.
+    innermost frame and the message are at the end. Registered secrets are
+    replaced once more in the serialized line, in case a value only appears
+    after JSON escaping.
     """
 
     def __init__(
@@ -52,15 +55,26 @@ class JsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         try:
-            return self._format(record)
+            line = self._format(record)
         except Exception:  # noqa: BLE001 - a raw record must never reach Handler.handleError
-            fallback = {
-                "ts": _timestamp(record),
-                "level": escape_controls(str(record.levelname))[:32],
-                "logger": escape_controls(str(record.name))[:MAX_KEY_LENGTH],
-                "msg": "log record could not be formatted",
-            }
-            return json.dumps(fallback, ensure_ascii=False, separators=(",", ":"))
+            return self._fallback(record, "log record could not be formatted")
+        final = redact_secrets(line, self._registry)
+        if final == line:
+            return line
+        if _is_json(final):
+            return final
+        return self._fallback(record, "log record withheld by redaction")
+
+    def _fallback(self, record: logging.LogRecord, message: str) -> str:
+        fallback = {
+            "ts": _timestamp(record),
+            "level": escape_controls(str(record.levelname))[:32],
+            "logger": redact_secrets(escape_controls(str(record.name)), self._registry)[
+                :MAX_KEY_LENGTH
+            ],
+            "msg": message,
+        }
+        return json.dumps(fallback, ensure_ascii=False, separators=(",", ":"))
 
     def _format(self, record: logging.LogRecord) -> str:
         try:
@@ -156,6 +170,14 @@ def _resolve_level(level: int | str) -> int:
         if name in mapping:
             return mapping[name]
     raise ValueError("invalid log level")
+
+
+def _is_json(line: str) -> bool:
+    try:
+        json.loads(line)
+    except ValueError:
+        return False
+    return True
 
 
 def _timestamp(record: logging.LogRecord) -> str:

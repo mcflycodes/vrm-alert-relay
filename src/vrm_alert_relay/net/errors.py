@@ -4,7 +4,8 @@ Every message is built only from the HTTP method, the endpoint's display form
 (scheme, host, port and path, never the query string or userinfo) and the
 status code. Header values, request and response bodies, and httpx's own
 messages, which embed full URLs, never reach ``str()``, ``repr()`` or
-``args``.
+``args``, and these exceptions are raised with no ``__cause__`` or
+``__context__`` so tracebacks cannot reach httpx's exception either.
 """
 
 from __future__ import annotations
@@ -59,6 +60,17 @@ class HttpTooLarge(HttpRequestError):
     def __init__(self, method: str, target: str, *, limit: int) -> None:
         super().__init__(f"HTTP response exceeded {limit} bytes", method, target)
         self.limit = limit
+
+
+class HttpContentEncodingRefused(HttpRequestError):
+    """The response declared a Content-Encoding other than identity.
+
+    Compressed bodies are never decoded, so a small response cannot expand
+    past the size cap in memory.
+    """
+
+    def __init__(self, method: str, target: str) -> None:
+        super().__init__("HTTP response content-encoding refused", method, target)
 
 
 class HttpRedirectRefused(HttpRequestError):

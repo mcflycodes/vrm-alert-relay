@@ -2,8 +2,9 @@
 
 Applied, in this order, to every string that reaches a log line:
 
-1. exact values registered with :func:`register_secret`, including their
-   URL-encoded and ``repr``-escaped forms;
+1. exact values registered with :func:`register_secret` or
+   :func:`register_derived_secret`, including their ``repr``, JSON, URL and
+   base64 encodings;
 2. URL userinfo, query strings and fragments;
 3. values of sensitive keys (``password=...``, ``"token": "..."``,
    ``Authorization: Bearer ...``);
@@ -18,6 +19,8 @@ outright.
 
 from __future__ import annotations
 
+import base64
+import json
 import math
 import re
 import threading
@@ -66,6 +69,7 @@ _PHONE_RE = re.compile(
 )
 _PHONEISH_RE = re.compile(r"\+?[\d\s().\-]+")
 _NON_DIGIT_RE = re.compile(r"\D")
+_PERCENT_ESCAPE_RE = re.compile(r"%[0-9A-F]{2}")
 
 _ESCAPES: dict[int, str] = {code: f"\\x{code:02x}" for code in range(0x20)}
 _ESCAPES.update({code: f"\\x{code:02x}" for code in range(0x7F, 0xA0)})
@@ -95,20 +99,20 @@ class SecretRegistry:
         self._secrets: tuple[str, ...] = ()
 
     def register(self, value: str) -> None:
-        """Redact ``value`` everywhere. Values shorter than six characters are ignored."""
+        """Redact ``value`` and its encoded forms. Values under six characters are ignored.
+
+        Registered forms: the raw value; its ``repr`` and JSON string escapes
+        (ASCII and non-ASCII); its URL encodings (``quote`` and ``quote_plus``)
+        with upper- and lower-case hex; and its standard and URL-safe base64,
+        with and without padding.
+        """
         if not isinstance(value, str):
             raise TypeError("secret must be a string")
-        variants = {
-            value,
-            quote(value, safe=""),
-            quote_plus(value, safe=""),
-            repr(value)[1:-1],
-        }
-        variants = {
-            variant for variant in variants if len(variant) >= MIN_SECRET_LENGTH
-        }
-        if not variants:
+        if len(value) < MIN_SECRET_LENGTH:
             return
+        variants = {
+            variant for variant in _variants(value) if len(variant) >= MIN_SECRET_LENGTH
+        }
         with self._lock:
             merged = set(self._secrets) | variants
             self._secrets = tuple(sorted(merged, key=len, reverse=True))
@@ -127,8 +131,48 @@ default_registry = SecretRegistry()
 
 
 def register_secret(value: str) -> None:
-    """Register ``value`` with the process-wide registry used by log formatting."""
+    """Register a configured credential with the process-wide registry."""
     default_registry.register(value)
+
+
+def register_derived_secret(value: str) -> None:
+    """Register a credential computed from configured secrets.
+
+    Encodings of a combined value are not substrings of the encodings of its
+    parts: base64 of ``user:password`` does not contain base64 of
+    ``password``. Adapters must therefore register every auth value they build,
+    such as ``f"{user}:{password}"``, a full ``Authorization`` header value, or
+    a signature, in addition to the configured secret itself.
+    """
+    default_registry.register(value)
+
+
+def redact_secrets(text: str, registry: SecretRegistry | None = None) -> str:
+    """Replace registered secrets only; no other redaction step."""
+    for secret in (registry or default_registry).secrets:
+        if secret in text:
+            text = text.replace(secret, REDACTED)
+    return text
+
+
+def _variants(value: str) -> set[str]:
+    raw = value.encode("utf-8")
+    variants = {
+        value,
+        repr(value)[1:-1],
+        json.dumps(value)[1:-1],
+        json.dumps(value, ensure_ascii=False)[1:-1],
+    }
+    for encoded in (quote(value, safe=""), quote_plus(value, safe="")):
+        variants.add(encoded)
+        variants.add(
+            _PERCENT_ESCAPE_RE.sub(lambda match: match.group(0).lower(), encoded)
+        )
+    for b64 in (base64.b64encode(raw), base64.urlsafe_b64encode(raw)):
+        text = b64.decode("ascii")
+        variants.add(text)
+        variants.add(text.rstrip("="))
+    return variants
 
 
 def is_sensitive_key(key: str) -> bool:
@@ -177,11 +221,9 @@ def redact_text(
     keep: Keep = "head",
 ) -> str:
     """Apply every redaction step to ``text`` and bound its length."""
-    secrets = (registry or default_registry).secrets
-    text = _pre_truncate(text, max_length, keep, secrets)
-    for secret in secrets:
-        if secret in text:
-            text = text.replace(secret, REDACTED)
+    registry = registry or default_registry
+    text = _pre_truncate(text, max_length, keep, registry.secrets)
+    text = redact_secrets(text, registry)
     text = _URL_RE.sub(_redact_url_match, text)
     text = _QUOTED_KV_RE.sub(_redact_quoted_match, text)
     text = _HEADER_KV_RE.sub(_redact_kv_match, text)

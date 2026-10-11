@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
+import json
 import time
 from typing import Any
+from urllib.parse import quote, quote_plus
 
 import pytest
 
@@ -10,8 +13,10 @@ from vrm_alert_relay.logs import (
     SecretRegistry,
     mask_recipient,
     redact_mapping,
+    redact_secrets,
     redact_text,
     redact_value,
+    register_derived_secret,
 )
 from vrm_alert_relay.logs import redaction as redaction_module
 from vrm_alert_relay.logs.redaction import (
@@ -66,11 +71,72 @@ def test_encoded_variants_registered() -> None:
         assert "fict" not in redact_text(f"value={rendered!s} end", registry=registry)
 
 
+TRICKY = 'fictitious"pa\\ss/wörd'
+
+
+def _rendered_variants(value: str) -> list[str]:
+    raw = value.encode()
+    return [
+        json.dumps({"detail": value}),
+        json.dumps({"detail": value}, ensure_ascii=False),
+        json.dumps(value),
+        repr(value),
+        quote(value, safe=""),
+        quote(value, safe="").lower(),
+        quote_plus(value, safe=""),
+        quote_plus(value, safe="").lower(),
+        base64.b64encode(raw).decode(),
+        base64.b64encode(raw).decode().rstrip("="),
+        base64.urlsafe_b64encode(raw).decode(),
+    ]
+
+
+@pytest.mark.parametrize("index", range(11))
+def test_encoded_forms_of_registered_secret_redacted(index: int) -> None:
+    registry = SecretRegistry()
+    registry.register(TRICKY)
+    rendered = _rendered_variants(TRICKY)[index]
+    result = redact_text(f"value {rendered} end", registry=registry, max_length=10_000)
+    assert REDACTED in result
+    assert "fictitious" not in result
+    assert "rd" not in result
+
+
+def test_derived_credentials_need_their_own_registration() -> None:
+    registry = SecretRegistry()
+    registry.register("fictitious-pass")
+    basic = base64.b64encode(b"relay-user:fictitious-pass").decode()
+    header = f"Basic {basic}"
+    assert basic in redact_text(f"sent {header}", registry=registry)
+    registry.register("relay-user:fictitious-pass")
+    assert redact_text(f"sent {header}", registry=registry) == f"sent Basic {REDACTED}"
+
+
+def test_register_derived_secret_uses_default_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh = SecretRegistry()
+    monkeypatch.setattr(redaction_module, "default_registry", fresh)
+    register_derived_secret("relay-user:fictitious-pass")
+    basic = base64.b64encode(b"relay-user:fictitious-pass").decode()
+    assert redact_text(basic) == REDACTED
+    assert redact_secrets(f"x {basic}") == f"x {REDACTED}"
+
+
+def test_short_value_variants_not_registered() -> None:
+    registry = SecretRegistry()
+    registry.register("a/b+c")
+    assert registry.secrets == ()
+
+
 def test_longest_secret_replaced_first() -> None:
     registry = SecretRegistry()
     registry.register("fictitious")
     registry.register("fictitious-longer-value")
-    assert registry.secrets[0] == "fictitious-longer-value"
+    lengths = [len(secret) for secret in registry.secrets]
+    assert lengths == sorted(lengths, reverse=True)
+    order = registry.secrets.index
+    assert order("fictitious-longer-value") < order("fictitious")
     assert (
         redact_text("x fictitious-longer-value y", registry=registry)
         == f"x {REDACTED} y"
