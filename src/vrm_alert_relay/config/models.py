@@ -36,6 +36,8 @@ from .fields import (
 __all__ = [
     "DEFAULT_VOIPMS_BASE_URL",
     "DEFAULT_VRM_BASE_URL",
+    "MAX_GLOBAL_PER_DAY",
+    "MAX_GLOBAL_PER_HOUR",
     "PROVIDER_NAMES",
     "SUPPORTED_VERSIONS",
     "SUPPORTED_VERSIONS_TEXT",
@@ -130,9 +132,14 @@ class VrmConfig(_Model):
     ]
 
 
+MAX_GLOBAL_PER_HOUR = 200
+MAX_GLOBAL_PER_DAY = 1000
+"""Ceilings for an alerting relay; the state journal is sized for the daily one."""
+
+
 class RateLimitsConfig(_Model):
-    global_per_hour: int = Field(default=20, ge=1, le=1000)
-    global_per_day: int = Field(default=60, ge=1, le=10_000)
+    global_per_hour: int = Field(default=20, ge=1, le=MAX_GLOBAL_PER_HOUR)
+    global_per_day: int = Field(default=60, ge=1, le=MAX_GLOBAL_PER_DAY)
     retries: int = Field(default=3, ge=0, le=10)
 
 
