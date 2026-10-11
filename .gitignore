@@ -17,4 +17,4 @@ dist/
 requirements-audit.txt
 sbom.*.json
 scratchpad/
-state/
+/state/
