@@ -11,6 +11,10 @@ Applied, in this order, to every string that reaches a log line:
 5. control and bidirectional-override characters, escaped;
 6. truncation to a bounded length.
 
+A string longer than its limit is cut to the limit before step 1, so
+matching cost is bounded by the field limit. Any part of a secret that runs
+across the cut (in any matched encoding) is dropped with it.
+
 Structured values (mappings, sequences) are redacted recursively with bounded
 depth, item count and total size, and values under sensitive keys are replaced
 outright.
@@ -28,11 +32,24 @@ for characters outside the BMP), a JSON short escape (``\\"``, ``\\\\``,
 standard and URL-safe base64 of the whole value, padded and unpadded, are
 matched exactly.
 
-A literal ``\\`` or ``%`` can also begin an escape, so matching those
-characters can backtrack. To keep matching time bounded, a secret with more
-than ``MAX_AMBIGUOUS_CHARACTERS`` of them gets a matcher that never
-backtracks, plus exact matches of its canonical ``repr``, JSON and URL
-encodings.
+At most ``MAX_SECRETS`` values of at most ``MAX_SECRET_LENGTH`` characters
+can be registered; :class:`TooManySecretsError` and
+:class:`SecretTooLongError` are raised beyond that. Secrets are first
+detected in linear time by :mod:`vrm_alert_relay.logs.lattice`, and only
+detected secrets are located with their matcher.
+
+Known limitation: a literal ``\\`` or ``%`` can also begin an escape, so
+matching those characters can backtrack. A secret with more than
+``MAX_AMBIGUOUS_CHARACTERS`` of them gets a matcher that never backtracks:
+at each ``\\`` or ``%`` of the secret it takes the literal character
+whenever the text has one there. Such a secret is therefore missed when the
+text spells some of those characters with an encoding that itself starts
+with ``\\`` or ``%`` (``\\\\``, ``\\u005c`` or ``\\x5c`` for ``\\``;
+``%25`` for ``%``) while spelling other characters differently, for
+example the secret ``"fict" + "\\\\" * 7 + "pass"`` written with only its
+first backslash JSON-escaped. Spellings that are entirely
+literal, entirely ``repr``-, JSON- or percent-encoded, or that encode
+``\\`` as ``%5C`` and ``%`` as ``\\u0025`` are still matched.
 
 Encodings of a composite value are not built from the encodings of its
 parts: base64 of ``user:password`` does not contain base64 of ``password``.
@@ -53,10 +70,13 @@ from dataclasses import dataclass
 from typing import Any, Final, Literal
 from urllib.parse import quote, quote_plus
 
+from vrm_alert_relay.logs.lattice import Lattice
+
 REDACTED: Final = "[REDACTED]"
 TRUNCATED: Final = "[TRUNCATED]"
 MIN_SECRET_LENGTH: Final = 6
-MAX_SECRET_BYTES: Final = 4096
+MAX_SECRET_LENGTH: Final = 512
+MAX_SECRETS: Final = 32
 MAX_AMBIGUOUS_CHARACTERS: Final = 6
 DEFAULT_MAX_FIELD_LENGTH: Final = 2048
 MAX_DEPTH: Final = 6
@@ -95,6 +115,8 @@ _PHONE_RE = re.compile(
     re.VERBOSE,
 )
 _PHONEISH_RE = re.compile(r"\+?[\d\s().\-]+")
+_CUT_PATTERNS: Final = (_URL_RE, _QUOTED_KV_RE, _HEADER_KV_RE, _BARE_KV_RE, _PHONE_RE)
+_CUT_CONTEXT: Final = 1024
 _NON_DIGIT_RE = re.compile(r"\D")
 _PERCENT_ESCAPE_RE = re.compile(r"%[0-9A-F]{2}")
 _BACKSLASH_ESCAPES: Final = {
@@ -130,10 +152,34 @@ _ESCAPES.update(
 Keep = Literal["head", "tail"]
 
 
+class SecretRegistrationError(ValueError):
+    """A secret could not be registered."""
+
+
+class SecretTooLongError(SecretRegistrationError):
+    """The value exceeds ``MAX_SECRET_LENGTH`` characters."""
+
+
+class TooManySecretsError(SecretRegistrationError):
+    """``MAX_SECRETS`` values are already registered."""
+
+
 @dataclass(frozen=True, slots=True)
 class _Matcher:
     pattern: re.Pattern[str]
     exact: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _State:
+    values: tuple[str, ...]
+    patterns: tuple[re.Pattern[str], ...]
+    exact: tuple[str, ...]
+    secrets: tuple[str, ...]
+    lattice: Lattice
+
+
+_EMPTY = _State((), (), (), (), Lattice(()))
 
 
 class SecretRegistry:
@@ -142,60 +188,125 @@ class SecretRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._matchers: dict[str, _Matcher] = {}
-        self._patterns: tuple[re.Pattern[str], ...] = ()
-        self._exact: tuple[str, ...] = ()
-        self._secrets: tuple[str, ...] = ()
+        self._state = _EMPTY
 
     def register(self, value: str) -> None:
         """Redact ``value`` in any encoding. Values under six characters are ignored.
 
-        Raises :class:`ValueError` for values over ``MAX_SECRET_BYTES`` in
-        UTF-8, which bounds the size of the compiled matcher.
+        Raises :class:`SecretTooLongError` for values over
+        ``MAX_SECRET_LENGTH`` characters and :class:`TooManySecretsError` when
+        ``MAX_SECRETS`` other values are registered. Registering a value
+        again does nothing.
         """
         if not isinstance(value, str):
             raise TypeError("secret must be a string")
         if len(value) < MIN_SECRET_LENGTH:
             return
-        if len(value.encode("utf-8", "surrogatepass")) > MAX_SECRET_BYTES:
-            raise ValueError(f"secret exceeds {MAX_SECRET_BYTES} bytes")
-        if value in self._matchers:
-            return
+        if len(value) > MAX_SECRET_LENGTH:
+            raise SecretTooLongError(f"secret exceeds {MAX_SECRET_LENGTH} characters")
+        with self._lock:
+            if value in self._matchers:
+                return
+            self._check_capacity()
         matcher = _compile_matcher(value)
         with self._lock:
+            if value in self._matchers:
+                return
+            self._check_capacity()
             self._matchers[value] = matcher
-            values = sorted(self._matchers, key=len, reverse=True)
-            matchers = [self._matchers[secret] for secret in values]
-            exact = {form for entry in matchers for form in entry.exact}
-            self._patterns = tuple(entry.pattern for entry in matchers)
-            self._exact = tuple(sorted(exact, key=len, reverse=True))
-            self._secrets = tuple(sorted(exact | set(values), key=len, reverse=True))
+            self._state = _build_state(self._matchers)
+
+    def _check_capacity(self) -> None:
+        if len(self._matchers) >= MAX_SECRETS:
+            raise TooManySecretsError(
+                f"at most {MAX_SECRETS} secrets can be registered"
+            )
 
     def clear(self) -> None:
         with self._lock:
             self._matchers = {}
-            self._patterns = ()
-            self._exact = ()
-            self._secrets = ()
+            self._state = _EMPTY
 
     @property
     def secrets(self) -> tuple[str, ...]:
         """Registered values and their exact-match encodings, longest first."""
-        return self._secrets
+        return self._state.secrets
 
     def redact(self, text: str) -> str:
         """Replace every match of a registered secret with ``[REDACTED]``."""
-        for form in self._exact:
+        state = self._state
+        for form in state.exact:
             if form in text:
                 text = text.replace(form, REDACTED)
-        for pattern in self._patterns:
-            text = pattern.sub(REDACTED, text)
+        detected, literal = state.lattice.detect(text)
+        for index in detected:
+            if literal:
+                text = text.replace(state.values[index], REDACTED)
+            else:
+                text = state.patterns[index].sub(REDACTED, text)
         return text
 
     def contains(self, text: str) -> bool:
         """Whether ``text`` contains a registered secret in any matched encoding."""
-        return any(form in text for form in self._exact) or any(
-            pattern.search(text) for pattern in self._patterns
-        )
+        state = self._state
+        if any(form in text for form in state.exact):
+            return True
+        detected, literal = state.lattice.detect(text)
+        if literal:
+            return bool(detected)
+        return any(state.patterns[index].search(text) for index in detected)
+
+    def trim_partial(self, text: str, keep: Keep) -> str:
+        """Drop a partial secret, in any matched encoding, left at a cut.
+
+        With ``keep="head"`` the text was cut at its end; with ``"tail"``,
+        at its start.
+        """
+        state = self._state
+        if keep == "tail":
+            text = text[state.lattice.partial_suffix_end(text) :]
+            return _trim_exact_suffixes(text, state.exact)
+        text = text[: state.lattice.partial_prefix_start(text)]
+        return _trim_exact_prefixes(text, state.exact)
+
+
+def _build_state(matchers: Mapping[str, _Matcher]) -> _State:
+    values = tuple(sorted(matchers, key=len, reverse=True))
+    entries = [matchers[value] for value in values]
+    exact = {form for entry in entries for form in entry.exact}
+    return _State(
+        values=values,
+        patterns=tuple(entry.pattern for entry in entries),
+        exact=tuple(sorted(exact, key=len, reverse=True)),
+        secrets=tuple(sorted(exact | set(values), key=len, reverse=True)),
+        lattice=Lattice(values),
+    )
+
+
+def _trim_exact_prefixes(text: str, forms: Iterable[str]) -> str:
+    """Drop the end of ``text`` if it is the start of an exact form."""
+    for form in forms:
+        tail = text[-(len(form) - 1) :]
+        position = tail.find(form[0])
+        while position != -1:
+            if form.startswith(tail[position:]):
+                text = text[: len(text) - len(tail) + position]
+                break
+            position = tail.find(form[0], position + 1)
+    return text
+
+
+def _trim_exact_suffixes(text: str, forms: Iterable[str]) -> str:
+    """Drop the start of ``text`` if it is the end of an exact form."""
+    for form in forms:
+        head = text[: len(form) - 1]
+        position = head.rfind(form[-1])
+        while position != -1:
+            if form.endswith(head[: position + 1]):
+                text = text[position + 1 :]
+                break
+            position = head.rfind(form[-1], 0, position)
+    return text
 
 
 default_registry = SecretRegistry()
@@ -342,14 +453,46 @@ def redact_text(
 ) -> str:
     """Apply every redaction step to ``text`` and bound its length."""
     registry = registry or default_registry
-    text = _pre_truncate(text, max_length, keep, registry.secrets)
+    cut = len(text) > max_length
+    if cut:
+        text = registry.trim_partial(_cut(text, max_length, keep), keep)
     text = redact_secrets(text, registry)
     text = _URL_RE.sub(_redact_url_match, text)
     text = _QUOTED_KV_RE.sub(_redact_quoted_match, text)
     text = _HEADER_KV_RE.sub(_redact_kv_match, text)
     text = _BARE_KV_RE.sub(_redact_kv_match, text)
     text = mask_phone_numbers(text)
-    return truncate(escape_controls(text), max_length, keep=keep)
+    text = escape_controls(text)
+    if not cut:
+        return truncate(text, max_length, keep=keep)
+    room = max(max_length - len(TRUNCATED), 0)
+    if keep == "tail":
+        return TRUNCATED + (text[-room:] if room else "")
+    return text[:room] + TRUNCATED
+
+
+def _cut(text: str, limit: int, keep: Keep) -> str:
+    """Cut ``text`` to ``limit``, moving the cut out of any URL, key-value or phone number.
+
+    Only matches within ``_CUT_CONTEXT`` characters of the cut are
+    considered, which bounds the cost.
+    """
+    position = len(text) - limit if keep == "tail" else limit
+    low = max(position - _CUT_CONTEXT, 0)
+    window = text[low : position + _CUT_CONTEXT]
+    relative = position - low
+    spans = [
+        match.span() for pattern in _CUT_PATTERNS for match in pattern.finditer(window)
+    ]
+    moved = True
+    while moved:
+        moved = False
+        for start, end in spans:
+            if start < relative < end:
+                relative = end if keep == "tail" else start
+                moved = True
+    position = low + relative
+    return text[position:] if keep == "tail" else text[:position]
 
 
 JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
@@ -454,30 +597,6 @@ def _safe_str(value: object) -> str:
         return str(value)
     except Exception:  # noqa: BLE001 - arbitrary __str__ implementations
         return f"<unprintable {type(value).__name__}>"
-
-
-def _pre_truncate(
-    text: str, max_length: int, keep: Keep, secrets: tuple[str, ...]
-) -> str:
-    """Bound regex work on huge inputs without exposing a partial secret at the cut."""
-    bound = max(16 * max_length, 65536)
-    if len(text) <= bound:
-        return text
-    if keep == "tail":
-        text = text[-bound:]
-        for secret in secrets:
-            for size in range(min(len(secret), len(text)) - 1, 0, -1):
-                if text.startswith(secret[-size:]):
-                    text = text[size:]
-                    break
-        return text
-    text = text[:bound]
-    for secret in secrets:
-        for size in range(min(len(secret), len(text)) - 1, 0, -1):
-            if text.endswith(secret[:size]):
-                text = text[:-size]
-                break
-    return text
 
 
 def _redact_url_match(match: re.Match[str]) -> str:

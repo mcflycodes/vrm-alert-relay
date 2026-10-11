@@ -6,9 +6,9 @@ transport owns the socket layer under httpcore's connection pool and limits
 every step to the time remaining before the deadline set by
 :func:`deadline_scope`:
 
-- name resolution runs on a small per-transport thread pool and is abandoned
-  when the deadline passes; when every worker is busy the request fails at
-  once instead of queueing (:class:`DnsTimeout`);
+- name resolution runs on two daemon threads per transport and is abandoned
+  when the deadline passes; when both are busy the request fails at once
+  instead of queueing (:class:`DnsTimeout`);
 - resolved addresses are tried in order, each connect attempt getting only
   the time still remaining;
 - the TLS handshake, every ``recv`` and every partial ``send`` recompute the
@@ -24,12 +24,12 @@ from __future__ import annotations
 
 import contextvars
 import ipaddress
+import queue
 import selectors
 import socket
 import ssl
 import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from time import monotonic
 from typing import Any, Final, cast
@@ -196,20 +196,35 @@ def _ip_literal(host: str, port: int) -> Sequence[AddressInfo] | None:
     )
 
 
-class _BoundedResolver:
-    """Runs lookups on at most ``DNS_WORKERS`` threads and never queues them.
+class _Lookup:
+    __slots__ = ("addresses", "done", "error", "host", "port")
 
-    A lookup that outlives its deadline keeps its worker until the resolver
-    returns, so stalled lookups can occupy at most ``DNS_WORKERS`` threads;
-    while they do, new lookups fail immediately.
+    def __init__(self, host: str, port: int) -> None:
+        self.host = host
+        self.port = port
+        self.done = threading.Event()
+        self.addresses: list[AddressInfo] = []
+        self.error: BaseException | None = None
+
+
+class _BoundedResolver:
+    """Runs lookups on ``DNS_WORKERS`` daemon threads and never queues them.
+
+    A lookup takes one of ``DNS_WORKERS`` slots before it is handed to a
+    worker, and the worker frees the slot when the resolver returns. A lookup
+    that outlives its deadline therefore keeps its slot, so stalled lookups
+    can occupy at most ``DNS_WORKERS`` threads; while they do, new lookups
+    fail immediately. Workers are daemon threads, so a resolver call that
+    never returns does not keep the interpreter from exiting.
     """
 
     def __init__(self, resolve: Resolver) -> None:
         self._resolve = resolve
         self._slots = threading.BoundedSemaphore(DNS_WORKERS)
-        self._executor = ThreadPoolExecutor(
-            max_workers=DNS_WORKERS, thread_name_prefix="vrm-alert-relay-dns"
-        )
+        self._jobs: queue.SimpleQueue[_Lookup | None] = queue.SimpleQueue()
+        self._lock = threading.Lock()
+        self._workers: list[threading.Thread] = []
+        self._closed = False
 
     def lookup(
         self, host: str, port: int, timeout: float | None
@@ -220,26 +235,41 @@ class _BoundedResolver:
             return literal
         if not self._slots.acquire(blocking=False):
             raise _CoreDnsTimeout("all resolver workers are busy")
-        try:
-            future = self._executor.submit(self._run, host, port)
-        except RuntimeError:
-            self._slots.release()
-            raise httpcore.ConnectError("resolver is closed") from None
-        try:
-            return future.result(timeout=wait)
-        except TimeoutError:
-            raise _CoreDnsTimeout("name resolution timed out") from None
-        except (OSError, UnicodeError) as exc:
-            raise httpcore.ConnectError(type(exc).__name__) from None
+        job = _Lookup(host, port)
+        with self._lock:
+            if self._closed:
+                self._slots.release()
+                raise httpcore.ConnectError("resolver is closed")
+            while len(self._workers) < DNS_WORKERS:
+                worker = threading.Thread(
+                    target=self._work, name="vrm-alert-relay-dns", daemon=True
+                )
+                worker.start()
+                self._workers.append(worker)
+            self._jobs.put(job)
+        if not job.done.wait(wait):
+            raise _CoreDnsTimeout("name resolution timed out")
+        if isinstance(job.error, OSError | UnicodeError):
+            raise httpcore.ConnectError(type(job.error).__name__) from None
+        if job.error is not None:
+            raise job.error
+        return job.addresses
 
-    def _run(self, host: str, port: int) -> Sequence[AddressInfo]:
-        try:
-            return list(self._resolve(host, port))
-        finally:
-            self._slots.release()
+    def _work(self) -> None:
+        while (job := self._jobs.get()) is not None:
+            try:
+                job.addresses = list(self._resolve(job.host, job.port))
+            except BaseException as exc:  # noqa: BLE001 - re-raised by lookup()
+                job.error = exc
+            finally:
+                self._slots.release()
+                job.done.set()
 
     def close(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        with self._lock:
+            self._closed = True
+            for _ in self._workers:
+                self._jobs.put(None)
 
 
 class _DeadlineBackend(httpcore.NetworkBackend):

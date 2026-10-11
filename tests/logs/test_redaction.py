@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import random
 import time
 from typing import Any
 from urllib.parse import quote, quote_plus
@@ -9,8 +11,14 @@ from urllib.parse import quote, quote_plus
 import pytest
 
 from vrm_alert_relay.logs import (
+    MAX_SECRET_LENGTH,
+    MAX_SECRETS,
     REDACTED,
+    JsonFormatter,
+    SecretRegistrationError,
     SecretRegistry,
+    SecretTooLongError,
+    TooManySecretsError,
     contains_secret,
     mask_recipient,
     redact_mapping,
@@ -20,12 +28,12 @@ from vrm_alert_relay.logs import (
     register_derived_secret,
 )
 from vrm_alert_relay.logs import redaction as redaction_module
+from vrm_alert_relay.logs.lattice import Lattice
 from vrm_alert_relay.logs.redaction import (
     MAX_AMBIGUOUS_CHARACTERS,
     MAX_DEPTH,
     MAX_ITEMS,
     MAX_NODES,
-    MAX_SECRET_BYTES,
     TRUNCATED,
     escape_controls,
     is_sensitive_key,
@@ -222,17 +230,36 @@ def test_matcher_is_exact_about_letters() -> None:
         assert not contains_secret(text, registry)
 
 
-def test_secret_size_limit_is_in_utf8_bytes() -> None:
+def test_secret_length_is_capped_in_characters() -> None:
     registry = SecretRegistry()
-    largest = "f" + "x" * (MAX_SECRET_BYTES - 1)
-    started = time.monotonic()
+    largest = "f" + "é" * (MAX_SECRET_LENGTH - 1)
     registry.register(largest)
-    assert time.monotonic() - started < 5
     assert redact_secrets(f"a {largest} b", registry) == f"a {REDACTED} b"
-    with pytest.raises(ValueError, match="4096 bytes"):
+    with pytest.raises(SecretTooLongError, match="512 characters"):
         registry.register(largest + "x")
-    with pytest.raises(ValueError, match="4096 bytes"):
-        registry.register("é" * 2049)
+    assert issubclass(SecretTooLongError, SecretRegistrationError)
+    assert issubclass(SecretRegistrationError, ValueError)
+    assert len(registry.secrets) > 0
+    assert largest + "x" not in registry.secrets
+
+
+def test_number_of_secrets_is_capped() -> None:
+    registry = SecretRegistry()
+    values = [f"fictitious-secret-{index:04d}" for index in range(MAX_SECRETS)]
+    for value in values:
+        registry.register(value)
+    registry.register(values[0])
+    registry.register("short")
+    with pytest.raises(TooManySecretsError, match="32 secrets"):
+        registry.register("fictitious-secret-extra")
+    assert issubclass(TooManySecretsError, SecretRegistrationError)
+    assert redact_secrets(values[-1], registry) == REDACTED
+    assert redact_secrets("fictitious-secret-extra", registry) == (
+        "fictitious-secret-extra"
+    )
+    registry.clear()
+    registry.register("fictitious-secret-extra")
+    assert redact_secrets("fictitious-secret-extra", registry) == REDACTED
 
 
 def test_repeated_registration_is_a_no_op() -> None:
@@ -270,6 +297,26 @@ def test_many_backslashes_use_non_backtracking_matcher() -> None:
     started = time.monotonic()
     redact_secrets(hostile, registry)
     assert time.monotonic() - started < 0.5
+
+
+def test_known_limitation_escape_heavy_secret_in_mixed_spelling_is_missed() -> None:
+    """Documents the known limitation in the redaction module docstring.
+
+    Over ``MAX_AMBIGUOUS_CHARACTERS`` backslashes, the matcher takes each
+    backslash literally whenever it can, so a spelling that escapes only
+    some of them is not matched. If this starts failing because the value is
+    now redacted, the limitation is fixed: update the docstring and this test.
+    """
+    secret = "fict" + "\\" * (MAX_AMBIGUOUS_CHARACTERS + 1) + "pass"
+    registry = SecretRegistry()
+    registry.register(secret)
+    mixed = "fict" + "\\\\" + "\\" * MAX_AMBIGUOUS_CHARACTERS + "pass"
+    unicode_mixed = "fict" + "\\u005c" + "\\" * MAX_AMBIGUOUS_CHARACTERS + "pass"
+    for text in (mixed, unicode_mixed):
+        assert redact_secrets(f"<{text}>", registry) == f"<{text}>"
+        assert not contains_secret(text, registry)
+    still_matched = "fict" + "%5C" + "\\" * MAX_AMBIGUOUS_CHARACTERS + "pass"
+    assert redact_secrets(f"<{still_matched}>", registry) == f"<{REDACTED}>"
 
 
 def test_backtracking_is_bounded_for_hostile_input() -> None:
@@ -523,26 +570,130 @@ def test_regex_heavy_input_is_fast() -> None:
     assert time.perf_counter() - start < 2.0
 
 
-def test_pre_truncation_never_exposes_partial_secret(registry: SecretRegistry) -> None:
-    bound = max(16 * 2048, 65536)
-    shrinking = 'password="' + "x" * (bound - 20) + '" '
+def test_cut_never_exposes_partial_secret(registry: SecretRegistry) -> None:
+    shrinking = 'password="' + "x" * (2048 - 20) + '" '
     text = shrinking + CANARY + " trailing"
-    cut = bound - len(shrinking)
+    cut = 2048 - len(shrinking)
     assert 0 < cut < len(CANARY)
     result = redact_text(text, registry=registry)
-    assert CANARY[:cut] not in result
-    assert CANARY[:4] not in result
+    assert result == f'password="{REDACTED}" {TRUNCATED}'
 
 
-def test_pre_truncation_tail_never_exposes_partial_secret(
-    registry: SecretRegistry,
-) -> None:
-    bound = max(16 * 2048, 65536)
-    tail = " " + "y" * (bound - 10)
+def test_cut_tail_never_exposes_partial_secret(registry: SecretRegistry) -> None:
+    tail = " " + "y" * (2048 - 10)
     text = "leading " + CANARY + tail
     result = redact_text(text, registry=registry, keep="tail")
+    assert result == TRUNCATED + tail[-(2048 - len(TRUNCATED)) :]
     assert CANARY[-4:] not in result
-    assert result.startswith(TRUNCATED)
+
+
+def _percent_all(value: str) -> str:
+    return "".join(f"%{byte:02x}" for byte in value.encode())
+
+
+def _unicode_all(value: str) -> str:
+    return "".join(f"\\u{ord(char):04X}" for char in value)
+
+
+ENCODINGS = [_percent_all, _unicode_all, lambda value: value.replace("-", "%2D")]
+
+
+@pytest.mark.parametrize("encode", ENCODINGS)
+@pytest.mark.parametrize("fraction", [0.0, 0.2, 0.5, 0.99])
+def test_cut_drops_encoded_partial_secret_at_head(
+    registry: SecretRegistry, encode: Any, fraction: float
+) -> None:
+    encoded = encode(CANARY)
+    inside = max(1, int(len(encoded) * fraction))
+    filler = "y" * (2048 - inside - 1) + " "
+    result = redact_text(filler + encoded + " after", registry=registry)
+    assert result == filler[: 2048 - len(TRUNCATED)] + TRUNCATED
+
+
+@pytest.mark.parametrize("encode", ENCODINGS)
+@pytest.mark.parametrize("fraction", [0.0, 0.2, 0.5, 0.99])
+def test_cut_drops_encoded_partial_secret_at_tail(
+    registry: SecretRegistry, encode: Any, fraction: float
+) -> None:
+    encoded = encode(CANARY)
+    inside = max(1, int(len(encoded) * fraction))
+    tail = " " + "y" * (2048 - inside - 1)
+    result = redact_text("before " + encoded + tail, registry=registry, keep="tail")
+    assert result == TRUNCATED + tail[-(2048 - len(TRUNCATED)) :]
+
+
+@pytest.mark.parametrize("keep", ["head", "tail"])
+def test_cut_drops_partial_base64_secret(registry: SecretRegistry, keep: Any) -> None:
+    encoded = base64.b64encode(CANARY.encode()).decode()
+    shrinking = 'password="' + "x" * (2048 - 30) + '"'
+    if keep == "head":
+        text = shrinking + " " + encoded
+        expected = f'password="{REDACTED}" {TRUNCATED}'
+    else:
+        text = encoded + " " + shrinking
+        expected = f'{TRUNCATED} password="{REDACTED}"'
+    assert redact_text(text, registry=registry, keep=keep) == expected
+
+
+def test_cut_moves_out_of_sensitive_values() -> None:
+    registry = SecretRegistry()
+    keyed = 'password="' + "s" * 100 + '" '
+    tail_text = keyed + "z" * (2048 - 50)
+    result = redact_text(tail_text, registry=registry, keep="tail")
+    assert "s" not in result
+    phone = "call +1 202 555 0143 "
+    head_text = "z" * (2048 - 8) + phone
+    assert "202" not in redact_text(head_text, registry=registry)
+    tail_phone = phone + "z" * (2048 - 8)
+    assert "0143" not in redact_text(tail_phone, registry=registry, keep="tail")
+    url = "https://user:fictitious@example.com/?q=1 "
+    assert "user" not in redact_text("z" * (2048 - 12) + url, registry=registry)
+
+
+def test_detection_finds_every_regex_match() -> None:
+    rng = random.Random(20261011)  # noqa: S311 - reproducible test data
+    alphabet = "ab\\%u0+ é/\U0001f600"
+    for _ in range(300):
+        secret = "".join(rng.choice(alphabet) for _ in range(rng.randint(6, 10)))
+        forms = [
+            lambda char: char,
+            lambda char: "".join(f"%{byte:02X}" for byte in char.encode("utf-8")),
+            lambda char: json.dumps(char)[1:-1],
+            lambda char: json.dumps(char, ensure_ascii=True)[1:-1].upper(),
+            lambda char: f"\\x{ord(char):02x}" if ord(char) < 0x100 else char,
+            lambda char: "+" if char == " " else char,
+        ]
+        noise = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 8)))
+        spelled = "".join(rng.choice(forms)(char) for char in secret)
+        text = noise + spelled + noise[::-1]
+        matcher = redaction_module._compile_matcher(secret)
+        hit = matcher.pattern.search(text) is not None
+        detected, _ = Lattice([secret]).detect(text)
+        assert not hit or detected == [0], (secret, text)
+        registry = SecretRegistry()
+        registry.register(secret)
+        assert contains_secret(text, registry) == (
+            hit or any(form in text for form in matcher.exact)
+        )
+
+
+def test_matching_cost_is_bounded_with_full_registry() -> None:
+    registry = SecretRegistry()
+    stems = "bcdefghijklmnopqrstuvwxyz0123456"
+    for stem in stems[:MAX_SECRETS]:
+        registry.register("%a\\" + "a" * (MAX_SECRET_LENGTH - 4) + stem)
+    near = "%a\\" + "a" * (MAX_SECRET_LENGTH - 4)
+    hostile = (near * 70)[:65536]
+    formatter = JsonFormatter(registry=registry)
+    record = logging.LogRecord(
+        "relay", logging.INFO, __file__, 1, "%s", (hostile,), None
+    )
+    started = time.perf_counter()
+    line = formatter.format(record)
+    elapsed = time.perf_counter() - started
+    print(f"near-prefix record with full registry formatted in {elapsed:.3f} s")
+    assert elapsed < 0.25
+    assert json.loads(line)["msg"].endswith(TRUNCATED)
 
 
 # Structured values

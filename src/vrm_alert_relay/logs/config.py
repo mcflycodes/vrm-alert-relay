@@ -12,6 +12,7 @@ from typing import Final, TextIO
 from vrm_alert_relay.logs.redaction import (
     DEFAULT_MAX_FIELD_LENGTH,
     MAX_KEY_LENGTH,
+    MAX_SECRET_LENGTH,
     REDACTED,
     JsonValue,
     SecretRegistry,
@@ -89,7 +90,14 @@ class JsonFormatter(logging.Formatter):
 
     def _token_leaks(self, token: str) -> bool:
         escaped = json.dumps(token, ensure_ascii=False)[1:-1]
-        return self._registry.contains(token) or self._registry.contains(escaped)
+        size = max(
+            self._max_field_length, self._max_exception_length, 2 * MAX_SECRET_LENGTH
+        )
+        return any(
+            self._registry.contains(chunk)
+            for form in (token, escaped)
+            for chunk in _chunks(form, size)
+        )
 
     def _fallback(self, record: logging.LogRecord, message: str) -> str:
         fallback: dict[str, str] = {
@@ -204,6 +212,16 @@ def _resolve_level(level: int | str) -> int:
         if name in mapping:
             return mapping[name]
     raise ValueError("invalid log level")
+
+
+def _chunks(text: str, size: int) -> list[str]:
+    """Slices of at most ``size`` overlapping by half, so that any substring
+    of up to ``size // 2`` characters lies wholly within one of them."""
+    if len(text) <= size:
+        return [text]
+    step = max(size // 2, 1)
+    starts = range(0, len(text) - size + step, step)
+    return [text[start : start + size] for start in starts]
 
 
 def _timestamp(record: logging.LogRecord) -> str:

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import os
 import socket
 import ssl
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
+from pathlib import Path
 from time import monotonic
 from typing import Any, cast
 
@@ -369,6 +373,91 @@ def test_lookup_after_deadline_and_after_close() -> None:
     resolver.close()
     with pytest.raises(httpcore.ConnectError, match="closed"):
         resolver.lookup("relay.example.com", 443, 1.0)
+
+
+def test_unexpected_resolver_errors_propagate_and_free_the_worker() -> None:
+    calls = 0
+
+    def flaky(host: str, port: int) -> Sequence[AddressInfo]:
+        nonlocal calls
+        calls += 1
+        if calls <= DNS_WORKERS:
+            raise LookupError("fictitious resolver bug")
+        return [address()]
+
+    resolver = transport_module._BoundedResolver(flaky)
+    for _ in range(DNS_WORKERS):
+        with pytest.raises(LookupError, match="fictitious"):
+            resolver.lookup("relay.example.com", 443, 1.0)
+    assert resolver.lookup("relay.example.com", 443, 1.0) == [address()]
+    resolver.close()
+
+
+def test_resolver_workers_are_daemon_threads_that_stop_on_close() -> None:
+    resolver = transport_module._BoundedResolver(lambda host, port: [address()])
+    resolver.lookup("relay.example.com", 443, 1.0)
+    workers = [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == "vrm-alert-relay-dns" and thread.is_alive()
+    ]
+    assert len(workers) >= DNS_WORKERS
+    assert all(thread.daemon for thread in workers)
+    own = resolver._workers
+    assert len(own) == DNS_WORKERS
+    resolver.close()
+    for thread in own:
+        thread.join(1.0)
+        assert not thread.is_alive()
+
+
+STUCK_RESOLVER_SCRIPT = """
+import ssl, threading, time
+import httpx
+from vrm_alert_relay.net.transport import DNS_WORKERS, HardenedTransport, deadline_scope
+
+def stuck(host, port):
+    threading.Event().wait()
+
+transport = HardenedTransport(ssl_context=ssl.create_default_context(), resolver=stuck)
+client = httpx.Client(transport=transport)
+for budget in [0.05] * DNS_WORKERS + [5.0]:
+    started = time.monotonic()
+    try:
+        with deadline_scope(started + budget):
+            client.get("https://relay.example.com/", timeout=budget)
+    except httpx.ConnectTimeout as exc:
+        print(type(exc).__name__, f"{time.monotonic() - started:.3f}", flush=True)
+client.close()
+print("main-finished", flush=True)
+"""
+
+
+def test_stuck_resolver_workers_do_not_block_interpreter_exit() -> None:
+    src = Path(transport_module.__file__).resolve().parents[2]
+    env = {**os.environ, "PYTHONPATH": str(src)}
+    process = subprocess.Popen(  # noqa: S603 - fixed interpreter and script
+        [sys.executable, "-c", STUCK_RESOLVER_SCRIPT],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        lines = [process.stdout.readline() for _ in range(DNS_WORKERS + 2)]
+        finished = monotonic()
+        assert lines[-1] == "main-finished\n", (lines, process.stderr)
+        assert all(line.startswith("DnsTimeout ") for line in lines[:-1])
+        assert float(lines[-2].split()[1]) < 1.0
+        process.wait(timeout=5)
+        exited = monotonic() - finished
+    finally:
+        process.kill()
+        process.communicate()
+    print(f"process exited {exited:.3f} s after main finished")
+    assert process.returncode == 0
+    assert exited < 1.0
 
 
 # Address loop

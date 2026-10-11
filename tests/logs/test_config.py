@@ -380,6 +380,26 @@ def test_secret_revealed_by_json_escaping_withholds_record() -> None:
     assert "kept out" not in output
 
 
+def test_verification_covers_whole_escaped_token_in_bounded_chunks() -> None:
+    registry = SecretRegistry()
+    registry.register("fictitious\\\\ncomposite")
+    buffer = io.StringIO()
+    configure_logging(
+        stream=buffer,
+        registry=registry,
+        max_field_length=12_000,
+        max_exception_length=1024,
+    )
+    message = 'x"' * 3995 + "value fictitious\ncomposite"
+    escaped = json.dumps(message.replace("\n", "\\n"))[1:-1]
+    start = escaped.index("fictitious")
+    assert len(message) < 12_000
+    assert start < 12_000 < start + len("fictitious\\\\ncomposite")
+    logging.getLogger("t").warning(message)
+    (record,) = lines(buffer)
+    assert record["msg"] == WITHHELD_MESSAGE
+
+
 def test_fallback_keeps_only_safe_codes_and_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
