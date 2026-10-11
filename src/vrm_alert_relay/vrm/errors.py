@@ -26,10 +26,10 @@ class FailureKind(StrEnum):
     """5xx, 408, timeouts and connection failures. Transient."""
 
     BAD_RESPONSE = "bad_response"
-    """A 2xx (or unexpected 3xx) response that could not be used. Transient."""
+    """An unusable 2xx response, a redirect, or an unexpected status (1xx, 6xx). Transient."""
 
     REJECTED = "rejected"
-    """Any other 4xx, or a request that could not be built. Not transient."""
+    """Any other 4xx (not 401, 403, 408 or 429), or an unbuildable request. Not transient."""
 
 
 TRANSIENT_KINDS = frozenset(

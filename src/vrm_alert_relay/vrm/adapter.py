@@ -65,7 +65,9 @@ _UNAUTHORIZED: Final = 401
 _FORBIDDEN: Final = 403
 _REQUEST_TIMEOUT: Final = 408
 _TOO_MANY_REQUESTS: Final = 429
+_CLIENT_ERROR: Final = 400
 _SERVER_ERROR: Final = 500
+_SERVER_ERROR_END: Final = 600
 
 _log = logging.getLogger(__name__)
 
@@ -241,42 +243,83 @@ class VrmAdapter:
         raise error
 
     def poll(self, targets: Sequence[tuple[Installation, Sequence[Measurement]]]) -> PollResult:
-        """Fetch every installation that is not backing off and record the outcomes.
+        """Fetch every site that is not backing off and record the outcomes.
 
-        After a 429 the remaining installations in the poll are deferred,
-        because the rate limit applies to the token.
+        Targets are grouped by VRM site id before any request, so each site is
+        fetched at most once per poll however often it is listed; every target
+        still gets its own outcome with the measurements it asked for. Backoff
+        state is keyed by site id. After a 429 every remaining site in the
+        poll is deferred, because the rate limit applies to the token.
         """
-        outcomes: list[InstallationOutcome] = []
+        groups: dict[int, list[Measurement]] = {}
+        first: dict[int, Installation] = {}
         for installation, measurements in targets:
-            key = installation.id
-            blocked = self._backoff.blocking_error(key, self._clock())
-            if blocked is not None:
-                outcomes.append(
-                    InstallationOutcome(
-                        installation,
-                        error=blocked,
-                        deferred=True,
-                        retry_at=self._backoff.retry_at(key),
-                    )
-                )
-                continue
-            try:
-                reading = self.fetch(installation, measurements)
-            except VrmError as exc:
-                retry_at = self._backoff.record_failure(key, exc, self._clock())
-                _log.warning(
-                    "vrm fetch failed",
-                    extra={
-                        "vrm_installation": key,
-                        "vrm_failure": exc.kind.value,
-                        "vrm_detail": exc.detail,
-                    },
-                )
-                outcomes.append(InstallationOutcome(installation, error=exc, retry_at=retry_at))
-            else:
-                self._backoff.record_success(key)
-                outcomes.append(InstallationOutcome(installation, reading=reading))
-        return PollResult(tuple(outcomes))
+            merged = groups.setdefault(installation.site_id, [])
+            first.setdefault(installation.site_id, installation)
+            merged.extend(m for m in measurements if m not in merged)
+
+        fetched: dict[int, _SiteOutcome] = {}
+        rate_limited: VrmRateLimitedError | None = None
+        for site_id, measurements in groups.items():
+            fetched[site_id] = self._poll_site(first[site_id], measurements, rate_limited)
+            error = fetched[site_id].error
+            if isinstance(error, VrmRateLimitedError):
+                rate_limited = error
+
+        return PollResult(
+            tuple(
+                fetched[installation.site_id].outcome_for(installation, measurements)
+                for installation, measurements in targets
+            )
+        )
+
+    def _poll_site(
+        self,
+        installation: Installation,
+        measurements: Sequence[Measurement],
+        rate_limited: VrmRateLimitedError | None,
+    ) -> _SiteOutcome:
+        key = str(installation.site_id)
+        blocked = rate_limited or self._backoff.blocking_error(key, self._clock())
+        if blocked is not None:
+            return _SiteOutcome(error=blocked, deferred=True, retry_at=self._backoff.retry_at(key))
+        try:
+            reading = self.fetch(installation, measurements)
+        except VrmError as exc:
+            retry_at = self._backoff.record_failure(key, exc, self._clock())
+            _log.warning(
+                "vrm fetch failed",
+                extra={
+                    "vrm_installation": installation.id,
+                    "vrm_failure": exc.kind.value,
+                    "vrm_detail": exc.detail,
+                },
+            )
+            return _SiteOutcome(error=exc, retry_at=retry_at)
+        self._backoff.record_success(key)
+        return _SiteOutcome(reading=reading)
+
+
+@dataclass(frozen=True, slots=True)
+class _SiteOutcome:
+    """The result of at most one request for a site, shared by its targets."""
+
+    reading: InstallationReading | None = None
+    error: VrmError | None = None
+    deferred: bool = False
+    retry_at: float | None = None
+
+    def outcome_for(
+        self, installation: Installation, measurements: Sequence[Measurement]
+    ) -> InstallationOutcome:
+        if self.reading is None:
+            return InstallationOutcome(
+                installation, error=self.error, deferred=self.deferred, retry_at=self.retry_at
+            )
+        by_measurement = {r.measurement: r for r in self.reading.results}
+        results = tuple(by_measurement[m] for m in measurements)
+        reading = InstallationReading(installation, results, self.reading.fetched_at)
+        return InstallationOutcome(installation, reading=reading)
 
 
 def _translate(exc: HttpError, installation: str) -> VrmError:  # noqa: PLR0911  # one return per error class
@@ -303,6 +346,8 @@ def _translate_status(exc: HttpStatusError, installation: str) -> VrmError:
         return VrmAuthError(installation, status=status)
     if status == _TOO_MANY_REQUESTS:
         return VrmRateLimitedError(installation, retry_after=exc.retry_after)
-    if status >= _SERVER_ERROR or status == _REQUEST_TIMEOUT:
+    if _SERVER_ERROR <= status < _SERVER_ERROR_END or status == _REQUEST_TIMEOUT:
         return VrmUnavailableError(installation, f"HTTP {status}", status=status)
-    return VrmRejectedError(installation, f"HTTP {status}", status=status)
+    if _CLIENT_ERROR <= status < _SERVER_ERROR:
+        return VrmRejectedError(installation, f"HTTP {status}", status=status)
+    return VrmResponseError(installation, f"unexpected status (HTTP {status})")

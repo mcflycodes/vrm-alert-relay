@@ -75,12 +75,21 @@ def test_bad_response_backs_off_like_transient() -> None:
 
 
 def test_retry_after_is_honoured_and_bounded() -> None:
-    policy = BackoffPolicy(max_retry_after=3600.0)
+    policy = BackoffPolicy(max_retry_after=3600.0, rate_limit_delay=10.0)
     assert policy.delay_for(limited(42.0), 1, 0.9) == 42.0
-    assert policy.delay_for(limited(0.0), 1, 0.9) == 0.0
-    assert policy.delay_for(limited(-5.0), 1, 0.9) == 0.0
+    assert policy.delay_for(limited(0.0), 1, 0.9) == 10.0
+    assert policy.delay_for(limited(-5.0), 1, 0.9) == 10.0
+    assert policy.delay_for(limited(3.0), 1, 0.9) == 10.0
     assert policy.delay_for(limited(86400.0), 1, 0.9) == 3600.0
     assert policy.delay_for(limited(1e300), 1, 0.9) == 3600.0
+
+
+@pytest.mark.parametrize("retry_after", [0.0, -1e9, 59.9])
+def test_every_429_waits_a_positive_minimum(retry_after: float) -> None:
+    backoff = Backoff(BackoffPolicy(rate_limit_delay=60.0))
+    until = backoff.record_failure("123456", limited(retry_after), 500.0)
+    assert until == 560.0
+    assert backoff.blocking_error("234567", 500.0) is not None
 
 
 def test_rate_limit_without_retry_after_waits_at_least_minimum() -> None:

@@ -24,12 +24,13 @@ from vrm_helpers import (
     record,
 )
 
-from vrm_alert_relay.config.models import DEFAULT_VRM_BASE_URL, VrmConfig
+from vrm_alert_relay.config.models import DEFAULT_VRM_BASE_URL, Installation, VrmConfig
 from vrm_alert_relay.config.secret import Secret
 from vrm_alert_relay.engine.models import Sample
 from vrm_alert_relay.logs.config import JsonFormatter
 from vrm_alert_relay.logs.redaction import SecretRegistry
 from vrm_alert_relay.net.errors import (
+    HttpStatusError,
     HttpTransportError,
     InvalidHeaderError,
     InvalidRequestError,
@@ -244,7 +245,7 @@ def test_auth_errors_are_not_retried_as_transient(
     clock.now = outcome.retry_at  # type: ignore[assignment]
     adapter.poll([(HOME, (VOLTAGE,))])
     assert len(transport.requests) == 2
-    assert adapter.backoff.state("home").next_attempt_at == clock.now + 3600.0
+    assert adapter.backoff.state("123456").next_attempt_at == clock.now + 3600.0
 
 
 def test_429_with_retry_after_defers_remaining_installations(
@@ -289,6 +290,46 @@ def test_429_without_retry_after(
     assert outcome.retry_at == clock.now + BackoffPolicy().rate_limit_delay
 
 
+@pytest.mark.parametrize("retry_after", ["0", "Wed, 21 Oct 2015 07:28:00 GMT", "5"])
+def test_zero_or_past_retry_after_still_defers_the_poll(
+    make_adapter: MakeAdapter, transport: StubTransport, clock: FakeClock, retry_after: str
+) -> None:
+    respond_status(transport, 429, **{"Retry-After": retry_after})
+    adapter = make_adapter()
+    result = adapter.poll([(HOME, (VOLTAGE,)), (CABIN, (VOLTAGE,))])
+    assert len(transport.requests) == 1
+    assert [o.deferred for o in result.outcomes] == [False, True]
+    assert result.next_attempt_at is not None
+    assert result.next_attempt_at > clock.now
+    assert result.next_attempt_at == clock.now + BackoffPolicy().rate_limit_delay
+
+    adapter.poll([(HOME, (VOLTAGE,)), (CABIN, (VOLTAGE,))])
+    assert len(transport.requests) == 1
+
+
+def test_429_latches_rest_of_poll_even_if_gate_expires_mid_poll(
+    make_adapter: MakeAdapter, transport: StubTransport
+) -> None:
+    class JumpingClock:
+        """Advances a day per reading, so any time-based gate has expired."""
+
+        def __init__(self) -> None:
+            self.now = 0.0
+
+        def __call__(self) -> float:
+            self.now += 86400.0
+            return self.now
+
+    respond_status(transport, 429, **{"Retry-After": "0"})
+    third = installation("barn", 345678)
+    result = make_adapter(clock=JumpingClock()).poll(
+        [(HOME, (VOLTAGE,)), (CABIN, (VOLTAGE,)), (third, (VOLTAGE,))]
+    )
+    assert len(transport.requests) == 1
+    assert [o.deferred for o in result.outcomes] == [False, True, True]
+    assert all(isinstance(o.error, VrmRateLimitedError) for o in result.outcomes)
+
+
 @pytest.mark.parametrize("retry_after", ["999999999", "Wed, 21 Oct 2099 07:28:00 GMT", "  86400  "])
 def test_huge_retry_after_is_capped(
     make_adapter: MakeAdapter, transport: StubTransport, clock: FakeClock, retry_after: str
@@ -323,12 +364,12 @@ def test_5xx_backoff_grows_and_caps(
         clock.now = outcome.retry_at
     assert delays == [30, 60, 120, 200, 200, 200]
     assert len(transport.requests) == 6
-    assert adapter.backoff.state("home").failures == 6
+    assert adapter.backoff.state("123456").failures == 6
 
     transport.respond(ok_handler)
     (outcome,) = adapter.poll([(HOME, (VOLTAGE,))]).outcomes
     assert outcome.ok
-    assert adapter.backoff.state("home").failures == 0
+    assert adapter.backoff.state("123456").failures == 0
 
 
 def test_jittered_backoff_stays_within_bounds(
@@ -345,6 +386,56 @@ def test_jittered_backoff_stays_within_bounds(
         delays.append(outcome.retry_at - clock.now)
         clock.now = outcome.retry_at
     assert delays == pytest.approx([100.0, 150.05, 350.0])
+
+
+def test_repeated_installation_is_fetched_once(
+    make_adapter: MakeAdapter, transport: StubTransport
+) -> None:
+    transport.respond(ok_handler)
+    result = make_adapter().poll(
+        [(HOME, (VOLTAGE,)), (CABIN, (SOC,)), (HOME, (SOC, VOLTAGE)), (HOME, (VOLTAGE,))]
+    )
+    assert [site_of(r) for r in transport.requests] == [HOME.site_id, CABIN.site_id]
+    assert [o.installation for o in result.outcomes] == [HOME, CABIN, HOME, HOME]
+    readings = [o.reading for o in result.outcomes]
+    assert all(r is not None for r in readings)
+    assert [[x.measurement for x in r.results] for r in readings] == [  # type: ignore[union-attr]
+        [VOLTAGE],
+        [SOC],
+        [SOC, VOLTAGE],
+        [VOLTAGE],
+    ]
+    assert readings[0].results[0].sample.value == 50.0  # type: ignore[union-attr]
+    assert readings[1].results[0].sample.value == 90.0  # type: ignore[union-attr]
+
+
+def test_distinct_installations_sharing_a_site_are_fetched_once(
+    make_adapter: MakeAdapter, transport: StubTransport, clock: FakeClock
+) -> None:
+    alias = Installation(id="home-alias", site_id=HOME.site_id)
+    transport.respond(ok_handler)
+    adapter = make_adapter()
+    result = adapter.poll([(HOME, (VOLTAGE,)), (alias, (SOC, PV))])
+    assert len(transport.requests) == 1
+    home, other = result.outcomes
+    assert home.installation == HOME
+    assert other.installation == alias
+    assert other.reading is not None
+    assert other.reading.installation == alias
+    assert [r.measurement for r in other.reading.results] == [SOC, PV]
+    assert other.reading.result_for(PV).problem is None  # type: ignore[union-attr]
+
+    respond_status(transport, 503)
+    failed = adapter.poll([(HOME, (VOLTAGE,)), (alias, (SOC,))])
+    assert len(transport.requests) == 2
+    assert failed.outcomes[0].error is failed.outcomes[1].error
+    assert failed.outcomes[0].retry_at == failed.outcomes[1].retry_at
+    assert adapter.backoff.state(str(HOME.site_id)).failures == 1
+
+    deferred = adapter.poll([(alias, (SOC,)), (HOME, (VOLTAGE,))])
+    assert len(transport.requests) == 2
+    assert all(o.deferred for o in deferred.outcomes)
+    assert clock.now < failed.outcomes[0].retry_at  # type: ignore[operator]
 
 
 def test_failure_in_one_installation_does_not_defer_others(
@@ -457,6 +548,37 @@ def test_records_as_object_is_a_bad_response_and_backs_off(
     assert isinstance(outcome.error, VrmResponseError)
     assert outcome.error.kind is FailureKind.BAD_RESPONSE
     assert outcome.retry_at == clock.now + BackoffPolicy().base_delay
+
+
+@pytest.mark.parametrize("status", [100, 101, 103])
+def test_informational_status_is_a_transient_bad_response(
+    make_adapter: MakeAdapter, transport: StubTransport, clock: FakeClock, status: int
+) -> None:
+    respond_status(transport, status)
+    (outcome,) = make_adapter().poll([(HOME, (VOLTAGE,))]).outcomes
+    assert isinstance(outcome.error, VrmResponseError)
+    assert outcome.error.transient
+    assert outcome.error.detail == f"unexpected status (HTTP {status})"
+    assert outcome.retry_at == clock.now + BackoffPolicy().base_delay
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [
+        (304, VrmResponseError),
+        (399, VrmResponseError),
+        (600, VrmResponseError),
+        (999, VrmResponseError),
+        (599, VrmUnavailableError),
+        (499, VrmRejectedError),
+        (400, VrmRejectedError),
+    ],
+)
+def test_status_classes_that_slip_past_the_client(status: int, error_type: type[VrmError]) -> None:
+    exc = HttpStatusError("GET", "https://vrm.example.invalid/v2", status=status)
+    error = _translate(exc, "home")
+    assert type(error) is error_type
+    assert error.transient is (error_type is not VrmRejectedError)
 
 
 @pytest.mark.parametrize(

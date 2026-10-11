@@ -6,10 +6,10 @@ seconds and the tracker answers when each installation may next be fetched.
 - Transient failures (5xx, timeouts, connection failures, bad responses) back
   off exponentially from ``base_delay``, capped at ``max_delay``, with up to
   ``jitter`` of each delay removed at random so restarts do not synchronise.
-- 429 applies to the whole token: every installation waits until the
-  ``Retry-After`` delay (bounded by ``max_retry_after``) has passed, or, with
-  no ``Retry-After``, at least ``rate_limit_delay`` or the exponential delay,
-  whichever is longer.
+- 429 applies to the whole token: every installation waits at least
+  ``rate_limit_delay``, or longer when ``Retry-After`` asks for more (bounded
+  by ``max_retry_after``) or, without ``Retry-After``, when the exponential
+  delay is longer. A zero or past ``Retry-After`` therefore still defers.
 - Non-transient failures (401, 403, other 4xx) are not retried as transient:
   they wait a fixed ``non_transient_delay`` that does not grow, so a revoked
   token is retried rarely and the failure stays visible.
@@ -71,7 +71,7 @@ class BackoffPolicy:
         if isinstance(error, VrmRateLimitedError):
             if error.retry_after is None:
                 return max(self.rate_limit_delay, self.transient_delay(failures, unit))
-            return min(max(error.retry_after, 0.0), self.max_retry_after)
+            return max(self.rate_limit_delay, min(error.retry_after, self.max_retry_after))
         if error.transient:
             return self.transient_delay(failures, unit)
         return self.non_transient_delay
