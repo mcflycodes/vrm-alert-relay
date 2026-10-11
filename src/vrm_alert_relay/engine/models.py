@@ -169,6 +169,7 @@ class Event:
 class RuleState:
     """All persisted state needed to evaluate one rule deterministically."""
 
+    generation: str | None = None
     active_level: str | None = None
     episode: int = 0
     clear_count: int = 0
@@ -183,14 +184,11 @@ class RuleState:
     episode_announced: bool = False
     episode_notified_levels: tuple[str, ...] = ()
     pending_escalation: str | None = None
-    pending_recovery_levels: tuple[str, ...] = ()
-    pending_recovery_started_at: datetime | None = None
     escalation_ordinal: int = 0
     rule_direction: Direction | None = None
     level_order: tuple[str, ...] = ()
     needs_rederive: bool = False
     level_notification_times: tuple[LevelTime, ...] = ()
-    level_recovery_times: tuple[LevelTime, ...] = ()
     suppressed_escalations: int = 0
 
     def __post_init__(self) -> None:
@@ -202,6 +200,7 @@ class RuleState:
             raise InvalidRuleStateError(str(exc)) from exc
 
     def _validate(self) -> None:
+        self._validate_generation()
         if self.active_level is not None and not _valid_name(self.active_level):
             raise InvalidRuleStateError("active_level must be a bounded level name")
         if self.pending_escalation is not None and not _valid_name(
@@ -242,7 +241,6 @@ class RuleState:
             "last_evaluated_sample_time",
             "last_episode_notification_time",
             "episode_started_at",
-            "pending_recovery_started_at",
         ):
             value = getattr(self, name)
             if value is not None and (
@@ -254,9 +252,7 @@ class RuleState:
         self._validate_level_times(
             self.level_notification_times, "level notification times"
         )
-        self._validate_level_times(self.level_recovery_times, "level recovery times")
         self._validate_names(self.episode_notified_levels, "episode_notified_levels")
-        self._validate_names(self.pending_recovery_levels, "pending_recovery_levels")
         if self.active_level is not None and self.episode < 1:
             raise InvalidRuleStateError("an active level requires a positive episode")
         if self.active_level is None and self.clear_count != 0:
@@ -267,16 +263,18 @@ class RuleState:
             raise InvalidRuleStateError("normal state cannot have a pending escalation")
         if self.episode_announced and self.active_level is None:
             raise InvalidRuleStateError("normal state cannot have an announced episode")
-        if self.pending_recovery_levels and self.active_level is not None:
-            raise InvalidRuleStateError("active state cannot have a pending recovery")
-        if self.pending_recovery_levels and self.episode < 1:
-            raise InvalidRuleStateError(
-                "a pending recovery requires a positive episode"
-            )
-        if bool(self.pending_recovery_levels) != (
-            self.pending_recovery_started_at is not None
-        ):
-            raise InvalidRuleStateError("pending recovery fields must be set together")
+
+    def _validate_generation(self) -> None:
+        if self.generation is None:
+            return
+        if not isinstance(self.generation, str) or len(self.generation) > 64:
+            raise InvalidRuleStateError("generation must be a bounded ISO timestamp")
+        try:
+            timestamp = datetime.fromisoformat(self.generation)
+        except ValueError as exc:
+            raise InvalidRuleStateError("generation is not an ISO timestamp") from exc
+        if not _is_aware(timestamp):
+            raise InvalidRuleStateError("generation must be timezone-aware")
 
     @staticmethod
     def _validate_names(values: object, field: str) -> None:
@@ -310,7 +308,8 @@ class RuleState:
             return value.isoformat() if value is not None else None
 
         return {
-            "version": 2,
+            "version": 3,
+            "generation": self.generation,
             "active_level": self.active_level,
             "episode": self.episode,
             "clear_count": self.clear_count,
@@ -327,10 +326,6 @@ class RuleState:
             "episode_announced": self.episode_announced,
             "episode_notified_levels": list(self.episode_notified_levels),
             "pending_escalation": self.pending_escalation,
-            "pending_recovery_levels": list(self.pending_recovery_levels),
-            "pending_recovery_started_at": encode_time(
-                self.pending_recovery_started_at
-            ),
             "escalation_ordinal": self.escalation_ordinal,
             "rule_direction": (
                 self.rule_direction.value if self.rule_direction is not None else None
@@ -341,10 +336,6 @@ class RuleState:
                 [name, timestamp.isoformat()]
                 for name, timestamp in self.level_notification_times
             ],
-            "level_recovery_times": [
-                [name, timestamp.isoformat()]
-                for name, timestamp in self.level_recovery_times
-            ],
             "suppressed_escalations": self.suppressed_escalations,
         }
 
@@ -354,6 +345,7 @@ class RuleState:
 
         keys = {
             "version",
+            "generation",
             "active_level",
             "episode",
             "clear_count",
@@ -368,24 +360,21 @@ class RuleState:
             "episode_announced",
             "episode_notified_levels",
             "pending_escalation",
-            "pending_recovery_levels",
-            "pending_recovery_started_at",
             "escalation_ordinal",
             "rule_direction",
             "level_order",
             "needs_rederive",
             "level_notification_times",
-            "level_recovery_times",
             "suppressed_escalations",
         }
         if not isinstance(data, dict) or len(data) != len(keys) or set(data) != keys:
             raise InvalidRuleStateError(
-                "state must contain exactly the version 2 fields"
+                "state must contain exactly the version 3 fields"
             )
         if (
             not isinstance(data["version"], int)
             or isinstance(data["version"], bool)
-            or data["version"] != 2
+            or data["version"] != 3
         ):
             raise InvalidRuleStateError("unsupported state version")
 
@@ -404,7 +393,6 @@ class RuleState:
             return value
 
         notification_times = cls._decode_pairs(data["level_notification_times"])
-        recovery_times = cls._decode_pairs(data["level_recovery_times"])
         raw_direction = data["rule_direction"]
         if raw_direction is None:
             direction = None
@@ -428,16 +416,8 @@ class RuleState:
                 "episode_notified_levels must be a bounded list"
             )
         episode_levels = tuple(raw_episode_levels)
-        raw_pending_recovery = data["pending_recovery_levels"]
-        if (
-            not isinstance(raw_pending_recovery, list)
-            or len(raw_pending_recovery) > MAX_LEVELS
-        ):
-            raise InvalidRuleStateError(
-                "pending_recovery_levels must be a bounded list"
-            )
-        pending_recovery_levels = tuple(raw_pending_recovery)
         return cls(
+            generation=cast(str | None, data["generation"]),
             active_level=cast(str | None, data["active_level"]),
             episode=cast(int, data["episode"]),
             clear_count=cast(int, data["clear_count"]),
@@ -454,14 +434,11 @@ class RuleState:
             episode_announced=cast(bool, data["episode_announced"]),
             episode_notified_levels=cast(tuple[str, ...], episode_levels),
             pending_escalation=cast(str | None, data["pending_escalation"]),
-            pending_recovery_levels=cast(tuple[str, ...], pending_recovery_levels),
-            pending_recovery_started_at=decode_time("pending_recovery_started_at"),
             escalation_ordinal=cast(int, data["escalation_ordinal"]),
             rule_direction=direction,
             level_order=cast(tuple[str, ...], level_order),
             needs_rederive=cast(bool, data["needs_rederive"]),
             level_notification_times=notification_times,
-            level_recovery_times=recovery_times,
             suppressed_escalations=cast(int, data["suppressed_escalations"]),
         )
 

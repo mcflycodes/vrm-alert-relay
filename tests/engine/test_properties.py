@@ -141,7 +141,7 @@ def test_event_ids_are_unique_and_bounded_invariants_hold(
         max_size=80,
     )
 )
-def test_cooldown_bounds_events_in_every_sliding_window(
+def test_cooldown_bounds_escalations_in_every_sliding_window(
     steps: list[tuple[int, bool]],
 ) -> None:
     cooldown = timedelta(minutes=15)
@@ -154,7 +154,7 @@ def test_cooldown_bounds_events_in_every_sliding_window(
     )
     state = RuleState()
     now = BASE
-    event_times: dict[EventKind, list[datetime]] = defaultdict(list)
+    escalation_times: list[datetime] = []
     for advance, active in steps:
         now += timedelta(minutes=advance)
         state, events = evaluate(
@@ -164,11 +164,56 @@ def test_cooldown_bounds_events_in_every_sliding_window(
             now,
         )
         for event in events:
-            if event.kind in (EventKind.ESCALATED, EventKind.RECOVERED):
-                event_times[event.kind].append(now)
+            if event.kind is EventKind.ESCALATED:
+                escalation_times.append(now)
 
-    for times in event_times.values():
-        assert all(later - earlier >= cooldown for earlier, later in pairwise(times))
+    assert all(
+        later - earlier >= cooldown for earlier, later in pairwise(escalation_times)
+    )
+
+
+@settings(max_examples=200, deadline=None, derandomize=True)
+@given(
+    st.lists(
+        st.tuples(
+            st.integers(min_value=1, max_value=20),
+            st.sampled_from([5.0, 15.0, 25.0]),
+        ),
+        min_size=1,
+        max_size=80,
+    )
+)
+def test_operator_alarm_state_matches_every_announced_recovery(
+    steps: list[tuple[int, float]],
+) -> None:
+    rule = RuleSpec(
+        "fictitious-operator-state",
+        Direction.RISING,
+        (LevelSpec("warning", 10.0), LevelSpec("alert", 20.0)),
+        cooldown=timedelta(minutes=15),
+        stale_after=timedelta(days=2),
+    )
+    state = RuleState()
+    now = BASE
+    operator_heard_alarm = False
+    for advance, value in steps:
+        previous_announced = state.active_level is not None and state.episode_announced
+        now += timedelta(minutes=advance)
+        state, events = evaluate(rule, state, Sample(value, now), now)
+        recoveries = [event for event in events if event.kind is EventKind.RECOVERED]
+        if previous_announced and state.active_level is None:
+            assert len(recoveries) == 1
+        else:
+            assert recoveries == []
+
+        for event in events:
+            if event.kind is EventKind.ESCALATED:
+                operator_heard_alarm = True
+            elif event.kind is EventKind.RECOVERED:
+                operator_heard_alarm = False
+        assert operator_heard_alarm == (
+            state.active_level is not None and state.episode_announced
+        )
 
 
 @settings(max_examples=150, deadline=None, derandomize=True)
