@@ -135,9 +135,7 @@ def _parse(url: object) -> httpx.URL:
     if len(url) > MAX_URL_LENGTH:
         raise InvalidUrlError(f"URL is longer than {MAX_URL_LENGTH} characters")
     if _FORBIDDEN_CHAR_RE.search(url):
-        raise InvalidUrlError(
-            "URL contains whitespace, control characters or backslashes"
-        )
+        raise InvalidUrlError("URL contains whitespace, control characters or backslashes")
     if "#" in url:
         raise InvalidUrlError("URL must not contain a fragment")
 
@@ -146,9 +144,7 @@ def _parse(url: object) -> httpx.URL:
         raise InvalidUrlError("URL could not be parsed")
     scheme = split.scheme.lower()
     if scheme != "https":
-        shown = (
-            repr(scheme) if _SCHEME_RE.fullmatch(scheme) else "an unsupported scheme"
-        )
+        shown = repr(scheme) if _SCHEME_RE.fullmatch(scheme) else "an unsupported scheme"
         raise InvalidUrlError(f"URL scheme must be https, not {shown}")
     if "@" in split.netloc:
         raise InvalidUrlError("URL must not contain userinfo")
@@ -163,9 +159,7 @@ def _parse(url: object) -> httpx.URL:
     if parsed is None:
         raise InvalidUrlError("URL could not be parsed")
 
-    if (
-        parsed.scheme != "https" or parsed.userinfo
-    ):  # pragma: no cover - urlsplit checks
+    if parsed.scheme != "https" or parsed.userinfo:  # pragma: no cover - urlsplit checks
         raise InvalidUrlError("URL scheme must be https, without userinfo")
     host = parsed.raw_host.decode("ascii")
     if not host:

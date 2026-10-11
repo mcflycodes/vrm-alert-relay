@@ -29,9 +29,11 @@ FALLBACK_CODE_KEYS: Final = ("event", "code")
 
 _CODE_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 
-_STANDARD_ATTRS = frozenset(
-    logging.LogRecord("", 0, "", 0, "", None, None).__dict__
-) | {"message", "asctime", "taskName"}
+_STANDARD_ATTRS = frozenset(logging.LogRecord("", 0, "", 0, "", None, None).__dict__) | {
+    "message",
+    "asctime",
+    "taskName",
+}
 _OUTPUT_KEYS = frozenset({"ts", "level", "logger", "msg", "exc", "stack"})
 
 
@@ -90,9 +92,7 @@ class JsonFormatter(logging.Formatter):
 
     def _token_leaks(self, token: str) -> bool:
         escaped = json.dumps(token, ensure_ascii=False)[1:-1]
-        size = max(
-            self._max_field_length, self._max_exception_length, 2 * MAX_SECRET_LENGTH
-        )
+        size = max(self._max_field_length, self._max_exception_length, 2 * MAX_SECRET_LENGTH)
         return any(
             self._registry.contains(chunk)
             for form in (token, escaped)
@@ -134,9 +134,7 @@ class JsonFormatter(logging.Formatter):
         }
 
         extras = {
-            key: value
-            for key, value in record.__dict__.items()
-            if key not in _STANDARD_ATTRS
+            key: value for key, value in record.__dict__.items() if key not in _STANDARD_ATTRS
         }
         redacted = redact_mapping(
             extras, registry=self._registry, max_length=self._max_field_length
@@ -154,9 +152,7 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     def _text(self, text: object) -> str:
-        return redact_text(
-            str(text), registry=self._registry, max_length=self._max_field_length
-        )
+        return redact_text(str(text), registry=self._registry, max_length=self._max_field_length)
 
     def _long_text(self, text: str) -> str:
         return redact_text(

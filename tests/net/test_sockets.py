@@ -86,9 +86,7 @@ class Server:
     def url(self) -> str:
         return f"https://localhost:{self.port}/api"
 
-    def _record_sni(
-        self, conn: ssl.SSLObject, name: str | None, context: ssl.SSLContext
-    ) -> None:
+    def _record_sni(self, conn: ssl.SSLObject, name: str | None, context: ssl.SSLContext) -> None:
         self.server_names.append(name)
 
     def _serve(self) -> None:
@@ -168,9 +166,7 @@ def trust_test_ca(ca: trustme.CA, monkeypatch: pytest.MonkeyPatch) -> None:
 def serve(ca: trustme.CA) -> Iterator[Callable[..., Server]]:
     servers: list[Server] = []
 
-    def start(
-        responder: Responder, *, tls: bool = True, hostname: str = "localhost"
-    ) -> Server:
+    def start(responder: Responder, *, tls: bool = True, hostname: str = "localhost") -> Server:
         server = Server(ca, responder, tls=tls, hostname=hostname)
         servers.append(server)
         return server
@@ -181,9 +177,7 @@ def serve(ca: trustme.CA) -> Iterator[Callable[..., Server]]:
 
 
 def slow_client() -> SafeHttpClient:
-    return SafeHttpClient(
-        timeouts=Timeouts(connect=5.0, read=5.0, write=5.0, deadline=DEADLINE)
-    )
+    return SafeHttpClient(timeouts=Timeouts(connect=5.0, read=5.0, write=5.0, deadline=DEADLINE))
 
 
 def timed_failure(server: Server, error: type[HttpError]) -> tuple[HttpError, float]:

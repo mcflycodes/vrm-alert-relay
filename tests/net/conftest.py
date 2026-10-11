@@ -46,9 +46,7 @@ class UnreadStream(httpx.SyncByteStream):
 
 
 @pytest.fixture(autouse=True)
-def transport(
-    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
-) -> StubTransport:
+def transport(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> StubTransport:
     """Stub the transport unless the test module sets ``REAL_SOCKETS = True``.
 
     Real-socket modules talk only to servers they start on 127.0.0.1.

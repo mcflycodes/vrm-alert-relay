@@ -116,9 +116,7 @@ def test_extras_are_structured_and_redacted(stream: io.StringIO) -> None:
 
 
 def test_extra_name_collisions_are_prefixed(stream: io.StringIO) -> None:
-    logging.getLogger("t").info(
-        "real", extra={"ts": "fake", "level": "fake", "exc": "fake"}
-    )
+    logging.getLogger("t").info("real", extra={"ts": "fake", "level": "fake", "exc": "fake"})
     (record,) = lines(stream)
     assert record["msg"] == "real"
     assert record["level"] == "INFO"
@@ -136,10 +134,7 @@ def test_message_and_args_redacted(stream: io.StringIO) -> None:
     log.info("bell\x07 escape\x1b[31m rtl\u202e nul\x00")
     records = lines(stream)
     assert records[0]["msg"] == f"login with {REDACTED} to ***0143"
-    assert (
-        records[1]["msg"]
-        == f"params {{'api_password': '{REDACTED}', 'did': '***0143'}}"
-    )
+    assert records[1]["msg"] == f"params {{'api_password': '{REDACTED}', 'did': '***0143'}}"
     assert records[2]["msg"] == f"header Authorization: {REDACTED}"
     assert records[3]["msg"] == f"GET https://example.com/api?{REDACTED}"
     assert records[4]["msg"] == "bell\\x07 escape\\x1b[31m rtl\\u202e nul\\x00"
@@ -149,9 +144,7 @@ def test_message_and_args_redacted(stream: io.StringIO) -> None:
 def test_exception_tracebacks_redacted(stream: io.StringIO) -> None:
     def fail() -> None:
         url = f"https://example.com/send?api_password={CANARY}"
-        raise ValueError(
-            f"failed {url} for {PHONE} token={CANARY_BEARER}\ninjected line"
-        )
+        raise ValueError(f"failed {url} for {PHONE} token={CANARY_BEARER}\ninjected line")
 
     try:
         fail()
@@ -230,9 +223,7 @@ def test_tail_truncation_inside_long_sensitive_value_does_not_leak(
     assert into_value > redaction_module._CUT_CONTEXT
     assert FAKE_FRAGMENT not in head + tail
 
-    formatter = JsonFormatter(
-        registry=SecretRegistry(), max_exception_length=TAIL_LIMIT
-    )
+    formatter = JsonFormatter(registry=SecretRegistry(), max_exception_length=TAIL_LIMIT)
     record = logging.LogRecord("t", logging.ERROR, __file__, 1, "failed", None, None)
     record.exc_text = text
     output = json.loads(formatter.format(record))
@@ -312,14 +303,10 @@ def test_bad_format_args_do_not_leak(
     stream = io.StringIO()
     handler = configure_logging(stream=stream, registry=registry)
     handler.handle(
-        logging.LogRecord(
-            "t", logging.INFO, __file__, 1, "value %d for " + CANARY, ("x",), None
-        )
+        logging.LogRecord("t", logging.INFO, __file__, 1, "value %d for " + CANARY, ("x",), None)
     )
     (output,) = lines(stream)
-    assert output["msg"] == (
-        f"value %d for {REDACTED} [log arguments could not be formatted]"
-    )
+    assert output["msg"] == (f"value %d for {REDACTED} [log arguments could not be formatted]")
     assert CANARY not in capsys.readouterr().err
     assert_clean(stream)
 
@@ -554,10 +541,7 @@ def test_httpx_request_lines_suppressed_and_redacted(stream: io.StringIO) -> Non
     )
     records = lines(stream)
     assert len(records) == 1
-    assert (
-        records[0]["msg"]
-        == f'HTTP Request: GET https://example.com/?{REDACTED} "HTTP/1.1 500"'
-    )
+    assert records[0]["msg"] == f'HTTP Request: GET https://example.com/?{REDACTED} "HTTP/1.1 500"'
 
 
 def test_warnings_routed_through_logging(stream: io.StringIO) -> None:

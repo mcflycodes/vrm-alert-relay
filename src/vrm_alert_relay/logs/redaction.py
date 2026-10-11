@@ -92,7 +92,9 @@ MAX_ITEMS: Final = 50
 MAX_NODES: Final = 500
 MAX_KEY_LENGTH: Final = 128
 
-_SENSITIVE_KEY = r"(?:password|passwd|secret|token|authorization|api[_-]?key|api[_-]?password|cookie)"
+_SENSITIVE_KEY = (
+    r"(?:password|passwd|secret|token|authorization|api[_-]?key|api[_-]?password|cookie)"
+)
 _SENSITIVE_KEY_RE = re.compile(_SENSITIVE_KEY, re.IGNORECASE)
 _KEY_TEXT = rf"{_SENSITIVE_KEY}[\w-]{{0,32}}"
 _QUOTED_KV_RE = re.compile(
@@ -131,9 +133,7 @@ _MAX_QUOTE_CANDIDATES: Final = 64
 _SCHEME = r"(?:bearer|basic|digest|token)"
 _BARE_STOP_RE = re.compile(r"[\s\"'&,;)}\]]")
 _QUOTED_OPEN_RE = re.compile(rf"{_KEY_TEXT}[\"']?\s*[:=]\s*\Z", re.IGNORECASE)
-_BARE_OPEN_RE = re.compile(
-    rf"{_KEY_TEXT}[\"']?\s*[:=]\s*[\"']?(?:{_SCHEME}\s+)?\Z", re.IGNORECASE
-)
+_BARE_OPEN_RE = re.compile(rf"{_KEY_TEXT}[\"']?\s*[:=]\s*[\"']?(?:{_SCHEME}\s+)?\Z", re.IGNORECASE)
 _KEY_END_RE = re.compile(rf"{_KEY_TEXT}[\"']?\s*\Z", re.IGNORECASE)
 _OPEN_TAIL_RE = re.compile(
     rf"[\w-]{{0,64}}[\"']?\s*(?:[:=]\s*[\"']?)?(?:{_SCHEME}\s+)?", re.IGNORECASE
@@ -242,9 +242,7 @@ class SecretRegistry:
 
     def _check_capacity(self) -> None:
         if len(self._matchers) >= MAX_SECRETS:
-            raise TooManySecretsError(
-                f"at most {MAX_SECRETS} secrets can be registered"
-            )
+            raise TooManySecretsError(f"at most {MAX_SECRETS} secrets can be registered")
 
     def clear(self) -> None:
         with self._lock:
@@ -388,8 +386,7 @@ def _character_forms(char: str) -> list[str]:
     forms = [
         re.escape(char),
         "".join(
-            "%" + _hex_pattern(f"{byte:02X}")
-            for byte in char.encode("utf-8", "surrogatepass")
+            "%" + _hex_pattern(f"{byte:02X}") for byte in char.encode("utf-8", "surrogatepass")
         ),
     ]
     if char == " ":
@@ -408,9 +405,7 @@ def _character_forms(char: str) -> list[str]:
 
 
 def _hex_pattern(digits: str) -> str:
-    return "".join(
-        f"[{digit}{digit.lower()}]" if digit.isalpha() else digit for digit in digits
-    )
+    return "".join(f"[{digit}{digit.lower()}]" if digit.isalpha() else digit for digit in digits)
 
 
 def _canonical_encodings(value: str) -> set[str]:
@@ -424,9 +419,7 @@ def _canonical_encodings(value: str) -> set[str]:
         quote_plus(value, safe="", errors="surrogatepass"),
     ):
         encodings.add(encoded)
-        encodings.add(
-            _PERCENT_ESCAPE_RE.sub(lambda match: match.group(0).lower(), encoded)
-        )
+        encodings.add(_PERCENT_ESCAPE_RE.sub(lambda match: match.group(0).lower(), encoded))
     return encodings
 
 
@@ -509,9 +502,7 @@ def _cut(text: str, limit: int, keep: Keep) -> str:
     low = max(position - _CUT_CONTEXT, 0)
     window = text[low : position + _CUT_CONTEXT]
     relative = position - low
-    spans = [
-        match.span() for pattern in _CUT_PATTERNS for match in pattern.finditer(window)
-    ]
+    spans = [match.span() for pattern in _CUT_PATTERNS for match in pattern.finditer(window)]
     moved = True
     while moved:
         moved = False
@@ -552,11 +543,7 @@ def _tail_start(text: str, position: int) -> int:
 
 
 def _next_line(text: str, position: int) -> int:
-    ends = [
-        end
-        for end in (text.find("\n", position), text.find("\r", position))
-        if end != -1
-    ]
+    ends = [end for end in (text.find("\n", position), text.find("\r", position)) if end != -1]
     return min(ends) + 1 if ends else len(text)
 
 
@@ -572,11 +559,7 @@ def _after_line_construct(text: str, position: int) -> int:
         for match in pattern.finditer(text, line, endpos):
             start, end = match.span()
             if start < position < end:
-                return (
-                    end
-                    if end < endpos or endpos == len(text)
-                    else _next_line(text, position)
-                )
+                return end if end < endpos or endpos == len(text) else _next_line(text, position)
     return position
 
 

@@ -49,9 +49,7 @@ def test_query_is_kept_but_never_displayed() -> None:
 
 
 def test_secret_path_is_redacted() -> None:
-    endpoint = Endpoint(
-        "https://hooks.example.com/services/T000/B000/XXXX", secret_path=True
-    )
+    endpoint = Endpoint("https://hooks.example.com/services/T000/B000/XXXX", secret_path=True)
     assert endpoint.display == "https://hooks.example.com/[REDACTED]"
     assert "T000" not in repr(endpoint)
     joined = endpoint.join("more")

@@ -105,9 +105,7 @@ def remaining_time() -> float | None:
     return None if deadline is None else deadline - monotonic()
 
 
-def _bounded(
-    timeout: float | None, exc_type: type[httpcore.TimeoutException]
-) -> float | None:
+def _bounded(timeout: float | None, exc_type: type[httpcore.TimeoutException]) -> float | None:
     remaining = remaining_time()
     if remaining is None:
         return timeout
@@ -165,9 +163,7 @@ class _SocketStream(httpcore.NetworkStream):
         try:
             with _socket_errors(httpcore.ConnectTimeout, httpcore.ConnectError):
                 self._sock.settimeout(_bounded(timeout, httpcore.ConnectTimeout))
-                sock = ssl_context.wrap_socket(
-                    self._sock, server_hostname=server_hostname
-                )
+                sock = ssl_context.wrap_socket(self._sock, server_hostname=server_hostname)
         except BaseException:
             self._sock.close()
             raise
@@ -255,9 +251,7 @@ class _BoundedResolver:
         self._workers: list[threading.Thread] = []
         self._closed = False
 
-    def lookup(
-        self, host: str, port: int, timeout: float | None
-    ) -> Sequence[AddressInfo]:
+    def lookup(self, host: str, port: int, timeout: float | None) -> Sequence[AddressInfo]:
         wait = _bounded(timeout, httpcore.ConnectTimeout)
         literal = _ip_literal(host, port)
         if literal is not None:
@@ -290,9 +284,7 @@ class _BoundedResolver:
         is not running when recording or starting it fails.
         """
         while len(self._workers) < DNS_WORKERS:
-            worker = threading.Thread(
-                target=self._work, name="vrm-alert-relay-dns", daemon=True
-            )
+            worker = threading.Thread(target=self._work, name="vrm-alert-relay-dns", daemon=True)
             try:
                 self._workers.append(worker)
                 worker.start()
@@ -321,9 +313,7 @@ class _BoundedResolver:
 
 
 class _DeadlineBackend(httpcore.NetworkBackend):
-    def __init__(
-        self, resolver: _BoundedResolver, socket_factory: SocketFactory
-    ) -> None:
+    def __init__(self, resolver: _BoundedResolver, socket_factory: SocketFactory) -> None:
         self._resolver = resolver
         self._socket_factory = socket_factory
 
@@ -339,9 +329,7 @@ class _DeadlineBackend(httpcore.NetworkBackend):
         error: httpcore.ConnectError | httpcore.ConnectTimeout = httpcore.ConnectError(
             "name resolved to no addresses"
         )
-        for family, kind, proto, _, sockaddr in self._resolver.lookup(
-            host, port, timeout
-        ):
+        for family, kind, proto, _, sockaddr in self._resolver.lookup(host, port, timeout):
             attempt = _bounded(timeout, httpcore.ConnectTimeout)
             try:
                 with _socket_errors(httpcore.ConnectTimeout, httpcore.ConnectError):
@@ -371,9 +359,7 @@ def _map_exceptions(request: httpx.Request) -> Iterator[None]:
     try:
         yield
     except _CAUGHT as exc:
-        httpx_type = next(
-            mapped for core, mapped in _EXCEPTIONS if isinstance(exc, core)
-        )
+        httpx_type = next(mapped for core, mapped in _EXCEPTIONS if isinstance(exc, core))
         raise httpx_type(type(exc).__name__, request=request) from None
 
 
@@ -416,9 +402,7 @@ class HardenedTransport(httpx.BaseTransport):
             keepalive_expiry=limits.keepalive_expiry,
             http1=True,
             http2=False,
-            network_backend=_DeadlineBackend(
-                self._resolver, socket_factory or _system_socket
-            ),
+            network_backend=_DeadlineBackend(self._resolver, socket_factory or _system_socket),
         )
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
@@ -441,9 +425,7 @@ class HardenedTransport(httpx.BaseTransport):
         return httpx.Response(
             status_code=core_response.status,
             headers=core_response.headers,
-            stream=_ResponseStream(
-                cast(Iterable[bytes], core_response.stream), request
-            ),
+            stream=_ResponseStream(cast(Iterable[bytes], core_response.stream), request),
             extensions=core_response.extensions,
         )
 

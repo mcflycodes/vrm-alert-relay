@@ -148,10 +148,7 @@ def test_longest_secret_replaced_first() -> None:
     assert lengths == sorted(lengths, reverse=True)
     order = registry.secrets.index
     assert order("fictitious-longer-value") < order("fictitious")
-    assert (
-        redact_text("x fictitious-longer-value y", registry=registry)
-        == f"x {REDACTED} y"
-    )
+    assert redact_text("x fictitious-longer-value y", registry=registry) == f"x {REDACTED} y"
 
 
 def redacts(secret: str, *rendered: str) -> None:
@@ -201,9 +198,7 @@ def test_mixed_literal_and_escaped_characters() -> None:
 
 def test_optional_and_short_escapes() -> None:
     redacts("fict/pass", "fict\\/pass", "fict/pass", "fict%2Fpass")
-    redacts(
-        "fict\tpass\n", "fict\\tpass\\n", "fict\\u0009pass\\u000A", "fict\\x09pass\\x0a"
-    )
+    redacts("fict\tpass\n", "fict\\tpass\\n", "fict\\u0009pass\\u000A", "fict\\x09pass\\x0a")
     redacts("fict'pass", "fict\\'pass", "fict%27pass")
 
 
@@ -254,9 +249,7 @@ def test_number_of_secrets_is_capped() -> None:
         registry.register("fictitious-secret-extra")
     assert issubclass(TooManySecretsError, SecretRegistrationError)
     assert redact_secrets(values[-1], registry) == REDACTED
-    assert redact_secrets("fictitious-secret-extra", registry) == (
-        "fictitious-secret-extra"
-    )
+    assert redact_secrets("fictitious-secret-extra", registry) == ("fictitious-secret-extra")
     registry.clear()
     registry.register("fictitious-secret-extra")
     assert redact_secrets("fictitious-secret-extra", registry) == REDACTED
@@ -461,9 +454,7 @@ def test_sensitive_key_values_redacted_in_text(text: str, leaked: str) -> None:
 
 
 def test_sensitive_key_redaction_keeps_other_fields() -> None:
-    result = redact_text(
-        "user=alice&password=hunter2-value&mode=sms", registry=SecretRegistry()
-    )
+    result = redact_text("user=alice&password=hunter2-value&mode=sms", registry=SecretRegistry())
     assert result == f"user=alice&password={REDACTED}&mode=sms"
 
 
@@ -547,9 +538,7 @@ def test_non_phone_numbers_untouched(text: str) -> None:
 
 
 def test_phone_in_url_path_masked() -> None:
-    result = redact_text(
-        "https://example.com/sms/2025550143/status", registry=SecretRegistry()
-    )
+    result = redact_text("https://example.com/sms/2025550143/status", registry=SecretRegistry())
     assert result == "https://example.com/sms/***0143/status"
 
 
@@ -627,13 +616,7 @@ def test_huge_input_is_fast_and_bounded(registry: SecretRegistry) -> None:
 
 
 def test_regex_heavy_input_is_fast() -> None:
-    hostile = (
-        "tokentokentoken" * 5000
-        + "1" * 5000
-        + "+1 " * 5000
-        + "password='"
-        + "\\" * 5000
-    )
+    hostile = "tokentokentoken" * 5000 + "1" * 5000 + "+1 " * 5000 + "password='" + "\\" * 5000
     start = time.perf_counter()
     redact_text(hostile, registry=SecretRegistry(), max_length=100_000)
     assert time.perf_counter() - start < 2.0
@@ -742,9 +725,7 @@ def test_tail_start_moves_past_line_bound_values() -> None:
     assert kept(header, 100) == "next"
     url = "see https://example.test/?token=" + "Zq" * 100
     assert kept(url, len(url) - 50) == ""
-    assert redact_text(url, registry=SecretRegistry(), max_length=60, keep="tail") == (
-        TRUNCATED
-    )
+    assert redact_text(url, registry=SecretRegistry(), max_length=60, keep="tail") == (TRUNCATED)
 
 
 def test_tail_start_drops_overlong_lines() -> None:
@@ -800,9 +781,7 @@ def test_forward_quote_scan_is_bounded_by_work(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(redaction_module, "_escaped", counting)
     text = 'password="\n' + "A" * 1500 + '\\"' * 20_000
-    result = redact_text(
-        text, registry=SecretRegistry(), max_length=len(text) - 1200, keep="tail"
-    )
+    result = redact_text(text, registry=SecretRegistry(), max_length=len(text) - 1200, keep="tail")
     assert result == TRUNCATED
     assert 0 < calls <= 2 * redaction_module._MAX_QUOTE_CANDIDATES
 
@@ -873,9 +852,7 @@ def test_matching_cost_is_bounded_with_full_registry() -> None:
     near = "%a\\" + "a" * (MAX_SECRET_LENGTH - 4)
     hostile = (near * 70)[:65536]
     formatter = JsonFormatter(registry=registry)
-    record = logging.LogRecord(
-        "relay", logging.INFO, __file__, 1, "%s", (hostile,), None
-    )
+    record = logging.LogRecord("relay", logging.INFO, __file__, 1, "%s", (hostile,), None)
     started = time.perf_counter()
     line = formatter.format(record)
     elapsed = time.perf_counter() - started
@@ -934,9 +911,7 @@ def test_sets_and_objects(registry: SecretRegistry) -> None:
     assert redact_value(Thing(), registry=registry) == f"Thing({REDACTED})"
     assert redact_value(Broken(), registry=registry) == "<unprintable Broken>"
     assert redact_value({Broken(): 1}, registry=registry) == {"<unprintable Broken>": 1}
-    assert (
-        redact_value(ValueError(CANARY), registry=registry) == f"ValueError: {REDACTED}"
-    )
+    assert redact_value(ValueError(CANARY), registry=registry) == f"ValueError: {REDACTED}"
 
 
 def test_huge_int_bounded() -> None:

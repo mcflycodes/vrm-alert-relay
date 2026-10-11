@@ -84,11 +84,7 @@ def _percent_edges(text: str, start: int) -> list[tuple[int, str]]:
     data = bytearray([lead])
     for index in range(1, size):
         position = start + 3 * index
-        byte = (
-            _hex(text, position + 1, 2)
-            if text[position : position + 1] == "%"
-            else None
-        )
+        byte = _hex(text, position + 1, 2) if text[position : position + 1] == "%" else None
         if byte is None:
             return []
         data.append(byte)

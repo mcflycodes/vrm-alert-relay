@@ -116,9 +116,7 @@ class FakeTlsContext:
     def set_alpn_protocols(self, protocols: list[str]) -> None:
         pass
 
-    def wrap_socket(
-        self, sock: FakeSocket, server_hostname: str | None = None
-    ) -> FakeSocket:
+    def wrap_socket(self, sock: FakeSocket, server_hostname: str | None = None) -> FakeSocket:
         self.calls.append((server_hostname, sock.timeout))
         if self.error is not None:
             raise self.error
@@ -240,9 +238,7 @@ def test_start_tls_keeps_hostname_and_bounds_handshake() -> None:
     sock = FakeSocket()
     context = FakeTlsContext()
     with deadline_scope(monotonic() + 1.0):
-        tls = stream_over(sock).start_tls(
-            cast(ssl.SSLContext, context), "relay.example.com", 5.0
-        )
+        tls = stream_over(sock).start_tls(cast(ssl.SSLContext, context), "relay.example.com", 5.0)
     assert isinstance(tls, transport_module._SocketStream)
     hostname, timeout = context.calls[0]
     assert hostname == "relay.example.com"
@@ -257,9 +253,7 @@ def test_start_tls_keeps_hostname_and_bounds_handshake() -> None:
         (TimeoutError(), httpcore.ConnectTimeout),
     ],
 )
-def test_failed_handshake_closes_socket(
-    error: BaseException, expected: type[Exception]
-) -> None:
+def test_failed_handshake_closes_socket(error: BaseException, expected: type[Exception]) -> None:
     sock = FakeSocket()
     with pytest.raises(expected):
         stream_over(sock).start_tls(
@@ -272,9 +266,7 @@ def test_handshake_after_deadline_closes_socket() -> None:
     sock = FakeSocket()
     context = FakeTlsContext()
     with deadline_scope(monotonic() - 1.0), pytest.raises(httpcore.ConnectTimeout):
-        stream_over(sock).start_tls(
-            cast(ssl.SSLContext, context), "relay.example.com", 5.0
-        )
+        stream_over(sock).start_tls(cast(ssl.SSLContext, context), "relay.example.com", 5.0)
     assert sock.closed
     assert context.calls == []
 
@@ -493,9 +485,7 @@ def test_interrupt_after_recording_a_worker_forgets_it() -> None:
 class InterruptingQueue:
     """Job queue that raises KeyboardInterrupt once a job has been handed over."""
 
-    def __init__(
-        self, inner: Any, *, deliver: bool, after: Callable[[], object]
-    ) -> None:
+    def __init__(self, inner: Any, *, deliver: bool, after: Callable[[], object]) -> None:
         self.inner = inner
         self.deliver = deliver
         self.after = after
@@ -537,9 +527,7 @@ def test_interrupt_after_handover_to_waiting_worker_releases_once(
         return [address()]
 
     resolver = transport_module._BoundedResolver(resolve)
-    jobs = InterruptingQueue(
-        resolver._jobs, deliver=True, after=lambda: started.wait(2.0)
-    )
+    jobs = InterruptingQueue(resolver._jobs, deliver=True, after=lambda: started.wait(2.0))
     monkeypatch.setattr(resolver, "_jobs", jobs)
     with pytest.raises(KeyboardInterrupt):
         resolver.lookup("slow.example.com", 443, 1.0)
@@ -659,8 +647,7 @@ def backend(
 
 def test_slow_addresses_stop_at_deadline() -> None:
     sockets = [
-        FakeSocket(connect_delay=0.04, connect_error=ConnectionRefusedError())
-        for _ in range(4)
+        FakeSocket(connect_delay=0.04, connect_error=ConnectionRefusedError()) for _ in range(4)
     ]
     factory = Factory(*sockets)
     start = monotonic()
@@ -671,8 +658,7 @@ def test_slow_addresses_stop_at_deadline() -> None:
     assert 1 <= len(factory.created) <= 3
     assert all(sock.closed for sock in factory.created)
     assert all(
-        sock.timeouts[0] is not None and sock.timeouts[0] <= 0.05
-        for sock in factory.created
+        sock.timeouts[0] is not None and sock.timeouts[0] <= 0.05 for sock in factory.created
     )
 
 
@@ -719,9 +705,7 @@ def test_last_connect_error_is_raised(
     addresses: list[AddressInfo], sockets: list[FakeSocket], expected: type[Exception]
 ) -> None:
     with pytest.raises(expected):
-        backend(addresses, Factory(*sockets)).connect_tcp(
-            "relay.example.com", 443, 0.02
-        )
+        backend(addresses, Factory(*sockets)).connect_tcp("relay.example.com", 443, 0.02)
 
 
 # Through the client
@@ -751,9 +735,7 @@ def timed_timeout(deadline: float, **request: Any) -> tuple[HttpTimeout, float]:
     with SafeHttpClient(timeouts=timeouts) as client:
         start = monotonic()
         with pytest.raises(HttpTimeout) as excinfo:
-            client.request(
-                "POST", f"https://relay.example.com/api?token={QUERY_CANARY}", **request
-            )
+            client.request("POST", f"https://relay.example.com/api?token={QUERY_CANARY}", **request)
         elapsed = monotonic() - start
     assert excinfo.value.__context__ is None
     assert excinfo.value.__cause__ is None
@@ -775,10 +757,7 @@ def test_client_slow_addresses_stop_at_deadline(
     fake_network: Callable[..., Factory],
 ) -> None:
     fake_network(
-        *(
-            FakeSocket(connect_delay=0.04, connect_error=ConnectionRefusedError())
-            for _ in range(4)
-        ),
+        *(FakeSocket(connect_delay=0.04, connect_error=ConnectionRefusedError()) for _ in range(4)),
         resolver=lambda host, port: [address()] * 4,
     )
     error, elapsed = timed_timeout(0.05)
@@ -852,9 +831,7 @@ def test_response_stream_maps_errors_and_closes() -> None:
 
 def test_pool_wait_bounded_by_deadline() -> None:
     transport = HardenedTransport(ssl_context=ssl.create_default_context())
-    request = httpx.Request(
-        "GET", "https://example.invalid/", extensions={"timeout": {}}
-    )
+    request = httpx.Request("GET", "https://example.invalid/", extensions={"timeout": {}})
     with deadline_scope(monotonic() - 1.0), pytest.raises(httpx.PoolTimeout):
         transport.handle_request(request)
     transport.close()

@@ -147,9 +147,7 @@ def test_proxy_and_tls_environment_is_ignored(
 
 def test_defaults() -> None:
     client = SafeHttpClient()
-    assert client.timeouts == Timeouts(
-        connect=5.0, read=10.0, write=10.0, pool=5.0, deadline=30.0
-    )
+    assert client.timeouts == Timeouts(connect=5.0, read=10.0, write=10.0, pool=5.0, deadline=30.0)
     assert client.max_response_bytes == DEFAULT_MAX_RESPONSE_BYTES == 1024 * 1024
     assert client.max_request_bytes == DEFAULT_MAX_REQUEST_BYTES == 64 * 1024
     client.close()
@@ -158,9 +156,7 @@ def test_defaults() -> None:
 
 @pytest.mark.parametrize("limit", [0, -1, True, 1.5])
 def test_max_request_bytes_validation(limit: Any) -> None:
-    with pytest.raises(
-        ValueError, match="max_request_bytes must be a positive integer"
-    ):
+    with pytest.raises(ValueError, match="max_request_bytes must be a positive integer"):
         SafeHttpClient(max_request_bytes=limit)
 
 
@@ -228,9 +224,7 @@ def test_max_response_bytes_validation(limit: Any) -> None:
 
 def test_default_and_custom_headers(transport: StubTransport) -> None:
     transport.respond(lambda request: ok())
-    with SafeHttpClient(
-        headers={"X-Client": "relay"}, user_agent="relay-test"
-    ) as client:
+    with SafeHttpClient(headers={"X-Client": "relay"}, user_agent="relay-test") as client:
         client.get(BASE, headers={"Authorization": f"Bearer {HEADER_CANARY}"})
     sent = transport.requests[0].headers
     assert sent["user-agent"] == "relay-test"
@@ -251,9 +245,7 @@ def test_constructor_validates_headers() -> None:
 
 def test_get_returns_response(client: SafeHttpClient, transport: StubTransport) -> None:
     transport.respond(
-        lambda request: ok(
-            b'{"value": 42}', headers={"content-type": "application/json"}
-        )
+        lambda request: ok(b'{"value": 42}', headers={"content-type": "application/json"})
     )
     response = client.get(Endpoint(BASE).join("installations", 123456))
     assert response.status_code == 200
@@ -264,9 +256,7 @@ def test_get_returns_response(client: SafeHttpClient, transport: StubTransport) 
     assert transport.requests[0].url.path == "/v1/installations/123456"
 
 
-def test_accepts_string_target(
-    client: SafeHttpClient, transport: StubTransport
-) -> None:
+def test_accepts_string_target(client: SafeHttpClient, transport: StubTransport) -> None:
     transport.respond(lambda request: ok(b"done"))
     assert client.request("get", f"{BASE}/x").content == b"done"
     assert transport.requests[0].method == "GET"
@@ -278,9 +268,7 @@ def test_head_and_no_content(client: SafeHttpClient, transport: StubTransport) -
     assert client.request("DELETE", BASE).status_code == 204
 
 
-def test_params_merge_with_endpoint_query(
-    client: SafeHttpClient, transport: StubTransport
-) -> None:
+def test_params_merge_with_endpoint_query(client: SafeHttpClient, transport: StubTransport) -> None:
     transport.respond(lambda request: ok())
     client.get(
         f"{BASE}?api_username=user&method=getBalance",
@@ -294,9 +282,7 @@ def test_params_merge_with_endpoint_query(
     assert transport.requests[1].url.params.get_list("a") == ["1", "2.5"]
 
 
-def test_invalid_params_rejected(
-    client: SafeHttpClient, transport: StubTransport
-) -> None:
+def test_invalid_params_rejected(client: SafeHttpClient, transport: StubTransport) -> None:
     with pytest.raises(InvalidRequestError, match="query parameter names"):
         client.get(BASE, params={"token": object()})  # type: ignore[dict-item]
     with pytest.raises(InvalidRequestError, match="query parameter names"):
@@ -306,9 +292,7 @@ def test_invalid_params_rejected(
     assert transport.requests == []
 
 
-def test_unencodable_json_rejected(
-    client: SafeHttpClient, transport: StubTransport
-) -> None:
+def test_unencodable_json_rejected(client: SafeHttpClient, transport: StubTransport) -> None:
     with pytest.raises(InvalidRequestError, match="could not be encoded"):
         client.post(BASE, json={"value": float("nan"), "pw": BODY_CANARY})
     assert transport.requests == []
@@ -338,9 +322,7 @@ def test_json_decode_error_has_no_body() -> None:
 
 
 def test_response_repr_hides_body_and_headers() -> None:
-    response = HttpResponse(
-        200, httpx.Headers({"set-cookie": HEADER_CANARY}), BODY_CANARY.encode()
-    )
+    response = HttpResponse(200, httpx.Headers({"set-cookie": HEADER_CANARY}), BODY_CANARY.encode())
     assert repr(response) == "HttpResponse(status_code=200)"
 
 
@@ -382,9 +364,7 @@ def test_multipart_body(client: SafeHttpClient, transport: StubTransport) -> Non
     body = request.read()
     assert b'name="api_password"\r\n\r\n' + BODY_CANARY.encode() in body
     assert b'name="message"\r\n\r\nBattery low' in body
-    assert (
-        b'name="attachment"; filename="report.txt"\r\nContent-Type: text/plain' in body
-    )
+    assert b'name="attachment"; filename="report.txt"\r\nContent-Type: text/plain' in body
     assert b"soc=12" in body
 
 
@@ -412,13 +392,9 @@ def test_invalid_bodies_rejected_before_io(
     assert transport.requests == []
 
 
-def test_multipart_content_type_validated(
-    client: SafeHttpClient, transport: StubTransport
-) -> None:
+def test_multipart_content_type_validated(client: SafeHttpClient, transport: StubTransport) -> None:
     with pytest.raises(InvalidHeaderError):
-        client.post(
-            BASE, multipart={"f": ("name", b"x", "text/plain\r\nX-Injected: 1")}
-        )
+        client.post(BASE, multipart={"f": ("name", b"x", "text/plain\r\nX-Injected: 1")})
     assert transport.requests == []
 
 
@@ -477,18 +453,14 @@ def test_bad_headers_rejected_before_io(
             assert value not in str(excinfo.value)
 
 
-def test_tab_allowed_in_header_value(
-    client: SafeHttpClient, transport: StubTransport
-) -> None:
+def test_tab_allowed_in_header_value(client: SafeHttpClient, transport: StubTransport) -> None:
     transport.respond(lambda request: ok())
     client.get(BASE, headers={"X-Test": "a\tb"})
     assert transport.requests[0].headers["x-test"] == "a\tb"
 
 
 @pytest.mark.parametrize("method", ["TRACE", "CONNECT", "OPTIONS", "", 5])
-def test_unsupported_methods(
-    client: SafeHttpClient, transport: StubTransport, method: Any
-) -> None:
+def test_unsupported_methods(client: SafeHttpClient, transport: StubTransport, method: Any) -> None:
     with pytest.raises(InvalidRequestError, match="method"):
         client.request(method, BASE)
     assert transport.requests == []
@@ -516,12 +488,8 @@ def test_redirects_are_refused(
 
 
 @pytest.mark.parametrize("status", [400, 401, 403, 404, 429, 500, 502, 503])
-def test_status_errors(
-    client: SafeHttpClient, transport: StubTransport, status: int
-) -> None:
-    transport.respond(
-        lambda request: httpx.Response(status, content=BODY_CANARY.encode())
-    )
+def test_status_errors(client: SafeHttpClient, transport: StubTransport, status: int) -> None:
+    transport.respond(lambda request: httpx.Response(status, content=BODY_CANARY.encode()))
     with pytest.raises(HttpStatusError) as excinfo:
         client.post(f"{BASE}?token={QUERY_CANARY}", form={"api_password": BODY_CANARY})
     assert excinfo.value.status == status
@@ -533,9 +501,7 @@ def test_status_errors(
     assert_no_canaries(excinfo.value)
 
 
-def test_informational_status_is_an_error(
-    client: SafeHttpClient, transport: StubTransport
-) -> None:
+def test_informational_status_is_an_error(client: SafeHttpClient, transport: StubTransport) -> None:
     transport.respond(lambda request: httpx.Response(101))
     with pytest.raises(HttpStatusError):
         client.get(BASE)
@@ -563,21 +529,15 @@ def test_retry_after_parsing(
     header: str,
     expected: float | None,
 ) -> None:
-    transport.respond(
-        lambda request: httpx.Response(429, headers={"retry-after": header})
-    )
+    transport.respond(lambda request: httpx.Response(429, headers={"retry-after": header}))
     with pytest.raises(HttpStatusError) as excinfo:
         client.get(BASE)
     assert excinfo.value.retry_after == expected
 
 
-def test_retry_after_future_date(
-    client: SafeHttpClient, transport: StubTransport
-) -> None:
+def test_retry_after_future_date(client: SafeHttpClient, transport: StubTransport) -> None:
     header = format_datetime(_FUTURE, usegmt=True)
-    transport.respond(
-        lambda request: httpx.Response(503, headers={"retry-after": header})
-    )
+    transport.respond(lambda request: httpx.Response(503, headers={"retry-after": header}))
     with pytest.raises(HttpStatusError) as excinfo:
         client.get(BASE)
     assert excinfo.value.retry_after is not None
@@ -605,9 +565,7 @@ def test_timeouts_are_mapped(
     phase: str,
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        raise exc_type(
-            f"timed out talking to {request.url} {HEADER_CANARY}", request=request
-        )
+        raise exc_type(f"timed out talking to {request.url} {HEADER_CANARY}", request=request)
 
     transport.respond(handler)
     with pytest.raises(HttpTimeout) as excinfo:
@@ -635,9 +593,7 @@ def test_transport_errors_are_mapped(
     with pytest.raises(HttpTransportError) as excinfo:
         client.post(f"{BASE}?token={QUERY_CANARY}", json={"pw": BODY_CANARY})
     assert excinfo.value.cause == exc_type.__name__
-    assert (
-        str(excinfo.value) == f"HTTP transport error ({exc_type.__name__}): POST {BASE}"
-    )
+    assert str(excinfo.value) == f"HTTP transport error ({exc_type.__name__}): POST {BASE}"
     assert_no_canaries(excinfo.value)
 
 
@@ -674,9 +630,7 @@ class FailingCloseStream(ChunkStream):
 def test_close_failure_does_not_replace_error(
     client: SafeHttpClient, transport: StubTransport
 ) -> None:
-    transport.respond(
-        lambda request: httpx.Response(500, stream=FailingCloseStream(b"x", 1))
-    )
+    transport.respond(lambda request: httpx.Response(500, stream=FailingCloseStream(b"x", 1)))
     with pytest.raises(HttpStatusError) as excinfo:
         client.get(BASE)
     assert excinfo.value.status == 500
@@ -687,9 +641,7 @@ def test_secret_path_endpoint_hides_path_in_errors(
     client: SafeHttpClient, transport: StubTransport
 ) -> None:
     transport.respond(lambda request: httpx.Response(500))
-    endpoint = Endpoint(
-        f"https://hooks.example.com/hook/{PATH_CANARY}", secret_path=True
-    )
+    endpoint = Endpoint(f"https://hooks.example.com/hook/{PATH_CANARY}", secret_path=True)
     with pytest.raises(HttpStatusError) as excinfo:
         client.post(endpoint, json={"text": "Battery low"})
     assert str(excinfo.value) == "HTTP 500: POST https://hooks.example.com/[REDACTED]"
@@ -717,9 +669,7 @@ def test_declared_oversize_body_rejected_without_reading(
     assert stream.yielded == 0
 
 
-def test_streamed_oversize_body_aborted(
-    client: SafeHttpClient, transport: StubTransport
-) -> None:
+def test_streamed_oversize_body_aborted(client: SafeHttpClient, transport: StubTransport) -> None:
     stream = ChunkStream(b"x" * 65536)
     transport.respond(lambda request: httpx.Response(200, stream=stream))
     with pytest.raises(HttpTooLarge, match="exceeded 1048576 bytes"):
@@ -730,9 +680,7 @@ def test_streamed_oversize_body_aborted(
 def test_understated_content_length_still_capped(transport: StubTransport) -> None:
     stream = ChunkStream(b"x" * 100, count=5)
     transport.respond(
-        lambda request: httpx.Response(
-            200, headers={"content-length": "garbage"}, stream=stream
-        )
+        lambda request: httpx.Response(200, headers={"content-length": "garbage"}, stream=stream)
     )
     with SafeHttpClient(max_response_bytes=250) as client, pytest.raises(HttpTooLarge):
         client.get(BASE)
@@ -740,16 +688,12 @@ def test_understated_content_length_still_capped(transport: StubTransport) -> No
 
 
 def test_body_at_cap_is_accepted(transport: StubTransport) -> None:
-    transport.respond(
-        lambda request: httpx.Response(200, stream=ChunkStream(b"x" * 100, count=3))
-    )
+    transport.respond(lambda request: httpx.Response(200, stream=ChunkStream(b"x" * 100, count=3)))
     with SafeHttpClient(max_response_bytes=300) as client:
         assert len(client.get(BASE).content) == 300
 
 
-def test_per_request_cap_override(
-    client: SafeHttpClient, transport: StubTransport
-) -> None:
+def test_per_request_cap_override(client: SafeHttpClient, transport: StubTransport) -> None:
     transport.respond(lambda request: ok(b"x" * 11))
     with pytest.raises(HttpTooLarge, match="exceeded 10 bytes"):
         client.get(BASE, max_response_bytes=10)
@@ -812,9 +756,7 @@ def test_debug_log_has_no_secrets_or_body(
     record = records[0]
     assert record.getMessage() == "http request completed"
     assert record.args == ()
-    extras = set(record.__dict__) - set(
-        logging.LogRecord("", 0, "", 0, "", None, None).__dict__
-    )
+    extras = set(record.__dict__) - set(logging.LogRecord("", 0, "", 0, "", None, None).__dict__)
     assert extras <= {
         "http_method",
         "http_target",
@@ -857,17 +799,13 @@ def test_library_logger_filter_installed_once() -> None:
 # Compression
 
 
-@pytest.mark.parametrize(
-    "encoding", ["gzip", "GZIP", "br", "deflate", "identity, gzip", "zstd"]
-)
+@pytest.mark.parametrize("encoding", ["gzip", "GZIP", "br", "deflate", "identity, gzip", "zstd"])
 def test_compressed_response_refused_before_reading(
     client: SafeHttpClient, transport: StubTransport, encoding: str
 ) -> None:
     stream = ChunkStream(gzip.compress(b"\x00" * (32 * 1024 * 1024)), count=1)
     transport.respond(
-        lambda request: httpx.Response(
-            200, headers={"content-encoding": encoding}, stream=stream
-        )
+        lambda request: httpx.Response(200, headers={"content-encoding": encoding}, stream=stream)
     )
     with pytest.raises(HttpContentEncodingRefused) as excinfo:
         client.get(f"{BASE}?token={QUERY_CANARY}")
@@ -880,9 +818,7 @@ def test_compressed_response_refused_before_reading(
 def test_identity_encoding_accepted(
     client: SafeHttpClient, transport: StubTransport, encoding: str
 ) -> None:
-    transport.respond(
-        lambda request: ok(b"plain", headers={"content-encoding": encoding})
-    )
+    transport.respond(lambda request: ok(b"plain", headers={"content-encoding": encoding}))
     assert client.get(BASE).content == b"plain"
 
 

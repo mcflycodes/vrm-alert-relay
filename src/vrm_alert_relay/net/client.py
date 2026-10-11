@@ -89,9 +89,7 @@ _TIMEOUT_PHASES: Mapping[type[httpx.TimeoutException], str] = {
 
 QueryValue = str | int | float | bool | None
 QueryParams = (
-    Mapping[str, QueryValue]
-    | list[tuple[str, QueryValue]]
-    | tuple[tuple[str, QueryValue], ...]
+    Mapping[str, QueryValue] | list[tuple[str, QueryValue]] | tuple[tuple[str, QueryValue], ...]
 )
 MultipartFile = tuple[str, bytes, str]
 """A file part: ``(filename, content, content_type)``."""
@@ -181,9 +179,7 @@ class SafeHttpClient:
     ) -> None:
         self._timeouts = timeouts if timeouts is not None else Timeouts()
         self._max_response_bytes = _validate_limit(max_response_bytes)
-        self._max_request_bytes = _validate_limit(
-            max_request_bytes, "max_request_bytes"
-        )
+        self._max_request_bytes = _validate_limit(max_request_bytes, "max_request_bytes")
         _validate_header_value("User-Agent", user_agent)
         default_headers = {"User-Agent": user_agent}
         default_headers.update(_validate_headers(headers))
@@ -292,9 +288,7 @@ class SafeHttpClient:
             if max_response_bytes is None
             else _validate_limit(max_response_bytes)
         )
-        request = self._build_request(
-            method, endpoint, params, headers, json, form, multipart
-        )
+        request = self._build_request(method, endpoint, params, headers, json, form, multipart)
         shown = endpoint.display
 
         start = monotonic()
@@ -306,12 +300,8 @@ class SafeHttpClient:
                 if 300 <= status < 400:
                     raise HttpRedirectRefused(method, shown, status=status)
                 if not 200 <= status < 300:
-                    retry_after = _parse_retry_after(
-                        response.headers.get("retry-after")
-                    )
-                    raise HttpStatusError(
-                        method, shown, status=status, retry_after=retry_after
-                    )
+                    retry_after = _parse_retry_after(response.headers.get("retry-after"))
+                    raise HttpStatusError(method, shown, status=status, retry_after=retry_after)
                 content = _read_body(response, method, shown, limit, deadline)
             finally:
                 with contextlib.suppress(httpx.HTTPError, httpx.StreamError):
@@ -327,9 +317,7 @@ class SafeHttpClient:
                 "elapsed_ms": round((monotonic() - start) * 1000),
             },
         )
-        return HttpResponse(
-            status_code=status, headers=response.headers, content=content
-        )
+        return HttpResponse(status_code=status, headers=response.headers, content=content)
 
     def _send(
         self, request: httpx.Request, method: str, shown: str, deadline: float
@@ -339,9 +327,7 @@ class SafeHttpClient:
         try:
             return self._client.send(request, stream=True)
         except httpx.TimeoutException as exc:
-            error: HttpError = HttpTimeout(
-                method, shown, phase=_timeout_phase(exc, deadline)
-            )
+            error: HttpError = HttpTimeout(method, shown, phase=_timeout_phase(exc, deadline))
         except (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError) as exc:
             error = HttpTransportError(method, shown, cause=type(exc).__name__)
         raise error
@@ -358,9 +344,7 @@ class SafeHttpClient:
     ) -> httpx.Request:
         bodies = sum(body is not None for body in (json, form, multipart))
         if bodies > 1:
-            raise InvalidRequestError(
-                "only one of json, form and multipart may be given"
-            )
+            raise InvalidRequestError("only one of json, form and multipart may be given")
         files = _multipart_files(multipart) if multipart is not None else None
         request_headers = _validate_headers(headers)
         _validate_params(params)
@@ -382,9 +366,7 @@ class SafeHttpClient:
             pass
         else:
             if size > self._max_request_bytes:
-                raise RequestTooLargeError(
-                    method, endpoint.display, limit=self._max_request_bytes
-                )
+                raise RequestTooLargeError(method, endpoint.display, limit=self._max_request_bytes)
             return request
         raise InvalidRequestError(
             f"request body or parameters could not be encoded: {method} {endpoint.display}"
@@ -398,12 +380,7 @@ def _read_body(
     if any(token.strip().lower() not in ("", "identity") for token in encodings):
         raise HttpContentEncodingRefused(method, shown)
     declared = response.headers.get("content-length")
-    if (
-        declared is not None
-        and declared.isascii()
-        and declared.isdigit()
-        and int(declared) > limit
-    ):
+    if declared is not None and declared.isascii() and declared.isdigit() and int(declared) > limit:
         raise HttpTooLarge(method, shown, limit=limit)
     if monotonic() > deadline:
         raise HttpTimeout(method, shown, phase="deadline")
@@ -418,9 +395,7 @@ def _read_body(
                 raise HttpTimeout(method, shown, phase="deadline")
         return bytes(body)
     except httpx.TimeoutException as exc:
-        error: HttpError = HttpTimeout(
-            method, shown, phase=_timeout_phase(exc, deadline)
-        )
+        error: HttpError = HttpTimeout(method, shown, phase=_timeout_phase(exc, deadline))
     except (httpx.HTTPError, httpx.StreamError) as exc:
         error = HttpTransportError(method, shown, cause=type(exc).__name__)
     raise error
@@ -472,9 +447,7 @@ def _validate_header_value(name: str, value: object) -> None:
     if len(value) > MAX_HEADER_VALUE_LENGTH:
         raise InvalidHeaderError(f"value of header {name!r} is too long")
     if _HEADER_VALUE_FORBIDDEN_RE.search(value):
-        raise InvalidHeaderError(
-            f"value of header {name!r} contains control characters"
-        )
+        raise InvalidHeaderError(f"value of header {name!r} contains control characters")
 
 
 def _multipart_files(
@@ -482,9 +455,7 @@ def _multipart_files(
 ) -> list[tuple[str, tuple[str | None, str | bytes] | tuple[str, bytes, str]]]:
     if not multipart:
         raise InvalidRequestError("multipart body must have at least one field")
-    files: list[
-        tuple[str, tuple[str | None, str | bytes] | tuple[str, bytes, str]]
-    ] = []
+    files: list[tuple[str, tuple[str | None, str | bytes] | tuple[str, bytes, str]]] = []
     for name, value in multipart.items():
         if not isinstance(name, str):
             raise InvalidRequestError("multipart field names must be strings")
