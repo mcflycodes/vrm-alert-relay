@@ -1,9 +1,9 @@
 """Rendering configuration locations without echoing untrusted mapping keys.
 
 A location segment is shown only when it is a field name from the schema, a list
-index, or a recipient name that passes the identifier pattern and holds no run
-of five or more digits. Other recipient names appear as ``[#<position>]``, and
-unrecognized keys end the path. Whenever something is withheld the problem
+index, or a recipient name that passes the identifier pattern and contains fewer
+than five digits in total. Other recipient names appear as ``[#<position>]``,
+and unrecognized keys end the path. Whenever something is withheld the problem
 gives the YAML line number instead.
 """
 
@@ -19,12 +19,21 @@ from pydantic import BaseModel
 
 from .models import RelayConfig
 
-__all__ = ["Loc", "SourceMap", "describe", "is_displayable_key", "render_path"]
+__all__ = [
+    "Loc",
+    "SourceMap",
+    "describe",
+    "display_name",
+    "is_displayable_key",
+    "render_path",
+]
 
 Loc = tuple[str | int, ...]
 
 _DISPLAYABLE_KEY = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
-_LONG_DIGIT_RUN = re.compile(r"[0-9]{5,}")
+_DIGIT = re.compile(r"[0-9]")
+# Phone numbers have at least five digits however they are separated.
+_MAX_DISPLAYED_DIGITS = 4
 _KEY_SEGMENT = "[key]"
 
 
@@ -53,8 +62,16 @@ _NO_SOURCE = SourceMap()
 
 
 def is_displayable_key(key: str) -> bool:
-    """Whether an operator-chosen name may be shown in an error."""
-    return bool(_DISPLAYABLE_KEY.fullmatch(key)) and not _LONG_DIGIT_RUN.search(key)
+    """Whether an operator-chosen name may be shown in operator-facing output."""
+    return (
+        _DISPLAYABLE_KEY.fullmatch(key) is not None
+        and len(_DIGIT.findall(key)) <= _MAX_DISPLAYED_DIGITS
+    )
+
+
+def display_name(name: str, position: int | str) -> str:
+    """``name`` if it may be shown, otherwise its placeholder ``[#<position>]``."""
+    return name if is_displayable_key(name) else f"[#{position}]"
 
 
 def _unwrap(annotation: Any) -> Any:
@@ -116,12 +133,10 @@ def render_path(
             shown = f".{segment}"
         else:
             next_annotation = _mapping_value(annotation)
-            if is_displayable_key(segment):
-                shown = f".{segment}"
-            else:
-                position = source.positions.get(tuple(loc[: index + 1]), "?")
-                shown = f"[#{position}]"
-                withheld = True
+            position = source.positions.get(tuple(loc[: index + 1]), "?")
+            name = display_name(segment, position)
+            withheld = withheld or name != segment
+            shown = f".{name}" if name == segment else name
         if next_annotation is None:
             withheld = True
             break

@@ -312,6 +312,29 @@ def test_check_missing_file(tmp_path: Path) -> None:
     assert report.problems == ("configuration file: does not exist",)
 
 
+@pytest.mark.parametrize(
+    "name", ["r2025550142", "202-555-0142", "202_555_0142", "1-202-555-0142"]
+)
+def test_check_report_lists_phone_shaped_names_by_position(
+    config_data: Data, write_config: Write, secret_file: SecretWriter, name: str
+) -> None:
+    secret_file("vrm_token")
+    secret_file("webhook_token")
+    config_data["sending"]["enabled"] = True
+    config_data["providers"]["webhook"]["enabled"] = True
+    hook = config_data["recipients"].pop("hook")
+    config_data["recipients"][name] = hook
+    config_data["recipients"]["r2025550199"] = {"provider": "log"}
+    config_data["rules"][1]["recipients"] = ["owner_app", name]
+    config_data["rules"][2]["recipients"] = ["audit", "r2025550199"]
+    report = check_config(write_config(config_data))
+    assert report.ok is True
+    assert report.live_recipients == ("[#3]",)
+    assert report.dry_run_recipients == ("owner_sms", "owner_app", "audit", "[#4]")
+    text = repr(report)
+    assert name not in text and "0142" not in text and "0199" not in text
+
+
 def test_check_masks_phone_numbers(config_data: Data, write_config: Write) -> None:
     config_data["recipients"]["owner_sms"]["phone"] = "+1 102 555 0142"
     report = check_config(write_config(config_data))

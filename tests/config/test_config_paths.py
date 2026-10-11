@@ -11,6 +11,7 @@ from vrm_alert_relay.config import config_warnings
 from vrm_alert_relay.config._paths import (
     SourceMap,
     describe,
+    display_name,
     is_displayable_key,
     render_path,
 )
@@ -79,9 +80,16 @@ def test_line_is_only_added_when_something_is_withheld() -> None:
         ("site-1234", True),
         ("a" * 63, True),
         ("fake-secret-canary-7q9x", True),
+        ("a1-b2-c3-d4", True),
         ("a" * 64, False),
         ("r12345", False),
         ("2025550142", False),
+        ("r2025550142", False),
+        ("202-555-0142", False),
+        ("202_555_0142", False),
+        ("1-202-555-0142", False),
+        ("a1-b2-c3-d4-e5", False),
+        ("owner-1-2-3-4-5", False),
         ("Owner", False),
         ("-owner", False),
         ("_owner", False),
@@ -94,10 +102,30 @@ def test_is_displayable_key(key: str, shown: bool) -> None:
     assert is_displayable_key(key) is shown
 
 
-def test_warnings_withhold_recipient_names_with_long_digit_runs(
-    config_data: Data, parse: Callable[[Any], Any]
+PHONE_SHAPED_NAMES = ["r2025550142", "202-555-0142", "202_555_0142", "1-202-555-0142"]
+
+
+@pytest.mark.parametrize("name", PHONE_SHAPED_NAMES)
+def test_display_name(name: str) -> None:
+    assert display_name(name, 3) == "[#3]"
+    assert display_name("owner_sms", 3) == "owner_sms"
+
+
+@pytest.mark.parametrize("name", PHONE_SHAPED_NAMES)
+def test_warnings_withhold_phone_shaped_recipient_names(
+    config_data: Data, parse: Callable[[Any], Any], name: str
 ) -> None:
-    config_data["recipients"]["r2025550142"] = {"provider": "log"}
+    config_data["recipients"][name] = {"provider": "log"}
     warnings = config_warnings(parse(config_data))
     assert "recipients[#4]: not used by any rule" in warnings
-    assert all("2025550142" not in warning for warning in warnings)
+    assert all(name not in warning and "0142" not in warning for warning in warnings)
+
+
+@pytest.mark.parametrize("name", PHONE_SHAPED_NAMES)
+def test_errors_withhold_phone_shaped_recipient_names(
+    config_data: Data, problems: Callable[[Any], tuple[str, ...]], name: str
+) -> None:
+    config_data["recipients"][name] = {"provider": "voipms"}
+    (problem,) = problems(config_data)
+    assert problem.startswith("recipients[#4].phone: is required (line ")
+    assert name not in problem and "0142" not in problem

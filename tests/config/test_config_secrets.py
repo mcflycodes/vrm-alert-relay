@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import errno
+import inspect
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import pickle
 import stat
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pydantic
@@ -180,6 +182,9 @@ def _assert_unchanged(secrets: RelaySecrets, fake_secret: str) -> None:
         lambda r, s: r.model_copy(update={"vrm_token": s}),
         lambda r, s: r.model_copy(update={"voipms_password": s}, deep=True),
         lambda r, s: r.model_copy(update={}),
+        lambda r, s: r.copy(update={"vrm_token": s}),
+        lambda r, s: r.copy(update={"voipms_password": Secret(s)}, deep=True),
+        lambda r, s: r.copy(update={}),
         lambda r, s: copy.replace(r, vrm_token=s),
         lambda r, s: copy.replace(r),
         lambda r, s: setattr(r, "vrm_token", s),
@@ -192,6 +197,9 @@ def _assert_unchanged(secrets: RelaySecrets, fake_secret: str) -> None:
         "model_copy_update",
         "model_copy_deep_update",
         "model_copy_empty_update",
+        "deprecated_copy_update_plain",
+        "deprecated_copy_update_secret",
+        "deprecated_copy_empty_update",
         "copy_replace",
         "copy_replace_nothing",
         "setattr_plain",
@@ -242,6 +250,117 @@ def test_relay_secrets_copies_hold_only_secrets(
     assert isinstance(duplicated.vrm_token, Secret)
     assert repr(duplicated) == str(duplicated) == HIDDEN
     _assert_unchanged(duplicated, fake_secret)
+
+
+def test_deprecated_copy_without_update_keeps_secrets(fake_secret: str) -> None:
+    secrets = RelaySecrets(vrm_token=Secret(fake_secret))
+    with pytest.warns(pydantic.PydanticDeprecatedSince20):
+        duplicated = secrets.copy(deep=True)
+    assert duplicated == secrets
+    _assert_unchanged(duplicated, fake_secret)
+
+
+_VALUE_PARAMETERS = frozenset(
+    {
+        "b",
+        "changes",
+        "data",
+        "json_data",
+        "obj",
+        "path",
+        "state",
+        "update",
+        "value",
+        "values",
+    }
+)
+
+
+def _value_entry_points() -> set[str]:
+    """Every public or dunder BaseModel method with a parameter that carries values."""
+    found: set[str] = set()
+    for name in vars(pydantic.BaseModel):
+        if name.startswith("_") and not name.startswith("__"):
+            continue
+        attr = inspect.getattr_static(pydantic.BaseModel, name)
+        function = getattr(attr, "__func__", attr)
+        if not inspect.isfunction(function):
+            continue
+        if _VALUE_PARAMETERS & set(inspect.signature(function).parameters):
+            found.add(name)
+    return found
+
+
+Attack = Callable[[RelaySecrets, str, Path], object]
+
+
+def _write_json(path: Path, value: str) -> Path:
+    target = path / "secrets.json"
+    target.write_text(json.dumps({"vrm_token": value}))
+    return target
+
+
+# Every way to feed values into a RelaySecrets, each tried with plaintext.
+VALUE_ATTACKS: list[tuple[str, Attack]] = [
+    ("__init__", lambda r, s, p: RelaySecrets(vrm_token=s)),
+    ("__replace__", lambda r, s, p: copy.replace(r, vrm_token=s)),
+    ("__setattr__", lambda r, s, p: setattr(r, "vrm_token", s)),
+    ("__setstate__", lambda r, s, p: r.__setstate__({"__dict__": {"vrm_token": s}})),
+    ("construct", lambda r, s, p: RelaySecrets.construct(vrm_token=s)),
+    ("copy", lambda r, s, p: r.copy(update={"vrm_token": s})),
+    ("from_orm", lambda r, s, p: RelaySecrets.from_orm(SimpleNamespace(vrm_token=s))),
+    ("model_construct", lambda r, s, p: RelaySecrets.model_construct(vrm_token=s)),
+    ("model_copy", lambda r, s, p: r.model_copy(update={"vrm_token": s})),
+    ("model_validate", lambda r, s, p: RelaySecrets.model_validate({"vrm_token": s})),
+    (
+        "model_validate",
+        lambda r, s, p: RelaySecrets.model_validate(
+            SimpleNamespace(vrm_token=s), from_attributes=True
+        ),
+    ),
+    (
+        "model_validate_json",
+        lambda r, s, p: RelaySecrets.model_validate_json(json.dumps({"vrm_token": s})),
+    ),
+    (
+        "model_validate_strings",
+        lambda r, s, p: RelaySecrets.model_validate_strings({"vrm_token": s}),
+    ),
+    ("parse_obj", lambda r, s, p: RelaySecrets.parse_obj({"vrm_token": s})),
+    ("parse_raw", lambda r, s, p: RelaySecrets.parse_raw(json.dumps({"vrm_token": s}))),
+    (
+        "parse_raw",
+        lambda r, s, p: RelaySecrets.parse_raw(
+            pickle.dumps({"vrm_token": s}), proto="pickle", allow_pickle=True
+        ),
+    ),
+    ("parse_file", lambda r, s, p: RelaySecrets.parse_file(_write_json(p, s))),
+    ("validate", lambda r, s, p: RelaySecrets.validate({"vrm_token": s})),
+]
+
+
+def test_every_value_entry_point_is_attacked() -> None:
+    assert _value_entry_points() == {name for name, _ in VALUE_ATTACKS}
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+@pytest.mark.parametrize(
+    "attack",
+    [attack for _, attack in VALUE_ATTACKS],
+    ids=[f"{name}-{i}" for i, (name, _) in enumerate(VALUE_ATTACKS)],
+)
+def test_no_entry_point_yields_plaintext(
+    fake_secret: str, tmp_path: Path, attack: Attack
+) -> None:
+    original = RelaySecrets(vrm_token=Secret(fake_secret))
+    plaintext = "fake-plaintext-for-entry-point-tests"
+    # from_orm is refused by pydantic itself because from_attributes is off.
+    refusals = (SecretTypeError, SecretsImmutableError, pydantic.PydanticUserError)
+    with pytest.raises(refusals) as caught:
+        attack(original, plaintext, tmp_path)
+    assert plaintext not in repr(caught.value) and plaintext not in str(caught.value)
+    assert all(v is None or isinstance(v, Secret) for v in vars(original).values())
+    _assert_unchanged(original, fake_secret)
 
 
 def test_model_construct_refuses_plain_values(fake_secret: str) -> None:

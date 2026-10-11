@@ -96,8 +96,9 @@ class RelaySecrets(BaseModel):
     values. Constructing it with anything other than :class:`Secret` values
     raises :class:`SecretTypeError` before pydantic validation, so no plaintext
     can be captured in a ``ValidationError``. Updates through ``model_copy``,
-    ``copy.replace``, attribute assignment, and pickling are refused with
-    :class:`SecretsImmutableError`, because they would skip that check.
+    the deprecated ``copy``, ``copy.replace``, attribute assignment, and
+    pickling are refused with :class:`SecretsImmutableError`, because they
+    would skip that check.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
@@ -129,6 +130,18 @@ class RelaySecrets(BaseModel):
         if update is not None:
             raise SecretsImmutableError()
         return super().model_copy(deep=deep)
+
+    def copy(
+        self,
+        *,
+        include: Any = None,
+        exclude: Any = None,
+        update: dict[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update is not None:
+            raise SecretsImmutableError()
+        return super().copy(include=include, exclude=exclude, deep=deep)
 
     def __replace__(self, **changes: Any) -> Self:
         raise SecretsImmutableError()
