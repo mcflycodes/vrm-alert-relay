@@ -14,17 +14,21 @@ from pydantic import (
     ConfigDict,
     Field,
     SerializerFunctionWrapHandler,
+    ValidationInfo,
     field_serializer,
+    field_validator,
     model_validator,
 )
 
 from .errors import ConfigError, format_path
 from .fields import (
     BindAddress,
+    CaFilePath,
     FieldValueError,
     HaServiceName,
     HeaderName,
     HttpsUrl,
+    HttpUrl,
     MeasurementCode,
     MessageTemplate,
     Name,
@@ -168,17 +172,50 @@ class VoipmsProvider(_Model):
     did: PhoneNumber | None = None
 
 
+_PLAIN_HTTP_MESSAGE = (
+    "must be an https:// URL (set allow_insecure_http: true for this provider to permit http://)"
+)
+
+
+def _https_unless_allowed(value: str | None, info: ValidationInfo) -> str | None:
+    # allow_insecure_http is declared before the URL, so it is validated first;
+    # when it is missing or invalid, plain http stays refused.
+    if (
+        value is not None
+        and value.startswith("http:")
+        and info.data.get("allow_insecure_http") is not True
+    ):
+        raise FieldValueError(_PLAIN_HTTP_MESSAGE)
+    return value
+
+
 class HomeAssistantProvider(_Model):
     enabled: bool = False
-    base_url: HttpsUrl | None = None
+    allow_insecure_http: bool = False
+    """Permit a plain http:// ``base_url`` for this provider only."""
+    base_url: HttpUrl | None = None
+    """https:// unless ``allow_insecure_http`` is true."""
     token_file: SecretPath | None = None
+    ca_file: CaFilePath | None = None
+    """PEM certificates to verify this provider's TLS certificate against,
+    instead of the bundled trust store. Verification is never disabled."""
+
+    _check_base_url = field_validator("base_url")(_https_unless_allowed)
 
 
 class WebhookProvider(_Model):
     enabled: bool = False
-    url: HttpsUrl | None = None
+    allow_insecure_http: bool = False
+    """Permit a plain http:// ``url`` for this provider only."""
+    url: HttpUrl | None = None
+    """https:// unless ``allow_insecure_http`` is true."""
     auth_header_name: HeaderName | None = None
     auth_header_value_file: SecretPath | None = None
+    ca_file: CaFilePath | None = None
+    """PEM certificates to verify this provider's TLS certificate against,
+    instead of the bundled trust store. Verification is never disabled."""
+
+    _check_url = field_validator("url")(_https_unless_allowed)
 
 
 class LogProvider(_Model):
