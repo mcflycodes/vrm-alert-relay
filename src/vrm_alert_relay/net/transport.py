@@ -18,6 +18,15 @@ every step to the time remaining before the deadline set by
 The hostname, not the resolved address, is still used for the ``Host``
 header, SNI and certificate verification. Only public httpx and httpcore
 APIs are used.
+
+Known limitations: an asynchronous :class:`BaseException` such as
+:class:`KeyboardInterrupt` can arrive in windows no Python code can guard,
+between ``Semaphore.acquire()`` returning and the caller observing it, or
+between the operating system scheduling a new worker thread and
+``Thread.start()`` observing that it started. It can then leave a resolver
+slot consumed or a daemon worker untracked. More generally, after any
+:class:`BaseException` escapes this transport the instance is unusable:
+callers must discard the client and create a new one.
 """
 
 from __future__ import annotations
@@ -277,18 +286,18 @@ class _BoundedResolver:
     def _start_workers(self) -> None:
         """Start missing workers; called with ``self._lock`` held.
 
-        A worker is recorded before it is started, and forgotten again only
-        if it is not running after ``start()`` fails.
+        A worker is recorded before it is started, and forgotten again if it
+        is not running when recording or starting it fails.
         """
         while len(self._workers) < DNS_WORKERS:
             worker = threading.Thread(
                 target=self._work, name="vrm-alert-relay-dns", daemon=True
             )
-            self._workers.append(worker)
             try:
+                self._workers.append(worker)
                 worker.start()
             except BaseException:
-                if not worker.is_alive():
+                if worker in self._workers and not worker.is_alive():
                     self._workers.remove(worker)
                 raise
 
