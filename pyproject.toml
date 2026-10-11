@@ -14,7 +14,10 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
 ]
-dependencies = []
+dependencies = [
+    "httpcore>=1.0,<2",
+    "httpx>=0.28,<0.29",
+]
 
 [project.urls]
 Source = "https://github.com/mcflycodes/vrm-alert-relay"
@@ -30,6 +33,7 @@ dev = [
     "pytest",
     "pytest-cov",
     "ruff",
+    "trustme",
 ]
 
 [build-system]
@@ -85,6 +89,13 @@ select = [
 "tests/**" = [
     "S101",
     "PLR2004",
+    "ANN401",  # test doubles mirror Any-typed library signatures
+    "ARG001",  # stubs and fixtures take the signature they replace
+    "ARG002",  # fake methods take the signature they replace
+    "ARG005",  # stub lambdas take the signature they replace
+    "SLF001",  # tests reach into private state to assert on it
+    "TRY003",  # fakes raise ad-hoc errors with descriptive messages
+    "TRY301",  # tests raise inside try to capture real tracebacks
     "DTZ001",  # naive datetimes are deliberate test inputs (rejection cases, hypothesis bounds)
     "FBT001",  # pytest.mark.parametrize injects bool arguments by name
 ]

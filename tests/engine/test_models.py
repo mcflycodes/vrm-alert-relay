@@ -274,8 +274,8 @@ def test_normal_state_cannot_claim_an_announced_episode() -> None:
 
 def test_unexpected_validation_error_is_converted_to_state_error() -> None:
     class BrokenTimezone(tzinfo):
-        def utcoffset(self, value: datetime | None) -> timedelta | None:  # noqa: ARG002  # tzinfo interface
-            raise ValueError("fictitious broken timezone")  # noqa: TRY003  # deliberate failure for the test
+        def utcoffset(self, value: datetime | None) -> timedelta | None:  # tzinfo interface
+            raise ValueError("fictitious broken timezone")  # deliberate failure for the test
 
     broken_time = datetime(2030, 1, 1, tzinfo=BrokenTimezone())
     with pytest.raises(InvalidRuleStateError, match="fictitious broken timezone"):
