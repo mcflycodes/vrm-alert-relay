@@ -29,14 +29,12 @@ import json as jsonlib
 import logging
 import math
 import re
-import ssl
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from time import monotonic
-from types import TracebackType
-from typing import Any, Final, Self
+from typing import TYPE_CHECKING, Any, Final, Self
 
 import httpx
 
@@ -55,6 +53,10 @@ from vrm_alert_relay.net.errors import (
     RequestTooLargeError,
 )
 from vrm_alert_relay.net.transport import DnsTimeout, HardenedTransport, deadline_scope
+
+if TYPE_CHECKING:
+    import ssl
+    from types import TracebackType
 
 DEFAULT_MAX_REQUEST_BYTES: Final = 64 * 1024
 DEFAULT_MAX_RESPONSE_BYTES: Final = 1024 * 1024
@@ -136,7 +138,7 @@ class Timeouts:
                 or not math.isfinite(value)
                 or value <= 0
             ):
-                raise ValueError(f"timeout {name!r} must be a positive finite number")
+                raise ValueError(f"timeout {name!r} must be a positive finite number")  # noqa: TRY003  # message is specific to this check
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,13 +158,13 @@ class HttpResponse:
                 encoding = codecs.lookup(match.group(1)).name
         return self.content.decode(encoding, errors="replace")
 
-    def json(self) -> Any:
+    def json(self) -> Any:  # noqa: ANN401  # JSON payloads are arbitrary
         """Parse the body as JSON, raising :class:`HttpDecodeError` on failure."""
         try:
             return jsonlib.loads(self.content)
         except (ValueError, RecursionError):
             pass
-        raise HttpDecodeError("response body is not valid JSON")
+        raise HttpDecodeError("response body is not valid JSON")  # noqa: TRY003  # message is specific to this check
 
 
 class SafeHttpClient:
@@ -240,13 +242,13 @@ class SafeHttpClient:
             max_response_bytes=max_response_bytes,
         )
 
-    def post(
+    def post(  # noqa: PLR0913  # keyword-only request options
         self,
         target: Endpoint | str,
         *,
         params: QueryParams | None = None,
         headers: Mapping[str, str] | None = None,
-        json: Any = None,
+        json: Any = None,  # noqa: ANN401  # JSON payloads are arbitrary
         form: Mapping[str, str] | None = None,
         multipart: MultipartFields | None = None,
         max_response_bytes: int | None = None,
@@ -262,14 +264,14 @@ class SafeHttpClient:
             max_response_bytes=max_response_bytes,
         )
 
-    def request(
+    def request(  # noqa: PLR0913  # keyword-only request options
         self,
         method: str,
         target: Endpoint | str,
         *,
         params: QueryParams | None = None,
         headers: Mapping[str, str] | None = None,
-        json: Any = None,
+        json: Any = None,  # noqa: ANN401  # JSON payloads are arbitrary
         form: Mapping[str, str] | None = None,
         multipart: MultipartFields | None = None,
         max_response_bytes: int | None = None,
@@ -297,9 +299,9 @@ class SafeHttpClient:
             response = self._send(request, method, shown, deadline)
             try:
                 status = response.status_code
-                if 300 <= status < 400:
+                if 300 <= status < 400:  # noqa: PLR2004  # HTTP status class boundaries
                     raise HttpRedirectRefused(method, shown, status=status)
-                if not 200 <= status < 300:
+                if not 200 <= status < 300:  # noqa: PLR2004  # HTTP status class boundaries
                     retry_after = _parse_retry_after(response.headers.get("retry-after"))
                     raise HttpStatusError(method, shown, status=status, retry_after=retry_after)
                 content = _read_body(response, method, shown, limit, deadline)
@@ -332,19 +334,19 @@ class SafeHttpClient:
             error = HttpTransportError(method, shown, cause=type(exc).__name__)
         raise error
 
-    def _build_request(
+    def _build_request(  # noqa: PLR0913, PLR0917  # internal helper mirrors request()
         self,
         method: str,
         endpoint: Endpoint,
         params: QueryParams | None,
         headers: Mapping[str, str] | None,
-        json: Any,
+        json: Any,  # noqa: ANN401  # JSON payloads are arbitrary
         form: Mapping[str, str] | None,
         multipart: MultipartFields | None,
     ) -> httpx.Request:
         bodies = sum(body is not None for body in (json, form, multipart))
         if bodies > 1:
-            raise InvalidRequestError("only one of json, form and multipart may be given")
+            raise InvalidRequestError("only one of json, form and multipart may be given")  # noqa: TRY003  # message is specific to this check
         files = _multipart_files(multipart) if multipart is not None else None
         request_headers = _validate_headers(headers)
         _validate_params(params)
@@ -368,7 +370,7 @@ class SafeHttpClient:
             if size > self._max_request_bytes:
                 raise RequestTooLargeError(method, endpoint.display, limit=self._max_request_bytes)
             return request
-        raise InvalidRequestError(
+        raise InvalidRequestError(  # noqa: TRY003  # message is specific to this check
             f"request body or parameters could not be encoded: {method} {endpoint.display}"
         )
 
@@ -403,13 +405,13 @@ def _read_body(
 
 def _validate_method(method: object) -> str:
     if not isinstance(method, str) or method.upper() not in _ALLOWED_METHODS:
-        raise InvalidRequestError("unsupported HTTP method")
+        raise InvalidRequestError("unsupported HTTP method")  # noqa: TRY003  # message is specific to this check
     return method.upper()
 
 
 def _validate_limit(limit: object, name: str = "max_response_bytes") -> int:
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-        raise ValueError(f"{name} must be a positive integer")
+        raise ValueError(f"{name} must be a positive integer")  # noqa: TRY003  # message is specific to this check
     return limit
 
 
@@ -418,11 +420,11 @@ def _validate_params(params: QueryParams | None) -> None:
         return
     pairs = params.items() if isinstance(params, Mapping) else params
     for pair in pairs:
-        if not isinstance(pair, tuple) or len(pair) != 2:
-            raise InvalidRequestError("query parameters must be (name, value) pairs")
+        if not isinstance(pair, tuple) or len(pair) != 2:  # noqa: PLR2004  # (name, value) pair
+            raise InvalidRequestError("query parameters must be (name, value) pairs")  # noqa: TRY003  # message is specific to this check
         name, value = pair
         if not isinstance(name, str) or not isinstance(value, str | int | float | None):
-            raise InvalidRequestError(
+            raise InvalidRequestError(  # noqa: TRY003  # message is specific to this check
                 "query parameter names must be str and values str, int, float, bool or None"
             )
 
@@ -433,9 +435,9 @@ def _validate_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
     validated: dict[str, str] = {}
     for name, value in headers.items():
         if not isinstance(name, str) or not _HEADER_NAME_RE.fullmatch(name):
-            raise InvalidHeaderError("invalid header name")
+            raise InvalidHeaderError("invalid header name")  # noqa: TRY003  # message is specific to this check
         if name.lower() in _RESERVED_HEADERS:
-            raise InvalidHeaderError(f"header {name!r} is managed by the client")
+            raise InvalidHeaderError(f"header {name!r} is managed by the client")  # noqa: TRY003  # message is specific to this check
         _validate_header_value(name, value)
         validated[name] = value
     return validated
@@ -443,33 +445,33 @@ def _validate_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
 
 def _validate_header_value(name: str, value: object) -> None:
     if not isinstance(value, str):
-        raise InvalidHeaderError(f"value of header {name!r} must be a string")
+        raise InvalidHeaderError(f"value of header {name!r} must be a string")  # noqa: TRY003  # message is specific to this check
     if len(value) > MAX_HEADER_VALUE_LENGTH:
-        raise InvalidHeaderError(f"value of header {name!r} is too long")
+        raise InvalidHeaderError(f"value of header {name!r} is too long")  # noqa: TRY003  # message is specific to this check
     if _HEADER_VALUE_FORBIDDEN_RE.search(value):
-        raise InvalidHeaderError(f"value of header {name!r} contains control characters")
+        raise InvalidHeaderError(f"value of header {name!r} contains control characters")  # noqa: TRY003  # message is specific to this check
 
 
 def _multipart_files(
     multipart: MultipartFields,
 ) -> list[tuple[str, tuple[str | None, str | bytes] | tuple[str, bytes, str]]]:
     if not multipart:
-        raise InvalidRequestError("multipart body must have at least one field")
+        raise InvalidRequestError("multipart body must have at least one field")  # noqa: TRY003  # message is specific to this check
     files: list[tuple[str, tuple[str | None, str | bytes] | tuple[str, bytes, str]]] = []
     for name, value in multipart.items():
         if not isinstance(name, str):
-            raise InvalidRequestError("multipart field names must be strings")
+            raise InvalidRequestError("multipart field names must be strings")  # noqa: TRY003  # message is specific to this check
         if isinstance(value, str):
             files.append((name, (None, value)))
             continue
         if (
             not isinstance(value, tuple)
-            or len(value) != 3
+            or len(value) != 3  # noqa: PLR2004  # (filename, bytes, content_type) triple
             or not isinstance(value[0], str)
             or not isinstance(value[1], bytes)
             or not isinstance(value[2], str)
         ):
-            raise InvalidRequestError(
+            raise InvalidRequestError(  # noqa: TRY003  # message is specific to this check
                 f"multipart field {name!r} must be a str or (filename, bytes, content_type)"
             )
         _validate_header_value("Content-Type", value[2])

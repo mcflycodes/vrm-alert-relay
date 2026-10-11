@@ -54,7 +54,7 @@ class HttpRequestError(HttpError):
         self.target = target
 
 
-class HttpTimeout(HttpRequestError):
+class HttpTimeout(HttpRequestError):  # noqa: N818  # named for the condition, like httpx's ConnectTimeout
     """A timeout expired. ``phase`` is ``connect``, ``read``, ``write``, ``pool``,
     ``dns`` (resolution timed out or every resolver worker was busy),
     ``deadline`` (the overall per-request deadline) or ``unknown``.
@@ -65,7 +65,7 @@ class HttpTimeout(HttpRequestError):
         self.phase = phase
 
 
-class HttpTooLarge(HttpRequestError):
+class HttpTooLarge(HttpRequestError):  # noqa: N818  # named for the condition, like httpx's ConnectTimeout
     """The response body exceeded the configured size cap."""
 
     def __init__(self, method: str, target: str, *, limit: int) -> None:
@@ -73,7 +73,7 @@ class HttpTooLarge(HttpRequestError):
         self.limit = limit
 
 
-class HttpContentEncodingRefused(HttpRequestError):
+class HttpContentEncodingRefused(HttpRequestError):  # noqa: N818  # named for the condition, like httpx's ConnectTimeout
     """The response declared a Content-Encoding other than identity.
 
     Compressed bodies are never decoded, so a small response cannot expand
@@ -84,7 +84,7 @@ class HttpContentEncodingRefused(HttpRequestError):
         super().__init__("HTTP response content-encoding refused", method, target)
 
 
-class HttpRedirectRefused(HttpRequestError):
+class HttpRedirectRefused(HttpRequestError):  # noqa: N818  # named for the condition, like httpx's ConnectTimeout
     """The server answered with a 3xx status. Redirects are never followed."""
 
     def __init__(self, method: str, target: str, *, status: int) -> None:

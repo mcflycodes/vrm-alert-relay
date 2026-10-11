@@ -227,7 +227,7 @@ MALICIOUS_SEGMENTS = [
     "a\r\nHost: evil.example",
     "\x00",
     "https://evil.example/",
-    "．．",
+    "．．",  # noqa: RUF001  # confusable full stops are the hostile input
     "\u2025",
     "ünïcødé/✓",
     "..\u2215admin",
@@ -288,7 +288,7 @@ def test_join_rejects_non_str_int_segments(segment: object) -> None:
         ("a" * 64 + ".example", False),
     ],
 )
-def test_host_validation(host: str, valid: bool) -> None:
+def test_host_validation(host: str, valid: bool) -> None:  # noqa: FBT001  # parametrized expectation
     assert endpoint_module._valid_host(host) is valid
 
 

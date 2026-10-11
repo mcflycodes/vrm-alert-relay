@@ -193,13 +193,13 @@ def configure_logging(
     root.setLevel(numeric_level)
     for name in QUIET_LOGGERS:
         logging.getLogger(name).setLevel(max(logging.WARNING, numeric_level))
-    logging.captureWarnings(True)
+    logging.captureWarnings(capture=True)
     return handler
 
 
 def _resolve_level(level: int | str) -> int:
     if isinstance(level, bool):
-        raise TypeError("log level must be an int or a level name")
+        raise TypeError("log level must be an int or a level name")  # noqa: TRY003  # message is specific to this check
     if isinstance(level, int):
         return level
     if isinstance(level, str):
@@ -207,7 +207,7 @@ def _resolve_level(level: int | str) -> int:
         name = level.strip().upper()
         if name in mapping:
             return mapping[name]
-    raise ValueError("invalid log level")
+    raise ValueError("invalid log level")  # noqa: TRY003  # message is specific to this check
 
 
 def _chunks(text: str, size: int) -> list[str]:

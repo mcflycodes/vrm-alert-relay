@@ -6,8 +6,7 @@ import json
 import logging
 import re
 import warnings
-from collections.abc import Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, quote_plus
 
 import pytest
@@ -22,6 +21,9 @@ from vrm_alert_relay.logs import (
 from vrm_alert_relay.logs import redaction as redaction_module
 from vrm_alert_relay.logs.config import WITHHELD_MESSAGE
 from vrm_alert_relay.logs.redaction import TRUNCATED
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 CANARY = "fictitious-api-password-0001"
 CANARY_BEARER = "fictitious-bearer-token-0002"
@@ -42,7 +44,7 @@ def restore_logging() -> Iterator[None]:
     root.setLevel(level)
     for name, quiet_level in quiet.items():
         logging.getLogger(name).setLevel(quiet_level)
-    logging.captureWarnings(False)
+    logging.captureWarnings(capture=False)
 
 
 @pytest.fixture
@@ -562,6 +564,6 @@ def test_invalid_level_names(level: str) -> None:
 
 def test_invalid_level_types() -> None:
     with pytest.raises(TypeError):
-        configure_logging(True)
+        configure_logging(True)  # noqa: FBT003  # a bare bool is the invalid input under test
     with pytest.raises(ValueError, match="invalid log level"):
         configure_logging(1.5)  # type: ignore[arg-type]

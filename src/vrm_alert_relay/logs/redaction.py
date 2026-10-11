@@ -223,11 +223,11 @@ class SecretRegistry:
         again does nothing.
         """
         if not isinstance(value, str):
-            raise TypeError("secret must be a string")
+            raise TypeError("secret must be a string")  # noqa: TRY003  # message is specific to this check
         if len(value) < MIN_SECRET_LENGTH:
             return
         if len(value) > MAX_SECRET_LENGTH:
-            raise SecretTooLongError(f"secret exceeds {MAX_SECRET_LENGTH} characters")
+            raise SecretTooLongError(f"secret exceeds {MAX_SECRET_LENGTH} characters")  # noqa: TRY003  # message is specific to this check
         with self._lock:
             if value in self._matchers:
                 return
@@ -242,7 +242,7 @@ class SecretRegistry:
 
     def _check_capacity(self) -> None:
         if len(self._matchers) >= MAX_SECRETS:
-            raise TooManySecretsError(f"at most {MAX_SECRETS} secrets can be registered")
+            raise TooManySecretsError(f"at most {MAX_SECRETS} secrets can be registered")  # noqa: TRY003  # message is specific to this check
 
     def clear(self) -> None:
         with self._lock:
@@ -391,13 +391,13 @@ def _character_forms(char: str) -> list[str]:
     ]
     if char == " ":
         forms.append(r"\+")
-    if code > 0xFFFF:
+    if code > 0xFFFF:  # noqa: PLR2004  # BMP boundary
         offset = code - 0x10000
         units = [0xD800 + (offset >> 10), 0xDC00 + (offset & 0x3FF)]
     else:
         units = [code]
     forms.append("".join(r"\\[uU]" + _hex_pattern(f"{unit:04X}") for unit in units))
-    if code < 0x100:
+    if code < 0x100:  # noqa: PLR2004  # Latin-1 boundary
         forms.append(r"\\x" + _hex_pattern(f"{code:02X}"))
     if char in _BACKSLASH_ESCAPES:
         forms.append(re.escape(_BACKSLASH_ESCAPES[char]))
@@ -454,9 +454,9 @@ def mask_recipient(value: object) -> str:
     """
     text = (value if isinstance(value, str) else str(value)).strip()
     digits = _NON_DIGIT_RE.sub("", text)
-    if len(digits) >= 7 and _PHONEISH_RE.fullmatch(text):
+    if len(digits) >= 7 and _PHONEISH_RE.fullmatch(text):  # noqa: PLR2004  # minimum phone digit count
         return "***" + digits[-4:]
-    if len(text) <= 4:
+    if len(text) <= 4:  # noqa: PLR2004  # short values are masked whole
         return "***"
     return "***" + escape_controls(text[-4:])
 
@@ -655,7 +655,7 @@ def _after_open_bare_value(text: str, position: int) -> int:
         or (region_start > 0 and _OPEN_TAIL_RE.fullmatch(region))
     ):
         return position
-    rest = cast(re.Match[str], _BARE_REST_RE.match(text, value))
+    rest = cast("re.Match[str]", _BARE_REST_RE.match(text, value))
     return max(rest.end(), position)
 
 
@@ -692,7 +692,7 @@ class _Redactor:
         limit = self._max_length if max_length is None else max_length
         return redact_text(text, registry=self._registry, max_length=limit)
 
-    def value(self, value: object, depth: int) -> JsonValue:
+    def value(self, value: object, depth: int) -> JsonValue:  # noqa: C901, PLR0911  # one branch per check, kept flat for review
         if self._nodes <= 0:
             return TRUNCATED
         self._nodes -= 1
@@ -795,6 +795,6 @@ def _redact_kv_match(match: re.Match[str]) -> str:
 
 def _mask_phone_match(match: re.Match[str]) -> str:
     digits = _NON_DIGIT_RE.sub("", match.group(0))
-    if len(digits) < 8:
+    if len(digits) < 8:  # noqa: PLR2004  # minimum phone digit count
         return match.group(0)
     return "***" + digits[-4:]

@@ -5,7 +5,6 @@ import json
 import logging
 import ssl
 import traceback
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from typing import TYPE_CHECKING, Any
@@ -37,6 +36,8 @@ from vrm_alert_relay.net import client as client_module
 from vrm_alert_relay.net.transport import DnsTimeout, HardenedTransport
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from conftest import StubTransport
 
 BASE = "https://api.example.com/v1"

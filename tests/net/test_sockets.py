@@ -8,6 +8,7 @@ import ssl
 import threading
 import time
 from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING
 
 import pytest
 import trustme
@@ -22,7 +23,9 @@ from vrm_alert_relay.net import (
 )
 from vrm_alert_relay.net import client as client_module
 from vrm_alert_relay.net import transport as transport_module
-from vrm_alert_relay.net.transport import AddressInfo
+
+if TYPE_CHECKING:
+    from vrm_alert_relay.net.transport import AddressInfo
 
 REAL_SOCKETS = True
 DEADLINE = 0.6

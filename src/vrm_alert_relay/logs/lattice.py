@@ -20,8 +20,10 @@ only for secrets detected here.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
-from typing import Final
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 ESCAPE_STARTS: Final = frozenset("%\\+")
 MAX_ESCAPE_LENGTH: Final = 12
@@ -42,7 +44,7 @@ _SHORT_ESCAPES: Final = {
 }
 
 
-def escape_edges(text: str, start: int) -> list[tuple[int, str]]:
+def escape_edges(text: str, start: int) -> list[tuple[int, str]]:  # noqa: PLR0911  # one branch per check, kept flat for review
     """Escapes beginning at ``start``, as ``(end, decoded character)`` pairs."""
     char = text[start]
     if char == "+":
@@ -61,9 +63,9 @@ def escape_edges(text: str, start: int) -> list[tuple[int, str]]:
     if unit is None:
         return []
     edges = [(start + 6, chr(unit))]
-    if 0xD800 <= unit < 0xDC00 and text[start + 6 : start + 7] == "\\":
+    if 0xD800 <= unit < 0xDC00 and text[start + 6 : start + 7] == "\\":  # noqa: PLR2004  # UTF-16 surrogate ranges
         low = _hex(text, start + 8, 4) if text[start + 7 : start + 8] in "uU" else None
-        if low is not None and 0xDC00 <= low < 0xE000:
+        if low is not None and 0xDC00 <= low < 0xE000:  # noqa: PLR2004  # UTF-16 surrogate ranges
             code = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00)
             edges.append((start + 12, chr(code)))
     return edges
@@ -80,7 +82,7 @@ def _percent_edges(text: str, start: int) -> list[tuple[int, str]]:
     lead = _hex(text, start + 1, 2) if text[start : start + 1] == "%" else None
     if lead is None:
         return []
-    size = 1 if lead < 0x80 else 2 if lead < 0xE0 else 3 if lead < 0xF0 else 4
+    size = 1 if lead < 0x80 else 2 if lead < 0xE0 else 3 if lead < 0xF0 else 4  # noqa: PLR2004  # UTF-8 lead byte ranges
     data = bytearray([lead])
     for index in range(1, size):
         position = start + 3 * index

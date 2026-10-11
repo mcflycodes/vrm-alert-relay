@@ -7,10 +7,9 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from time import monotonic
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import httpcore
 import httpx
@@ -28,6 +27,9 @@ from vrm_alert_relay.net.transport import (
     remaining_time,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator, Sequence
+
 # Uses the real transport class over fakes; nothing here leaves the process.
 REAL_SOCKETS = True
 EPSILON = 0.1
@@ -43,7 +45,7 @@ def address(sockaddr: tuple[str, int] = TEST_NET) -> AddressInfo:
 class FakeSocket:
     """Socket-compatible fake whose blocking calls sleep, up to the socket timeout."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913  # one keyword per fake behaviour
         self,
         *,
         connect_delay: float = 0.0,
@@ -133,11 +135,11 @@ class Factory:
         if isinstance(item, OSError):
             raise item
         self.created.append(item)
-        return cast(socket.socket, item)
+        return cast("socket.socket", item)
 
 
 def stream_over(sock: FakeSocket) -> transport_module._SocketStream:
-    return transport_module._SocketStream(cast(socket.socket, sock))
+    return transport_module._SocketStream(cast("socket.socket", sock))
 
 
 @pytest.fixture
@@ -198,7 +200,8 @@ def test_read_is_bounded_and_mapped() -> None:
     sock = FakeSocket()
     with deadline_scope(monotonic() + 1.0):
         assert stream_over(sock).read(10, 5.0) == b"data"
-    assert sock.timeouts[0] is not None and sock.timeouts[0] <= 1.0
+    assert sock.timeouts[0] is not None
+    assert sock.timeouts[0] <= 1.0
     with pytest.raises(httpcore.ReadTimeout):
         stream_over(FakeSocket(recv_error=TimeoutError())).read(10, 5.0)
     with pytest.raises(httpcore.ReadError, match="ConnectionResetError"):
@@ -238,11 +241,12 @@ def test_start_tls_keeps_hostname_and_bounds_handshake() -> None:
     sock = FakeSocket()
     context = FakeTlsContext()
     with deadline_scope(monotonic() + 1.0):
-        tls = stream_over(sock).start_tls(cast(ssl.SSLContext, context), "relay.example.com", 5.0)
+        tls = stream_over(sock).start_tls(cast("ssl.SSLContext", context), "relay.example.com", 5.0)
     assert isinstance(tls, transport_module._SocketStream)
     hostname, timeout = context.calls[0]
     assert hostname == "relay.example.com"
-    assert timeout is not None and timeout <= 1.0
+    assert timeout is not None
+    assert timeout <= 1.0
     assert tls.get_extra_info("ssl_object") is None
 
 
@@ -257,7 +261,7 @@ def test_failed_handshake_closes_socket(error: BaseException, expected: type[Exc
     sock = FakeSocket()
     with pytest.raises(expected):
         stream_over(sock).start_tls(
-            cast(ssl.SSLContext, FakeTlsContext(error)), "relay.example.com", 5.0
+            cast("ssl.SSLContext", FakeTlsContext(error)), "relay.example.com", 5.0
         )
     assert sock.closed
 
@@ -266,7 +270,7 @@ def test_handshake_after_deadline_closes_socket() -> None:
     sock = FakeSocket()
     context = FakeTlsContext()
     with deadline_scope(monotonic() - 1.0), pytest.raises(httpcore.ConnectTimeout):
-        stream_over(sock).start_tls(cast(ssl.SSLContext, context), "relay.example.com", 5.0)
+        stream_over(sock).start_tls(cast("ssl.SSLContext", context), "relay.example.com", 5.0)
     assert sock.closed
     assert context.calls == []
 
@@ -630,7 +634,7 @@ def test_stuck_resolver_workers_do_not_block_interpreter_exit() -> None:
     finally:
         process.kill()
         process.communicate()
-    print(f"process exited {exited:.3f} s after main finished")
+    print(f"process exited {exited:.3f} s after main finished")  # noqa: T201  # timing shown under pytest -s
     assert process.returncode == 0
     assert exited < 1.0
 
@@ -682,7 +686,9 @@ def test_address_loop_moves_past_failures() -> None:
         socket_options=[option],
     )
     assert stream.get_extra_info("socket") is good
-    assert refused.closed and slow.closed and not good.closed
+    assert refused.closed
+    assert slow.closed
+    assert not good.closed
     assert good.connected == ("192.0.2.4", 443)
     assert good.bound == ("198.51.100.7", 0)
     assert option in good.options

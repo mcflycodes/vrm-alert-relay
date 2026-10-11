@@ -49,8 +49,8 @@ class Endpoint:
     @classmethod
     def _from_url(cls, url: httpx.URL, *, secret_path: bool) -> Endpoint:
         endpoint = cls.__new__(cls)
-        endpoint._url = url
-        endpoint._secret_path = secret_path
+        endpoint._url = url  # noqa: SLF001  # alternate constructor filling its own instance
+        endpoint._secret_path = secret_path  # noqa: SLF001  # alternate constructor filling its own instance
         return endpoint
 
     @property
@@ -96,10 +96,10 @@ class Endpoint:
         encoded: list[str] = []
         for segment in segments:
             if isinstance(segment, bool) or not isinstance(segment, str | int):
-                raise InvalidUrlError("path segments must be str or int")
+                raise InvalidUrlError("path segments must be str or int")  # noqa: TRY003  # message is specific to this check
             text = str(segment)
             if text in ("", ".", ".."):
-                raise InvalidUrlError("path segments must not be empty, '.' or '..'")
+                raise InvalidUrlError("path segments must not be empty, '.' or '..'")  # noqa: TRY003  # message is specific to this check
             encoded.append(quote(text, safe=""))
         if not encoded:
             return self
@@ -109,7 +109,7 @@ class Endpoint:
         if (
             joined.raw_host != self._url.raw_host or joined.port != self._url.port
         ):  # pragma: no cover
-            raise InvalidUrlError("path join changed the destination")
+            raise InvalidUrlError("path join changed the destination")  # noqa: TRY003  # message is specific to this check
         return Endpoint._from_url(joined, secret_path=self._secret_path)
 
     def __str__(self) -> str:
@@ -127,47 +127,47 @@ class Endpoint:
         return hash((str(self._url), self._secret_path))
 
 
-def _parse(url: object) -> httpx.URL:
+def _parse(url: object) -> httpx.URL:  # noqa: C901, PLR0912  # one branch per check, kept flat for review
     if not isinstance(url, str):
-        raise InvalidUrlError("URL must be a string")
+        raise InvalidUrlError("URL must be a string")  # noqa: TRY003  # message is specific to this check
     if not url:
-        raise InvalidUrlError("URL must not be empty")
+        raise InvalidUrlError("URL must not be empty")  # noqa: TRY003  # message is specific to this check
     if len(url) > MAX_URL_LENGTH:
-        raise InvalidUrlError(f"URL is longer than {MAX_URL_LENGTH} characters")
+        raise InvalidUrlError(f"URL is longer than {MAX_URL_LENGTH} characters")  # noqa: TRY003  # message is specific to this check
     if _FORBIDDEN_CHAR_RE.search(url):
-        raise InvalidUrlError("URL contains whitespace, control characters or backslashes")
+        raise InvalidUrlError("URL contains whitespace, control characters or backslashes")  # noqa: TRY003  # message is specific to this check
     if "#" in url:
-        raise InvalidUrlError("URL must not contain a fragment")
+        raise InvalidUrlError("URL must not contain a fragment")  # noqa: TRY003  # message is specific to this check
 
     split = _urlsplit(url)
     if split is None:
-        raise InvalidUrlError("URL could not be parsed")
+        raise InvalidUrlError("URL could not be parsed")  # noqa: TRY003  # message is specific to this check
     scheme = split.scheme.lower()
     if scheme != "https":
         shown = repr(scheme) if _SCHEME_RE.fullmatch(scheme) else "an unsupported scheme"
-        raise InvalidUrlError(f"URL scheme must be https, not {shown}")
+        raise InvalidUrlError(f"URL scheme must be https, not {shown}")  # noqa: TRY003  # message is specific to this check
     if "@" in split.netloc:
-        raise InvalidUrlError("URL must not contain userinfo")
+        raise InvalidUrlError("URL must not contain userinfo")  # noqa: TRY003  # message is specific to this check
     try:
         port = split.port
     except ValueError:
         port = 0
-    if port is not None and not 1 <= port <= 65535:
-        raise InvalidUrlError("URL port must be between 1 and 65535")
+    if port is not None and not 1 <= port <= 65535:  # noqa: PLR2004  # maximum TCP port
+        raise InvalidUrlError("URL port must be between 1 and 65535")  # noqa: TRY003  # message is specific to this check
 
     parsed = _httpx_url(url)
     if parsed is None:
-        raise InvalidUrlError("URL could not be parsed")
+        raise InvalidUrlError("URL could not be parsed")  # noqa: TRY003  # message is specific to this check
 
     if parsed.scheme != "https" or parsed.userinfo:  # pragma: no cover - urlsplit checks
-        raise InvalidUrlError("URL scheme must be https, without userinfo")
+        raise InvalidUrlError("URL scheme must be https, without userinfo")  # noqa: TRY003  # message is specific to this check
     host = parsed.raw_host.decode("ascii")
     if not host:
-        raise InvalidUrlError("URL must have a host")
+        raise InvalidUrlError("URL must have a host")  # noqa: TRY003  # message is specific to this check
     if not _valid_host(host):
-        raise InvalidUrlError("URL host is not a valid hostname or IP address")
+        raise InvalidUrlError("URL host is not a valid hostname or IP address")  # noqa: TRY003  # message is specific to this check
     if (parsed.port or 443) != (port or 443):  # pragma: no cover - parsers agree
-        raise InvalidUrlError("URL port could not be parsed")
+        raise InvalidUrlError("URL port could not be parsed")  # noqa: TRY003  # message is specific to this check
     return parsed
 
 
@@ -192,4 +192,4 @@ def _valid_host(host: str) -> bool:
         except ValueError:
             return False
         return "%" not in host
-    return len(host) <= 253 and _HOSTNAME_RE.fullmatch(host) is not None
+    return len(host) <= 253 and _HOSTNAME_RE.fullmatch(host) is not None  # noqa: PLR2004  # maximum hostname length

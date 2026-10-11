@@ -4,8 +4,7 @@ import base64
 import json
 import logging
 import time
-from collections.abc import Callable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, quote_plus
 
 import pytest
@@ -39,6 +38,9 @@ from vrm_alert_relay.logs.redaction import (
     is_sensitive_key,
     truncate,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
 
 CANARY = "fictitious-api-password-0001"
 CANARY_2 = "fictitious-token-value-0002"
@@ -856,7 +858,7 @@ def test_matching_cost_is_bounded_with_full_registry() -> None:
     started = time.perf_counter()
     line = formatter.format(record)
     elapsed = time.perf_counter() - started
-    print(f"near-prefix record with full registry formatted in {elapsed:.3f} s")
+    print(f"near-prefix record with full registry formatted in {elapsed:.3f} s")  # noqa: T201  # timing shown under pytest -s
     assert elapsed < 0.25
     assert json.loads(line)["msg"].endswith(TRUNCATED)
 

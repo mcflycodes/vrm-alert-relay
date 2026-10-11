@@ -110,7 +110,7 @@ def _bounded(timeout: float | None, exc_type: type[httpcore.TimeoutException]) -
     if remaining is None:
         return timeout
     if remaining <= 0:
-        raise exc_type("request deadline exceeded")
+        raise exc_type("request deadline exceeded")  # noqa: TRY003  # message is specific to this check
     return remaining if timeout is None else min(timeout, remaining)
 
 
@@ -122,7 +122,7 @@ def _socket_errors(
     try:
         yield
     except TimeoutError:
-        raise timeout_type("socket operation timed out") from None
+        raise timeout_type("socket operation timed out") from None  # noqa: TRY003  # message is specific to this check
     except OSError as exc:
         raise error_type(type(exc).__name__) from None
 
@@ -169,7 +169,7 @@ class _SocketStream(httpcore.NetworkStream):
             raise
         return _SocketStream(sock)
 
-    def get_extra_info(self, info: str) -> Any:
+    def get_extra_info(self, info: str) -> Any:  # noqa: ANN401  # httpcore NetworkStream interface
         if info == "ssl_object":
             return self._sock if isinstance(self._sock, ssl.SSLSocket) else None
         if info == "client_addr":
@@ -258,11 +258,11 @@ class _BoundedResolver:
             return literal
         job = _Lookup(host, port)
         if not self._slots.acquire(blocking=False):
-            raise _CoreDnsTimeout("all resolver workers are busy")
+            raise _CoreDnsTimeout("all resolver workers are busy")  # noqa: TRY003  # message is specific to this check
         try:
             with self._lock:
                 if self._closed:
-                    raise httpcore.ConnectError("resolver is closed")
+                    raise httpcore.ConnectError("resolver is closed")  # noqa: TRY003, TRY301  # raised under the lock so the except clause frees the slot
                 self._start_workers()
                 self._jobs.put(job)
         except BaseException:
@@ -270,7 +270,7 @@ class _BoundedResolver:
                 self._slots.release()
             raise
         if not job.done.wait(wait):
-            raise _CoreDnsTimeout("name resolution timed out")
+            raise _CoreDnsTimeout("name resolution timed out")  # noqa: TRY003  # message is specific to this check
         if isinstance(job.error, OSError | UnicodeError):
             raise httpcore.ConnectError(type(job.error).__name__) from None
         if job.error is not None:
@@ -418,14 +418,14 @@ class HardenedTransport(httpx.BaseTransport):
                     target=request.url.raw_path,
                 ),
                 headers=request.headers.raw,
-                content=cast(Iterable[bytes], request.stream),
+                content=cast("Iterable[bytes]", request.stream),
                 extensions={**request.extensions, "timeout": timeouts},
             )
             core_response = self._pool.handle_request(core_request)
         return httpx.Response(
             status_code=core_response.status,
             headers=core_response.headers,
-            stream=_ResponseStream(cast(Iterable[bytes], core_response.stream), request),
+            stream=_ResponseStream(cast("Iterable[bytes]", core_response.stream), request),
             extensions=core_response.extensions,
         )
 
