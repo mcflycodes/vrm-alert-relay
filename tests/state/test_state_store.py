@@ -38,7 +38,9 @@ BASE = datetime(2035, 1, 1, tzinfo=UTC)
 RULE = RuleSpec("freezer", Direction.RISING, (LevelSpec("warning", -12.0),))
 
 
-def record(n: int, status: DeliveryStatus = DeliveryStatus.DELIVERED, **changes: Any) -> DeliveryRecord:
+def record(
+    n: int, status: DeliveryStatus = DeliveryStatus.DELIVERED, **changes: Any
+) -> DeliveryRecord:
     fields: dict[str, Any] = {
         "event_id": f"evt_{n:04d}",
         "recipient": "owner_sms",
@@ -165,7 +167,9 @@ def test_everything_round_trips_across_a_reopen(tmp_path: Path) -> None:
 def test_upserts_replace_rows_and_clear_suppression(tmp_path: Path) -> None:
     store = StateStore(tmp_path)
     suppression = Suppression(counts=MappingProxyType({"owner_sms": 3}), since=BASE)
-    assert store.flush(Changes(deliveries=(record(1, DeliveryStatus.PENDING),), suppression=suppression), BASE)
+    assert store.flush(
+        Changes(deliveries=(record(1, DeliveryStatus.PENDING),), suppression=suppression), BASE
+    )
     assert store.flush(Changes(deliveries=(record(1),)), BASE)
     snapshot = store.load()
     assert [r.status for r in snapshot.deliveries] == [DeliveryStatus.DELIVERED]
@@ -256,7 +260,8 @@ def test_pruning_bounds_records_attempts_and_rule_states(
     old = [record(n, updated_at=BASE) for n in range(3)]
     old_pending = [record(n, DeliveryStatus.PENDING, updated_at=BASE) for n in range(3, 5)]
     recent = [
-        record(n, DeliveryStatus.FAILED, updated_at=now - timedelta(minutes=n)) for n in range(5, 12)
+        record(n, DeliveryStatus.FAILED, updated_at=now - timedelta(minutes=n))
+        for n in range(5, 12)
     ]
     attempts = (
         now - timedelta(days=1),

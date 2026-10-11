@@ -65,7 +65,7 @@ def migrate(
     """
     version = schema_version(connection)
     if version > len(migrations):
-        raise SchemaTooNewError(
+        raise SchemaTooNewError(  # noqa: TRY003  # the versions are the useful detail
             f"database schema version {version} is newer than supported {len(migrations)}"
         )
     for index in range(version, len(migrations)):

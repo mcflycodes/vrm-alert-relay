@@ -356,13 +356,14 @@ class StateStore:
 
     @staticmethod
     def _load_suppression(connection: sqlite3.Connection) -> Suppression:
-        counts: dict[str, int] = {}
         rows = connection.execute(
             "SELECT recipient, count FROM suppressed LIMIT ?", (MAX_SUPPRESSED_ROWS,)
         )
-        for recipient, count in rows:
-            if is_identifier(recipient) and _valid_count(count):
-                counts[recipient] = count
+        counts: dict[str, int] = {
+            recipient: count
+            for recipient, count in rows
+            if is_identifier(recipient) and _valid_count(count)
+        }
         meta = dict(connection.execute("SELECT key, value FROM meta").fetchall())
         times: dict[str, datetime | None] = {}
         for key in (_META_SINCE, _META_LAST_SUMMARY):

@@ -51,9 +51,9 @@ def test_valid_record_has_a_key() -> None:
         ("attempts", 101),
         ("attempts", True),
         ("attempts", 1.0),
-        ("created_at", datetime(2035, 1, 1)),  # noqa: DTZ001  # naive on purpose
+        ("created_at", datetime(2035, 1, 1)),  # naive on purpose
         ("updated_at", "2035-01-01T00:00:00+00:00"),
-        ("next_attempt_at", datetime(2035, 1, 1)),  # noqa: DTZ001  # naive on purpose
+        ("next_attempt_at", datetime(2035, 1, 1)),  # naive on purpose
         ("last_attempt_at", 0),
         ("provider_message_id", ""),
         ("provider_message_id", "x" * 129),
