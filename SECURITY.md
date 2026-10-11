@@ -28,17 +28,17 @@ The service is not intended to accept public commands or arbitrary message submi
 
 - Sending is disabled by default. A provider and at least one recipient must be explicitly enabled by operator configuration.
 - Recipients come only from an explicit operator-controlled allowlist. API data, measurement labels, templates, event payloads, and request parameters cannot select or override a recipient.
-- Rate limits apply globally and per provider, recipient, and rule. Retries are bounded, use backoff, and cannot bypass rate limits or duplicate-suppression state.
-- Threshold crossings and delivery attempts have stable event identities. Restarts, delayed API responses, and retry races must not create unbounded duplicate messages.
+- A global rate limit, per-rule cooldowns, and a cap on critical reminders bound message volume. Retries are bounded, use backoff, and count against the global limit; they cannot bypass it or duplicate-suppression state.
+- Threshold crossings and delivery attempts have stable event identities. Restarts, delayed API responses, and retries must not create unbounded duplicate messages.
 - No configuration value, API response, template, measurement, or message content is executed as shell code, program code, or a command.
-- Outbound destinations are constrained to documented, operator-selected HTTPS provider endpoints. Redirects and user-controlled URLs must not enable server-side request forgery.
+- Outbound destinations come only from operator configuration or a provider adapter's documented default endpoint. VRM data, measurement labels, templates, event payloads, and provider responses can never supply or alter a destination. Requests use HTTPS with certificate verification and do not follow redirects.
 - Message content is length-bounded and encoded for the destination transport. Untrusted content cannot add attachments, executable content, arbitrary links, headers, recipients, or provider parameters.
 - Credentials never appear in source control, images, command arguments, health responses, exceptions, metrics, or logs. Sensitive query parameters and headers are always redacted.
 - Public examples, fixtures, tests, documentation, and defaults contain no real installation IDs, device IDs, DIDs, phone numbers, account names, private hostnames, private addresses, or other identifying deployment data.
 - The project collects no telemetry and makes no network requests beyond the operator-configured VRM and notification-provider integrations.
-- The container runs as a non-root user with no Docker socket, host namespace, privileged mode, or unnecessary Linux capabilities. Persistent and secret mounts receive only the access they require.
+- The container runs as a non-root user on a read-only root filesystem with no Docker socket, host namespace, privileged mode, or Linux capabilities. Persistent and secret mounts receive only the access they require.
 - Parsing, queues, history, persistent state, retries, and logs are bounded to prevent resource exhaustion.
-- A failure to fetch, parse, persist state, or deliver a notification fails closed for sending: it cannot generate an arbitrary or unbounded message stream.
+- Failures fail toward alerting. A failure to fetch, parse, persist state, or deliver a notification must not silently suppress alerts: the service reports degraded monitoring and keeps alerting. A rare failure, such as a crash during delivery, may produce a duplicate message, but no failure can generate an arbitrary or unbounded message stream.
 - Logs preserve enough information to diagnose alert behavior without exposing complete recipient identifiers or sensitive deployment details.
 
 ## Reportable Findings and Severity Context
@@ -50,7 +50,8 @@ Unauthorized high-volume or attacker-directed messaging, remote code execution, 
 ## Out of Scope and Accepted Risk
 
 - Availability, accuracy, pricing, policy, or delivery behavior of VRM, telecommunications carriers, and configured notification providers
-- A trusted administrator intentionally configuring an incorrect threshold, recipient, provider, or endpoint
+- A trusted administrator intentionally configuring an incorrect threshold, recipient, provider, or endpoint, including an endpoint on a private network
+- An occasional duplicate message after a crash or ambiguous provider response, within the configured rate limits
 - A provider rejecting legitimate traffic because of account registration, balance, quota, carrier filtering, or regulatory requirements
 - Compromise of the deployment host or provider account that occurs independently of VRM Alert Relay
 - The unavoidable disclosure of message content and recipient metadata to the notification provider selected by the operator
