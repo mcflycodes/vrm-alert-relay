@@ -1,0 +1,22 @@
+name: Install container scanners
+description: Download hadolint and Trivy into $RUNNER_TEMP and verify their SHA-256 checksums.
+
+runs:
+  using: composite
+  steps:
+    - name: Install hadolint and Trivy
+      shell: bash
+      env:
+        HADOLINT_VERSION: "2.15.1"
+        HADOLINT_SHA256: c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507
+        TRIVY_VERSION: "0.75.0"
+        TRIVY_SHA256: c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
+      run: |
+        curl -fsSL --proto '=https' --tlsv1.2 -o "$RUNNER_TEMP/hadolint" \
+          "https://github.com/hadolint/hadolint/releases/download/v${HADOLINT_VERSION}/hadolint-linux-x86_64"
+        echo "${HADOLINT_SHA256}  $RUNNER_TEMP/hadolint" | sha256sum --check --strict
+        chmod +x "$RUNNER_TEMP/hadolint"
+        curl -fsSL --proto '=https' --tlsv1.2 -o "$RUNNER_TEMP/trivy.tar.gz" \
+          "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+        echo "${TRIVY_SHA256}  $RUNNER_TEMP/trivy.tar.gz" | sha256sum --check --strict
+        tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP" trivy
