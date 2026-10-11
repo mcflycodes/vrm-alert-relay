@@ -139,6 +139,13 @@ def test_persisted_active_level_requires_positive_episode() -> None:
         RuleState.from_dict(encoded)
 
 
+def test_persisted_active_level_must_exist_in_nonempty_level_order() -> None:
+    encoded = populated_state().to_dict()
+    encoded["level_order"] = ["warning"]
+    with pytest.raises(InvalidRuleStateError, match="active_level must appear"):
+        RuleState.from_dict(encoded)
+
+
 @pytest.mark.parametrize(
     ("field", "bad_value"),
     [
