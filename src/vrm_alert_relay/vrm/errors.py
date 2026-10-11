@@ -11,6 +11,7 @@ underlying HTTP exception either.
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Self
 
 
 class FailureKind(StrEnum):
@@ -43,10 +44,24 @@ class VrmError(Exception):
     kind: FailureKind
 
     def __init__(self, installation: str, detail: str) -> None:
+        super().__init__()
+        self._bind(installation, detail)
+
+    def _bind(self, installation: str, detail: str) -> None:
         self.installation = installation
         self.detail = detail
         self.message = f"VRM {self.kind.value} for installation {installation!r}: {detail}"
-        super().__init__(self.message)
+        self.args = (self.message,)
+
+    def for_installation(self, installation: str) -> Self:
+        """Return a new error of the same class and fields, attributed to ``installation``.
+
+        The copy has no traceback, ``__cause__`` or ``__context__``.
+        """
+        clone = type(self).__new__(type(self))
+        clone.__dict__.update(self.__dict__)
+        clone._bind(installation, self.detail)  # noqa: SLF001  # same class, private by convention
+        return clone
 
     @property
     def transient(self) -> bool:

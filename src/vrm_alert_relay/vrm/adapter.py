@@ -282,7 +282,12 @@ class VrmAdapter:
         key = str(installation.site_id)
         blocked = rate_limited or self._backoff.blocking_error(key, self._clock())
         if blocked is not None:
-            return _SiteOutcome(error=blocked, deferred=True, retry_at=self._backoff.retry_at(key))
+            return _SiteOutcome(
+                error=blocked,
+                deferred=True,
+                retry_at=self._backoff.retry_at(key),
+                own_error=blocked is self._backoff.state(key).last_error,
+            )
         try:
             reading = self.fetch(installation, measurements)
         except VrmError as exc:
@@ -295,26 +300,35 @@ class VrmAdapter:
                     "vrm_detail": exc.detail,
                 },
             )
-            return _SiteOutcome(error=exc, retry_at=retry_at)
+            return _SiteOutcome(error=exc, retry_at=retry_at, own_error=True)
         self._backoff.record_success(key)
         return _SiteOutcome(reading=reading)
 
 
 @dataclass(frozen=True, slots=True)
 class _SiteOutcome:
-    """The result of at most one request for a site, shared by its targets."""
+    """The result of at most one request for a site, shared by its targets.
+
+    ``own_error`` is true when ``error`` came from this site, rather than from
+    the token-wide rate limit hit by another site; each target then gets its
+    own copy of the error, attributed to its own installation id.
+    """
 
     reading: InstallationReading | None = None
     error: VrmError | None = None
     deferred: bool = False
     retry_at: float | None = None
+    own_error: bool = False
 
     def outcome_for(
         self, installation: Installation, measurements: Sequence[Measurement]
     ) -> InstallationOutcome:
         if self.reading is None:
+            error = self.error
+            if self.own_error and error is not None:
+                error = error.for_installation(installation.id)
             return InstallationOutcome(
-                installation, error=self.error, deferred=self.deferred, retry_at=self.retry_at
+                installation, error=error, deferred=self.deferred, retry_at=self.retry_at
             )
         by_measurement = {r.measurement: r for r in self.reading.results}
         results = tuple(by_measurement[m] for m in measurements)

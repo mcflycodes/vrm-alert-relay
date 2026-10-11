@@ -240,7 +240,8 @@ def test_auth_errors_are_not_retried_as_transient(
     second = adapter.poll([(HOME, (VOLTAGE,))])
     assert len(transport.requests) == 1
     assert second.outcomes[0].deferred
-    assert second.outcomes[0].error is outcome.error
+    assert repr(second.outcomes[0].error) == repr(outcome.error)
+    assert second.outcomes[0].error is not outcome.error
 
     clock.now = outcome.retry_at  # type: ignore[assignment]
     adapter.poll([(HOME, (VOLTAGE,))])
@@ -261,7 +262,7 @@ def test_429_with_retry_after_defers_remaining_installations(
     assert home.error.transient
     assert not home.deferred
     assert cabin.deferred
-    assert cabin.error is home.error
+    assert repr(cabin.error) == repr(home.error)
     assert home.retry_at == cabin.retry_at == clock.now + 120.0
     assert result.next_attempt_at == clock.now + 120.0
     assert result.degraded
@@ -428,7 +429,8 @@ def test_distinct_installations_sharing_a_site_are_fetched_once(
     respond_status(transport, 503)
     failed = adapter.poll([(HOME, (VOLTAGE,)), (alias, (SOC,))])
     assert len(transport.requests) == 2
-    assert failed.outcomes[0].error is failed.outcomes[1].error
+    assert failed.outcomes[0].error is not failed.outcomes[1].error
+    assert [o.error.installation for o in failed.outcomes] == ["home", "home-alias"]  # type: ignore[union-attr]
     assert failed.outcomes[0].retry_at == failed.outcomes[1].retry_at
     assert adapter.backoff.state(str(HOME.site_id)).failures == 1
 
@@ -436,6 +438,91 @@ def test_distinct_installations_sharing_a_site_are_fetched_once(
     assert len(transport.requests) == 2
     assert all(o.deferred for o in deferred.outcomes)
     assert clock.now < failed.outcomes[0].retry_at  # type: ignore[operator]
+
+
+@pytest.mark.parametrize(
+    ("status", "headers", "error_type"),
+    [
+        (503, {}, VrmUnavailableError),
+        (401, {}, VrmAuthError),
+        (404, {}, VrmRejectedError),
+        (429, {"Retry-After": "300"}, VrmRateLimitedError),
+    ],
+)
+def test_aliases_sharing_a_failing_site_get_their_own_errors(
+    make_adapter: MakeAdapter,
+    transport: StubTransport,
+    status: int,
+    headers: dict[str, str],
+    error_type: type[VrmError],
+) -> None:
+    alias = Installation(id="home-alias", site_id=HOME.site_id)
+    transport.respond(
+        lambda r: httpx.Response(
+            status,
+            content=f"body {FAKE_TOKEN}".encode(),
+            headers={"x-echo": r.headers[AUTH_HEADER], **headers},
+        )
+    )
+    adapter = make_adapter()
+    result = adapter.poll([(HOME, (VOLTAGE,)), (alias, (SOC,)), (CABIN, (VOLTAGE,))])
+    assert [site_of(r) for r in transport.requests] == [HOME.site_id] + (
+        [] if status == 429 else [CABIN.site_id]
+    )
+    home, other, _cabin = result.outcomes
+    assert isinstance(home.error, error_type)
+    assert isinstance(other.error, error_type)
+    assert home.error is not other.error
+    assert home.error.installation == "home"
+    assert other.error.installation == "home-alias"
+    for outcome in (home, other):
+        error = outcome.error
+        assert error is not None
+        name = outcome.installation.id
+        assert error.kind is home.error.kind
+        assert error.detail == home.error.detail
+        assert error.transient is home.error.transient
+        assert str(error) == f"VRM {error.kind.value} for installation {name!r}: {error.detail}"
+        assert repr(error) == f"{error_type.__name__}({str(error)!r})"
+        assert error.args == (str(error),)
+        assert getattr(error, "status", None) == status
+        assert getattr(error, "retry_after", None) == getattr(home.error, "retry_after", None)
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        text = "".join(traceback.format_exception(error)) + repr(vars(error))
+        assert FAKE_TOKEN not in text
+        assert "123456" not in text
+    assert home.retry_at == other.retry_at
+    assert home.retry_at is not None
+    assert not home.deferred
+    assert not other.deferred
+
+    deferred = adapter.poll([(alias, (SOC,)), (HOME, (VOLTAGE,))])
+    assert all(o.deferred for o in deferred.outcomes)
+    assert [o.error.installation for o in deferred.outcomes] == ["home-alias", "home"]  # type: ignore[union-attr]
+    assert deferred.outcomes[0].error is not deferred.outcomes[1].error
+
+
+def test_rate_limit_from_another_site_keeps_its_attribution(
+    make_adapter: MakeAdapter, transport: StubTransport
+) -> None:
+    respond_status(transport, 429, **{"Retry-After": "300"})
+    result = make_adapter().poll([(HOME, (VOLTAGE,)), (CABIN, (VOLTAGE,))])
+    home, cabin = result.outcomes
+    assert cabin.deferred
+    assert repr(cabin.error) == repr(home.error)
+    assert cabin.error.installation == "home"  # type: ignore[union-attr]
+
+
+def test_error_copy_is_independent() -> None:
+    original = VrmRateLimitedError("home", retry_after=12.0)
+    copy = original.for_installation("cabin")
+    assert type(copy) is VrmRateLimitedError
+    assert (copy.installation, copy.retry_after, copy.status) == ("cabin", 12.0, 429)
+    assert original.installation == "home"
+    assert str(original) == "VRM rate_limited for installation 'home': HTTP 429 (Retry-After 12s)"
+    assert str(copy) == "VRM rate_limited for installation 'cabin': HTTP 429 (Retry-After 12s)"
+    assert copy.__traceback__ is None
 
 
 def test_failure_in_one_installation_does_not_defer_others(
