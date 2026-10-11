@@ -259,6 +259,14 @@ class RelayConfig(_Model):
         BeforeValidator(_as_tuple),
         Field(max_length=MAX_RULES),
     ] = ()
+    system_recipients: (
+        Annotated[
+            tuple[Name, ...],
+            BeforeValidator(_as_tuple),
+            Field(min_length=1, max_length=MAX_RECIPIENTS),
+        ]
+        | None
+    ) = None
     health: HealthConfig = Field(default_factory=HealthConfig)
 
     @field_serializer("recipients", mode="wrap")
@@ -292,6 +300,16 @@ class RelayConfig(_Model):
     def delivery_modes(self) -> Mapping[str, DeliveryMode]:
         """Delivery mode for every configured recipient."""
         return MappingProxyType({name: self.delivery_mode(name) for name in self.recipients})
+
+    def system_recipient_names(self) -> tuple[str, ...]:
+        """Recipients of system notifications such as rate-limit summaries.
+
+        ``system_recipients`` when set; otherwise every recipient that any rule
+        names, in order of first appearance.
+        """
+        if self.system_recipients is not None:
+            return self.system_recipients
+        return tuple(dict.fromkeys(name for rule in self.rules for name in rule.recipients))
 
     def live_providers(self) -> tuple[ProviderName, ...]:
         return tuple(p for p in PROVIDER_NAMES if self.provider_is_live(p))
@@ -377,12 +395,18 @@ def _level_problems(base: tuple[str | int, ...], rule: Rule) -> list[str]:
 def _rule_recipient_problems(
     base: tuple[str | int, ...], rule: Rule, config: RelayConfig
 ) -> list[str]:
+    return _recipient_list_problems((*base, "recipients"), rule.recipients, config)
+
+
+def _recipient_list_problems(
+    base: tuple[str | int, ...], names: tuple[str, ...], config: RelayConfig
+) -> list[str]:
     problems: list[str] = []
     seen_recipients: dict[str, int] = {}
-    for recipient_index, name in enumerate(rule.recipients):
-        loc = format_path((*base, "recipients", recipient_index))
+    for recipient_index, name in enumerate(names):
+        loc = format_path((*base, recipient_index))
         if name in seen_recipients:
-            first = format_path((*base, "recipients", seen_recipients[name]))
+            first = format_path((*base, seen_recipients[name]))
             problems.append(f"{loc}: duplicate recipient (same as {first})")
         elif name not in config.recipients:
             problems.append(f"{loc}: unknown recipient (not defined under recipients)")
@@ -424,4 +448,8 @@ def _semantic_problems(config: RelayConfig) -> list[str]:
             )
         rule_ids.setdefault(rule.id, index)
         problems.extend(_rule_problems(index, rule, config))
+    if config.system_recipients is not None:
+        problems.extend(
+            _recipient_list_problems(("system_recipients",), config.system_recipients, config)
+        )
     return problems

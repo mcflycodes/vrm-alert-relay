@@ -12,6 +12,7 @@ import pytest
 
 from vrm_alert_relay.config import (
     STRUCTURE_ONLY_NOTE,
+    SYSTEM_RECIPIENTS_DEFAULT_NOTE,
     CheckReport,
     DeliveryMode,
     RelayConfig,
@@ -110,7 +111,9 @@ def test_check_dry_run_passes_with_only_the_vrm_token(
     assert report.ok is True
     assert report.ready is True
     assert report.secrets_checked is True
-    assert report.notes == ()
+    assert report.notes == (SYSTEM_RECIPIENTS_DEFAULT_NOTE,)
+    assert report.system_recipients_defaulted is True
+    assert report.system_recipients == ("owner_sms", "audit", "owner_app", "hook")
     assert report.problems == ()
     assert (report.installations, report.rules, report.recipients) == (2, 3, 4)
     assert report.live_providers == ()
@@ -153,7 +156,7 @@ def test_structure_only_skips_secret_files(config_data: Data, write_config: Writ
     assert report.ok is True
     assert report.ready is False
     assert report.secrets_checked is False
-    assert report.notes == (STRUCTURE_ONLY_NOTE,)
+    assert report.notes == (STRUCTURE_ONLY_NOTE, SYSTEM_RECIPIENTS_DEFAULT_NOTE)
     assert "not been verified as ready to deploy" in STRUCTURE_ONLY_NOTE
     assert report.problems == ()
     assert not any("secret file" in w for w in report.warnings)
@@ -251,6 +254,9 @@ def test_check_fully_live_configuration(
         dry_run_providers=("log",),
         live_recipients=("owner_sms", "owner_app", "hook"),
         dry_run_recipients=("audit",),
+        notes=(SYSTEM_RECIPIENTS_DEFAULT_NOTE,),
+        system_recipients=("owner_sms", "audit", "owner_app", "hook"),
+        system_recipients_defaulted=True,
     )
 
 
@@ -322,6 +328,7 @@ def test_check_report_lists_phone_shaped_names_by_position(
     assert report.ok is True
     assert report.live_recipients == ("[#3]",)
     assert report.dry_run_recipients == ("owner_sms", "owner_app", "audit", "[#4]")
+    assert report.system_recipients == ("owner_sms", "audit", "owner_app", "[#3]", "[#4]")
     text = repr(report)
     assert name not in text
     assert "0142" not in text
@@ -359,5 +366,9 @@ def test_warning_when_no_rules(config_data: Data, parse: Parse) -> None:
     config_data["recipients"] = {}
     config_data["health"] = {"enabled": True, "bind": "::1"}
     assert config_warnings(parse(config_data)) == [
-        "rules: no rules are configured; nothing will be monitored"
+        "rules: no rules are configured; nothing will be monitored",
+        (
+            "system_recipients: no system recipients; rate-limit summaries and "
+            "storage warnings will not be sent"
+        ),
     ]

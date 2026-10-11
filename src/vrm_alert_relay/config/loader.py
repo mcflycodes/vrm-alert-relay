@@ -285,6 +285,7 @@ def config_warnings(config: RelayConfig) -> list[str]:
             "all messages will be logged only"
         )
     used = {name for rule in config.rules for name in rule.recipients}
+    used.update(config.system_recipients or ())
     positions = SourceMap(
         positions={("recipients", name): i for i, name in enumerate(config.recipients)}
     )
@@ -300,6 +301,11 @@ def config_warnings(config: RelayConfig) -> list[str]:
             warnings.append(describe(loc, "not used by any rule", positions))
     if not config.rules:
         warnings.append("rules: no rules are configured; nothing will be monitored")
+    if not config.system_recipient_names():
+        warnings.append(
+            "system_recipients: no system recipients; rate-limit summaries and "
+            "storage warnings will not be sent"
+        )
     if config.health.enabled and not ipaddress.ip_address(config.health.bind).is_loopback:
         warnings.append("health.bind: the health endpoint listens on a non-loopback address")
     return warnings
