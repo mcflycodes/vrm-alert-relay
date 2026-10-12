@@ -421,12 +421,29 @@ jobs:
       - name: Tag the version
         run: |
           oras="$RUNNER_TEMP/oras"
-          # A version tag is never moved to a different image.
-          if existing="$("$oras" resolve "${REPOSITORY}:${IMAGE_TAG}" 2> /dev/null)" && [[ "$existing" != "$DIGEST" ]]; then
-            echo "::error::${REPOSITORY}:${IMAGE_TAG} already points to ${existing}"
-            exit 1
+          # A version tag is never moved to a different image. Only an explicit
+          # answer counts as "no such tag": a tag list without it, or the
+          # registry's NAME_UNKNOWN for a repository with no tags at all. Any
+          # other error fails the job.
+          errors="$RUNNER_TEMP/tags.err"
+          if ! tags="$("$oras" repo tags "$REPOSITORY" 2> "$errors")"; then
+            cat "$errors" >&2
+            if ! grep -qi 'name unknown' "$errors"; then
+              echo "::error::could not list the tags of ${REPOSITORY}"
+              exit 1
+            fi
+            tags=""
           fi
-          "$oras" tag "${REPOSITORY}@${DIGEST}" "$IMAGE_TAG"
+          if grep -qxF -- "$IMAGE_TAG" <<< "$tags"; then
+            existing="$("$oras" resolve "${REPOSITORY}:${IMAGE_TAG}")"
+            if [[ "$existing" != "$DIGEST" ]]; then
+              echo "::error::${REPOSITORY}:${IMAGE_TAG} already points to ${existing}"
+              exit 1
+            fi
+            echo "${REPOSITORY}:${IMAGE_TAG} already points to ${DIGEST}"
+          else
+            "$oras" tag "${REPOSITORY}@${DIGEST}" "$IMAGE_TAG"
+          fi
           resolved="$("$oras" resolve "${REPOSITORY}:${IMAGE_TAG}")"
           [[ "$resolved" == "$DIGEST" ]] || { echo "::error::${REPOSITORY}:${IMAGE_TAG} is ${resolved}"; exit 1; }
           echo "${REPOSITORY}:${IMAGE_TAG} is ${DIGEST}"
@@ -453,14 +470,16 @@ jobs:
           path: sbom
       # "latest" only ever moves forward: an older line's patch release, made
       # after a newer stable release, is published without becoming latest.
+      # This release's own tag is left out, so a re-run decides the same way.
       - name: Decide whether this release becomes latest
         id: latest
         run: |
           promote=false
           if [[ "$PRERELEASE" == false ]]; then
-            highest="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
-                --limit 1000 --json tagName --jq '.[].tagName' |
+            highest="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+                --jq '.[] | select(.draft | not) | select(.prerelease | not) | .tag_name' |
               { grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || true; } |
+              { grep -vxF -- "$TAG" || true; } |
               sed 's/^v//' | sort -V | tail -n 1)"
             echo "Highest released stable version: ${highest:-none}"
             if [[ -z "$highest" ]] ||
@@ -504,16 +523,39 @@ jobs:
             echo
           } > "$RUNNER_TEMP/notes.md"
           cat "$RUNNER_TEMP/notes.md"
-      - name: Create the GitHub Release
+      # Idempotent: a re-run finishes a release that an earlier attempt left
+      # as a draft or published without every asset, instead of failing.
+      - name: Create or complete the GitHub Release
         env:
           PROMOTE: ${{ steps.latest.outputs.promote }}
         run: |
-          flags=(--latest=false)
-          [[ "$PRERELEASE" == true ]] && flags+=(--prerelease)
-          [[ "$PROMOTE" == true ]] && flags=(--latest)
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes "${flags[@]}" \
-            sbom/sbom-linux-amd64.cdx.json sbom/sbom-linux-arm64.cdx.json
+          prerelease=(--prerelease=false)
+          [[ "$PRERELEASE" == true ]] && prerelease=(--prerelease)
+          latest=(--latest=false)
+          [[ "$PROMOTE" == true ]] && latest=(--latest)
+          assets=(sbom/sbom-linux-amd64.cdx.json sbom/sbom-linux-arm64.cdx.json)
+          existing="$RUNNER_TEMP/release.json"
+          errors="$RUNNER_TEMP/release.err"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,author \
+              > "$existing" 2> "$errors"; then
+            echo "A release for ${TAG} exists: $(jq -c '{tagName, isDraft, author: .author.login}' "$existing")"
+            if [[ "$(jq -r .tagName "$existing")" != "$TAG" || "$(jq -r .author.login "$existing")" != "github-actions[bot]" ]]; then
+              echo "::error::the existing release for ${TAG} was not created by this workflow; resolve it by hand"
+              exit 1
+            fi
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false "${prerelease[@]}" "${latest[@]}"
+          elif grep -qxF 'release not found' "$errors"; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes \
+              "${prerelease[@]}" "${latest[@]}" "${assets[@]}"
+          else
+            cat "$errors" >&2
+            echo "::error::could not look up the release for ${TAG}"
+            exit 1
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,assets \
+            --jq '"Release: draft \(.isDraft), pre-release \(.isPrerelease), assets \([.assets[].name] | join(", "))"'
 
   latest:
     needs: [build, release]

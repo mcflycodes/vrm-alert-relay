@@ -41,25 +41,28 @@ Jobs run in this order, each only if the previous ones succeeded:
 2. **build:** builds `linux/amd64` and `linux/arm64` (arm64 through QEMU) once, into an OCI layout. Everything after works on that layout: the build-log checks from CI, smoke tests of each platform (user, command, working directory, `--version`, the runtime contract, the state directory, TLS verification), the same Trivy gate as CI (HIGH and CRITICAL findings with a fix available block the release; unfixed ones are listed in the job summary), and a CycloneDX SBOM per platform. Nothing is pushed.
 3. **publish:** pushes the layout's objects to `ghcr.io/mcflycodes/vrm-alert-relay` by digest, without a tag, and checks that the pushed image index and both platform manifests are byte-for-byte the built ones.
 4. **sign:** signs the index and both platform images with cosign keyless signing through GitHub Actions OIDC, attests each platform's SBOM, and verifies the signatures and attestations against this workflow's identity.
-5. **tag:** applies the version tag (`0.1.0-rc.1`) to the signed digest. It never moves an existing version tag to a different digest.
-6. **release:** creates the GitHub Release, a pre-release for `-alpha`, `-beta` and `-rc` tags, with the image digest, a verification command, generated notes and the SBOMs attached. A stable release is marked latest only if its version is higher than every stable version already released.
+5. **tag:** applies the version tag (`0.1.0-rc.1`) to the signed digest. If the tag already points to that digest, it does nothing; if it points elsewhere, or the tags cannot be listed, the job fails.
+6. **release:** creates the GitHub Release, a pre-release for `-alpha`, `-beta` and `-rc` tags, with the image digest, a verification command, generated notes and the SBOMs attached. A stable release is marked latest only if its version is higher than every other stable version released (all pages of the release list are read). If a release for the tag already exists from an earlier attempt and was created by this workflow, the job uploads the assets again and publishes it instead of failing.
 7. **latest:** only for a stable release marked latest in step 6: points `latest` at the digest.
 
 Releases run one at a time across the repository, so two cannot race on `latest`. The workflow uses only its `GITHUB_TOKEN`, and each job has only the permissions it needs.
 
 ## If a release fails
 
-The job that failed decides what is left behind. Fix the cause first. "Retry" means deleting the tag (`git push origin :refs/tags/v0.1.0-rc.1`, then `git tag -d v0.1.0-rc.1`), tagging again and pushing; re-running only the failed jobs from the Actions tab also works, unless the fix needed a code change.
+The job that failed decides what is left behind. Fix the cause first, then either:
+
+- **Re-run the failed jobs** from the Actions tab. This reuses the run's own build: the same digest, image artifact and SBOMs. The tag and release jobs are safe to re-run: the tag job accepts a version tag that already points to this digest, and the release job completes a release that an earlier attempt left as a draft or without its assets.
+- **Push a fresh tag:** delete the tag (`git push origin :refs/tags/v0.1.0-rc.1`, then `git tag -d v0.1.0-rc.1`), tag again and push. This rebuilds, so the image gets a new digest. It is needed when the fix changed code, and it is possible only while the version tag does not yet exist in GHCR.
 
 | Failed job | Left behind | What to do |
 |---|---|---|
-| prepare, build | Nothing published. | Retry. |
-| publish | Possibly some blobs or manifests in GHCR, untagged and unsigned. | Retry. Untagged objects are harmless; nothing refers to them. |
-| sign | An untagged image in GHCR, possibly with some of its signatures or attestations. | Retry. The rebuild gets a new digest, so the old one stays untagged and unused. |
-| tag | A signed, attested image, untagged or under the version tag. | Re-run the failed jobs. If the version tag was applied, it points to a signed image, which is safe to use. |
-| release | A signed image under the version tag, no GitHub Release. | Re-run the failed jobs. Do not retry from a new tag: the version tag in GHCR already points at this digest, and the tag job refuses to move it. |
+| prepare, build | Nothing published. | Either. |
+| publish | Possibly some blobs or manifests in GHCR, untagged and unsigned. | Either. Untagged objects are harmless; nothing refers to them. |
+| sign | An untagged image in GHCR, possibly with some of its signatures or attestations. | Re-run the failed jobs to sign the same digest. A fresh tag rebuilds instead, and the old digest stays untagged and unused. |
+| tag | A signed, attested image, untagged or under the version tag. The job also fails, without tagging, if it cannot list the tags or the version tag points to another digest. | Re-run the failed jobs. If the version tag points to another digest, release a new version instead. |
+| release | A signed image under the version tag, and possibly a draft or published release that is missing assets. | Re-run the failed jobs. Do not push a fresh tag: the version tag in GHCR already points to this digest, and the tag job refuses to move it. A release for the tag that this workflow did not create stops the job; remove or fix it by hand. |
 | latest | Everything except the `latest` move. The GitHub Release may already be marked latest. | Re-run the failed job. |
 
-Re-running a job reuses the run's own build: the digest and artifacts do not change. The image artifact is kept for 7 days, so re-run within that time. Release a new version rather than reuse a version tag in GHCR that already points to an image someone may have pulled.
+The image artifact is kept for 7 days, so re-run failed jobs within that time. Release a new version rather than reuse a version tag in GHCR that already points to an image someone may have pulled.
 
 To remove leftover untagged images, open the package's settings on GitHub (Your profile, Packages, `vrm-alert-relay`, Package settings) and delete the version with that digest. Its signatures and attestations are separate entries in the same package that refer to that digest (tagged `sha256-<digest>`, or untagged); delete those too. Never delete a digest that a version tag points to.
