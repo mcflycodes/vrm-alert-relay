@@ -9,6 +9,7 @@ from vrm_alert_relay.net.client import (
     QueryParams,
     SafeHttpClient,
     Timeouts,
+    load_ca_file,
 )
 from vrm_alert_relay.net.endpoint import Endpoint
 from vrm_alert_relay.net.errors import (
@@ -21,6 +22,7 @@ from vrm_alert_relay.net.errors import (
     HttpTimeout,
     HttpTooLarge,
     HttpTransportError,
+    InvalidCaFileError,
     InvalidHeaderError,
     InvalidRequestError,
     InvalidUrlError,
@@ -41,6 +43,7 @@ __all__ = [
     "HttpTimeout",
     "HttpTooLarge",
     "HttpTransportError",
+    "InvalidCaFileError",
     "InvalidHeaderError",
     "InvalidRequestError",
     "InvalidUrlError",
@@ -50,4 +53,5 @@ __all__ = [
     "RequestTooLargeError",
     "SafeHttpClient",
     "Timeouts",
+    "load_ca_file",
 ]

@@ -29,6 +29,10 @@ class InvalidUrlError(HttpError, ValueError):
     """A URL or endpoint failed validation. Raised before any network I/O."""
 
 
+class InvalidCaFileError(HttpError, ValueError):
+    """A CA file for certificate verification could not be loaded."""
+
+
 class InvalidHeaderError(HttpError, ValueError):
     """A header name or value failed validation. Raised before any network I/O."""
 

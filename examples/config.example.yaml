@@ -36,8 +36,9 @@ sending:
 # Victron VRM API access.
 vrm:
   # VRM API v2 base URL. The default is shown; override only if needed.
-  # Every URL in this file must use https:// and must not contain credentials
-  # or a "#fragment".
+  # Every URL in this file must use https:// (Home Assistant and the webhook
+  # can opt in to http://, see below) and must not contain credentials or a
+  # "#fragment".
   base_url: https://vrmapi.victronenergy.com/v2
   # File holding a VRM personal access token. Use a dedicated VRM user that is
   # invited only to the installations below, with the lowest role that works.
@@ -95,13 +96,24 @@ providers:
     base_url: https://homeassistant.example.invalid:8123
     # Long-lived access token of a dedicated, non-admin Home Assistant user.
     token_file: /run/secrets/homeassistant_token
+    # Optional: a PEM file with the CA (or self-signed) certificate of your
+    # Home Assistant, used instead of the bundled trust store. Certificates
+    # are always verified.
+    # ca_file: /run/secrets/homeassistant_ca.pem
+    # Optional and insecure: permit a plain http:// base_url for this provider.
+    # The token and messages then cross the network unencrypted.
+    # allow_insecure_http: false
   webhook:
     enabled: false
-    # Receives a fixed JSON payload by HTTPS POST.
+    # Receives a fixed JSON payload by HTTPS POST (see docs/notifications.md).
     url: https://hooks.example.com/vrm-alert-relay
     # Optional header-based authentication. Set both settings or neither.
     auth_header_name: X-Relay-Token
     auth_header_value_file: /run/secrets/webhook_token
+    # Optional, as for Home Assistant: a private CA file, or (insecure) plain
+    # http:// for this provider only.
+    # ca_file: /run/secrets/webhook_ca.pem
+    # allow_insecure_http: false
   # The log provider needs no settings and is always available.
   log: {}
 
@@ -123,8 +135,9 @@ rules:
     direction: rising
     # Up to 20 levels. One notification is sent per escalation into a level;
     # jumping several levels in one poll sends one notification for the highest.
-    # "message" is an optional single-line template of at most 320 characters;
-    # see the message template documentation for the placeholders it supports.
+    # "message" is an optional single-line template of at most 320 characters.
+    # Placeholders: {rule} {level} {value} {unit} {installation} {measurement}
+    # {label} {time} {kind} {count}; see docs/notifications.md.
     levels:
       - name: warning
         threshold: -12.0

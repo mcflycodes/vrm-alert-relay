@@ -11,6 +11,12 @@ from urllib.parse import urlsplit
 from pydantic import AfterValidator
 from pydantic_core import CoreSchema, core_schema
 
+from vrm_alert_relay.templates.syntax import (
+    MAX_TEMPLATE_CHARS,
+    TemplateSyntaxError,
+    parse_template,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Callable
     from urllib.parse import SplitResult
@@ -20,9 +26,11 @@ if TYPE_CHECKING:
 __all__ = [
     "MAX_TEMPLATE_CHARS",
     "BindAddress",
+    "CaFilePath",
     "FieldValueError",
     "HaServiceName",
     "HeaderName",
+    "HttpUrl",
     "HttpsUrl",
     "MeasurementCode",
     "MessageTemplate",
@@ -32,7 +40,6 @@ __all__ = [
     "ServiceType",
 ]
 
-MAX_TEMPLATE_CHARS = 320
 MAX_URL_CHARS = 2048
 MAX_PATH_CHARS = 4096
 
@@ -130,6 +137,11 @@ def _check_template(value: str) -> str:
         raise FieldValueError(f"must be at most {MAX_TEMPLATE_CHARS} characters")  # noqa: TRY003 -- fixed operator-facing text
     if CONTROL_CHARS.search(value):
         raise FieldValueError("must not contain line breaks or control characters")  # noqa: TRY003 -- fixed operator-facing text
+    try:
+        parse_template(value)
+    except TemplateSyntaxError as exc:
+        # The reason is fixed text naming the allowed placeholders, never the value.
+        raise FieldValueError(exc.reason) from None
     return value
 
 
@@ -152,6 +164,21 @@ def _check_secret_path(value: str) -> str:
 SecretPath = Annotated[str, AfterValidator(_check_secret_path)]
 
 
+def _check_ca_file(value: str) -> str:
+    if not value:
+        raise FieldValueError("must not be empty")  # noqa: TRY003 -- fixed operator-facing text
+    if len(value) > MAX_PATH_CHARS:
+        raise FieldValueError(f"must be at most {MAX_PATH_CHARS} characters")  # noqa: TRY003 -- fixed operator-facing text
+    if CONTROL_CHARS.search(value):
+        raise FieldValueError("must not contain line breaks or control characters")  # noqa: TRY003 -- fixed operator-facing text
+    if not PurePath(value).is_absolute():
+        raise FieldValueError("must be an absolute path to a PEM CA certificate file")  # noqa: TRY003 -- fixed operator-facing text
+    return value
+
+
+CaFilePath = Annotated[str, AfterValidator(_check_ca_file)]
+
+
 def _check_host(host: str) -> None:
     if host.startswith("["):
         try:
@@ -164,6 +191,14 @@ def _check_host(host: str) -> None:
 
 
 def _check_https_url(value: str) -> str:
+    return _check_url(value, ("https",))
+
+
+def _check_http_url(value: str) -> str:
+    return _check_url(value, ("https", "http"))
+
+
+def _check_url(value: str, schemes: tuple[str, ...]) -> str:
     # The value is not echoed in errors because query strings may carry tokens.
     if len(value) > MAX_URL_CHARS:
         raise FieldValueError(f"must be at most {MAX_URL_CHARS} characters")  # noqa: TRY003 -- fixed operator-facing text
@@ -173,8 +208,12 @@ def _check_https_url(value: str) -> str:
         parts = urlsplit(value)
     except ValueError:
         raise FieldValueError("is not a valid URL") from None  # noqa: TRY003 -- fixed operator-facing text
-    if parts.scheme != "https":
-        raise FieldValueError("must be an https:// URL")  # noqa: TRY003 -- fixed operator-facing text
+    if parts.scheme not in schemes:
+        raise FieldValueError(
+            "must be an https:// URL"
+            if schemes == ("https",)
+            else "must be an https:// URL (or http:// with allow_insecure_http: true)"
+        )
     if "#" in value:
         raise FieldValueError("must not contain a fragment ('#')")  # noqa: TRY003 -- fixed operator-facing text
     authority = parts.netloc
@@ -206,6 +245,10 @@ def _check_port(parts: SplitResult) -> None:
 
 
 HttpsUrl = Annotated[str, AfterValidator(_check_https_url)]
+
+HttpUrl = Annotated[str, AfterValidator(_check_http_url)]
+"""An https:// or http:// URL. Models that use it must require https:// unless
+the operator explicitly opts in to plain http for that one setting."""
 
 
 def _check_bind(value: str) -> str:

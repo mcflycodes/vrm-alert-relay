@@ -308,6 +308,27 @@ def config_warnings(config: RelayConfig) -> list[str]:
         )
     if config.health.enabled and not ipaddress.ip_address(config.health.bind).is_loopback:
         warnings.append("health.bind: the health endpoint listens on a non-loopback address")
+    warnings.extend(_transport_warnings(config))
+    return warnings
+
+
+def _transport_warnings(config: RelayConfig) -> list[str]:
+    warnings: list[str] = []
+    sections = (
+        ("homeassistant", config.providers.homeassistant, config.providers.homeassistant.base_url),
+        ("webhook", config.providers.webhook, config.providers.webhook.url),
+    )
+    for name, section, url in sections:
+        if section.allow_insecure_http:
+            warnings.append(
+                f"providers.{name}.allow_insecure_http: INSECURE: plain http:// is permitted "
+                "for this provider; its credentials and messages can be read or altered "
+                "by anyone on the network path"
+            )
+        if section.ca_file is not None and url is not None and url.startswith("http:"):
+            warnings.append(
+                f"providers.{name}.ca_file: has no effect because the URL uses plain http://"
+            )
     return warnings
 
 

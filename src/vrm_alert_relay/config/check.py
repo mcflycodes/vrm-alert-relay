@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from vrm_alert_relay.net import InvalidCaFileError, load_ca_file
+
 from ._paths import display_name
 from .errors import ConfigError
 from .loader import _collect_secrets, config_warnings, load_config
@@ -12,6 +14,8 @@ from .models import DeliveryMode, ProviderName
 
 if TYPE_CHECKING:
     import os
+
+    from .models import RelayConfig
 
 __all__ = [
     "STRUCTURE_ONLY_NOTE",
@@ -77,6 +81,7 @@ def check_config(path: str | os.PathLike[str], *, structure_only: bool = False) 
     secret_warnings: list[str] = []
     if not structure_only:
         _, problems, secret_warnings = _collect_secrets(config, preflight=True)
+        _check_ca_files(config, problems, secret_warnings)
     shown = {name: display_name(name, position) for position, name in enumerate(config.recipients)}
     modes = config.delivery_modes()
     defaulted = config.system_recipients is None
@@ -100,3 +105,22 @@ def check_config(path: str | os.PathLike[str], *, structure_only: bool = False) 
         system_recipients=tuple(shown[n] for n in config.system_recipient_names()),
         system_recipients_defaulted=defaulted,
     )
+
+
+def _check_ca_files(config: RelayConfig, problems: list[str], warnings: list[str]) -> None:
+    """Load each enabled provider's ``ca_file`` the way the provider will."""
+    sections: tuple[tuple[ProviderName, str | None], ...] = (
+        ("homeassistant", config.providers.homeassistant.ca_file),
+        ("webhook", config.providers.webhook.ca_file),
+    )
+    for provider, ca_file in sections:
+        if ca_file is None or not config.providers.is_enabled(provider):
+            continue
+        try:
+            load_ca_file(ca_file)
+        except InvalidCaFileError as exc:
+            message = f"providers.{provider}.ca_file: {exc}"
+            if config.provider_is_live(provider):
+                problems.append(message)
+            else:
+                warnings.append(f"{message} (required before sending is enabled)")
