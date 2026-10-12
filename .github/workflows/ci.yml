@@ -120,6 +120,27 @@ jobs:
       - uses: ./.github/actions/install-scanners
       - name: Lint Dockerfile
         run: '"$RUNNER_TEMP/hadolint" Dockerfile'
+      - name: Validate Compose example
+        run: |
+          docker compose version
+          docker compose -f compose.example.yaml config --quiet
+          docker compose -f compose.example.yaml config --format json | python3 -c '
+          import json, sys
+          relay = json.load(sys.stdin)["services"]["relay"]
+          assert relay["user"] == "65532:65532", relay.get("user")
+          assert relay["read_only"] is True
+          assert relay["cap_drop"] == ["ALL"], relay.get("cap_drop")
+          assert relay["security_opt"] == ["no-new-privileges:true"], relay.get("security_opt")
+          assert not relay.get("privileged"), "privileged"
+          for key in ("network_mode", "pid", "ports", "devices", "cap_add", "env_file"):
+              assert key not in relay, key
+          assert relay.get("ipc") == "private", relay.get("ipc")
+          for mount in relay["volumes"]:
+              assert "docker.sock" not in str(mount.get("source")), mount
+              assert mount["type"] == "volume" or mount.get("read_only") is True, mount
+          assert all(not name.upper().endswith(("TOKEN", "PASSWORD")) for name in relay["environment"])
+          print("Compose example keeps the hardened settings")
+          '
       - name: Build image
         run: docker build --pull --tag "$IMAGE" .
       - name: Smoke test hardened runtime
