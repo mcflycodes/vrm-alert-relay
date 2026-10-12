@@ -215,3 +215,96 @@ def test_a_failing_conversion_still_sends_the_default_text(
     assert harness.voipms.sent() == [
         (OWNER_PHONE, "warning: freezer at cabin: Fictitious tsT is -10 (2035-01-01 00:00 UTC)"),
     ]
+
+
+def fallbacks(caplog: pytest.LogCaptureFixture) -> int:
+    return sum(r.__dict__.get("event") == "relay.display_unit_fallback" for r in caplog.records)
+
+
+@pytest.mark.parametrize("later_format", [None, "°C", "%.1F", 42, "value %.1F °C"])
+def test_a_later_reading_without_a_celsius_unit_is_not_converted(
+    harness: Harness, caplog: pytest.LogCaptureFixture, later_format: object
+) -> None:
+    harness.write_config(rules=[freezer_rule(display_unit="degF")])
+    key = (CABIN_SITE, "tsT", 20)
+    harness.vrm.formats[key] = "%.1F °C"
+    with harness.service() as service, caplog.at_level(logging.WARNING):
+        harness.vrm.set("tsT", 20, -10)
+        harness.cycle(service)
+        assert fallbacks(caplog) == 0
+        if later_format is None:
+            del harness.vrm.formats[key]
+        else:
+            harness.vrm.formats[key] = later_format
+        harness.vrm.set("tsT", 20, -6)
+        harness.cycle(service)
+
+    assert harness.voipms.texts() == [
+        "warning: freezer at cabin: Fictitious tsT is 14°F (2035-01-01 00:00 UTC)",
+        "alert: freezer at cabin: Fictitious tsT is -6 (2035-01-01 00:01 UTC)",
+    ]
+    assert fallbacks(caplog) == 1
+
+
+def single_level_rule() -> dict[str, Any]:
+    return freezer_rule(
+        display_unit="degF",
+        levels=[{"name": "critical", "threshold": -4}],
+        reminder_interval_minutes=1,
+        stale_after_minutes=1440,
+    )
+
+
+def test_a_reminder_without_a_fresh_reading_keeps_that_readings_unit(
+    harness: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness.write_config(rules=[single_level_rule()])
+    harness.vrm.formats[CABIN_SITE, "tsT", 20] = "%.1F °C"
+    with harness.service() as service, caplog.at_level(logging.WARNING):
+        harness.vrm.set("tsT", 20, -2)
+        harness.cycle(service)
+        harness.vrm.fail(503)
+        harness.cycle(service, 3)
+
+    reminders = [t for t in harness.voipms.texts() if t.startswith("Reminder")]
+    assert harness.voipms.texts()[0].startswith(
+        "critical: freezer at cabin: Fictitious tsT is 28.4°F"
+    )
+    assert reminders
+    assert all("is 28.4°F (2035-01-01 00:00 UTC)" in text for text in reminders)
+    assert fallbacks(caplog) == 0
+
+
+def test_a_reminder_from_saved_state_shows_the_value_as_reported(
+    harness: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness.write_config(rules=[single_level_rule()])
+    harness.vrm.formats[CABIN_SITE, "tsT", 20] = "%.1F °C"
+    with harness.service() as service:
+        harness.vrm.set("tsT", 20, -2)
+        harness.cycle(service)
+    harness.vrm.fail(503)
+    with harness.service() as service, caplog.at_level(logging.WARNING):
+        harness.cycle(service, 3)
+
+    reminders = [t for t in harness.voipms.texts() if t.startswith("Reminder")]
+    assert reminders
+    assert all("is -2 (2035-01-01 00:00 UTC)" in text for text in reminders)
+    assert fallbacks(caplog) == len(reminders)
+
+
+def test_a_reminder_after_a_reading_without_a_sample_shows_the_value_as_reported(
+    harness: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness.write_config(rules=[single_level_rule()])
+    harness.vrm.formats[CABIN_SITE, "tsT", 20] = "%.1F °C"
+    with harness.service() as service, caplog.at_level(logging.WARNING):
+        harness.vrm.set("tsT", 20, -2)
+        harness.cycle(service)
+        harness.vrm.set("tsT", 20, "warm")
+        harness.cycle(service, 3)
+
+    reminders = [t for t in harness.voipms.texts() if t.startswith("Reminder")]
+    assert reminders
+    assert all("is -2 (2035-01-01 00:00 UTC)" in text for text in reminders)
+    assert fallbacks(caplog) == len(reminders)

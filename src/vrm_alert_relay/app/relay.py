@@ -107,7 +107,8 @@ class Relay:
         self._targets = poll_targets(config)
         self._monitoring = MonitoringTracker(inst.id for inst in config.vrm.installations)
         self._labels: dict[str, str] = {}
-        self._units: dict[str, str] = {}
+        self._units: dict[str, tuple[datetime | None, str | None]] = {}
+        """Per rule: the newest reading's sample time and the unit reported with it."""
         self._status = RelayStatus(
             started_at=clock.wall(), installations=len(config.vrm.installations)
         )
@@ -186,8 +187,8 @@ class Relay:
         sample = result.sample if result is not None else None
         if result is not None and result.label is not None:
             self._labels[rule_id] = result.label
-        if result is not None and result.unit is not None:
-            self._units[rule_id] = result.unit
+        if result is not None:
+            self._units[rule_id] = (sample.timestamp if sample is not None else None, result.unit)
         state = self._delivery.rule_state(rule_id)
         observed = _observed(state)
         if sample is None and not observed:
@@ -232,7 +233,7 @@ class Relay:
     def _render(self, binding: RuleBinding, event: Event) -> str:
         label = self._labels.get(binding.rule.id)
         try:
-            return binding.render(event, label, self._units.get(binding.rule.id))
+            return binding.render(event, label, self._unit_for(binding, event))
         except Exception:
             logger.exception(
                 "rendering a level message failed; sending the default text",
@@ -245,6 +246,18 @@ class Relay:
                 label=label,
             )
             return render_notification(fields)
+
+    def _unit_for(self, binding: RuleBinding, event: Event) -> str | None:
+        """The unit VRM reported with the reading ``event`` shows, if it is known.
+
+        Only a unit from the poll that returned that very sample is used; for
+        any other value, such as one from saved state after a restart, the
+        unit is unknown and the value is shown as reported.
+        """
+        sample_time, unit = self._units.get(binding.rule.id, (None, None))
+        if sample_time is None or sample_time != event.sample_time:
+            return None
+        return unit
 
     def _evaluate_monitors(
         self,
