@@ -52,7 +52,7 @@ The only startup failure that stops the relay is a second process on the same st
    - **Journal writes:** the journal is opened with `O_APPEND` and `O_NOFOLLOW` and kept at mode 0600. Each line is written with `fsync` before the call it records. Each line is one JSON object, validated when read.
    - **Other changes:** every other change to a delivery reaches the journal too when SQLite fails, keyed by delivery identity. That includes outcomes, deliveries held back by the cap or by queue overflow, and summary acknowledgements.
    - **Startup:** the journal is replayed into rate limiting, duplicate suppression and the held-back count.
-   - **Replay applies each change once.** A delivery counts as held back once, unless the database already shows it held back. A delivered summary subtracts what it reported once, unless the database already shows it delivered.
+   - **Replay applies each change once.** A delivery counts as held back once, unless the database already shows it held back. A delivered summary subtracts what it reported only when that is provably not yet done: the database does not show it delivered, and it is the database's open summary or was delivered after the database was last written. Otherwise nothing is subtracted, and the count errs high.
    - **Recovery:** the next successful SQLite transaction merges the journal, and then the journal is deleted.
 
 4. **The journal never discards recent evidence.** When the journal reaches its size bound (4 MiB), it is compacted rather than rotated. Compaction atomically rewrites it to:
@@ -64,7 +64,7 @@ The only startup failure that stops the relay is a second process on the same st
 5. **An unreadable database never holds alerts.**
    - **Corrupt:** SQLite reports a malformed file or one that is not a database.
      - Every table that can still be read is salvaged.
-     - The file and its sidecars are renamed to `relay-state.sqlite3.corrupt-<UTC time>`, kept at mode 0600, and never overwritten. Every source is checked first, and the name is chosen clear for the database and every sidecar. Each move refuses to replace a file: a hard link and then an unlink, or, where the filesystem has no hard links, a rename after checking the name.
+     - The file and its sidecars are renamed to `relay-state.sqlite3.corrupt-<UTC time>`, kept at mode 0600, and never overwritten. Every source is checked first, and the name is chosen clear for the database and every sidecar. Each move refuses to replace a file: a hard link and then an unlink, or, where the filesystem has no hard links, a rename after checking the name. If the unlink fails, the new link is removed again.
      - If a move fails part way, the failure is logged with the files already moved, the relay stays unhealthy and keeps alerting, and the database is read again on the next cycle.
      - A fresh database is created. The relay rewrites everything it holds into it: salvaged rows, the journal, and its own state.
      - The missing history does not fill the cap. Only the attempts that were actually salvaged hold slots.
@@ -73,8 +73,8 @@ The only startup failure that stops the relay is a second process on the same st
    - **Otherwise unreadable:** permission or I/O errors, a lock, an unsafe path, or a schema from a newer release.
      - The file is left untouched, and nothing is written to it.
      - The relay runs on the journal and in-memory state, and keeps alerting.
-     - Every cycle it reads the database again. Once the read succeeds, the stored state is merged in. Slots this process already holds keep their monotonic time.
-     - Held-back counts are merged by delivery identity, not by adding counters. The stored count already covers the deliveries the database shows held back, and already excludes what the summaries it shows delivered reported. Only what this process counted beyond those is added or subtracted, so a delivery that both the database and the journal recorded is counted once.
+     - While the database or the journal cannot be read, every cycle reads both again as one snapshot. Once both can be read, the stored state is merged in; anything read before then is merged too, and the reads continue. Slots this process already holds keep their monotonic time.
+     - Held-back counts are merged by delivery identity, not by adding counters. They count as unread while either the database or the journal is unreadable, and the relay keeps its record of identities for that whole time. The stored count already covers the deliveries the database shows held back, and already excludes what the summaries it shows delivered reported. Only what this process counted beyond those is added or subtracted, so a delivery that both the database and the journal recorded is counted once.
      - A newer schema is never quarantined.
    - **Each table is read in its own transaction,** so one failing table hides nothing else.
 
@@ -165,7 +165,7 @@ The only startup failure that stops the relay is a second process on the same st
 - **A forward clock jump across a restart.** If the wall clock jumps forward and the process restarts before it is corrected, stored attempts look older than they are and may free slots early. Without a trusted clock this cannot be detected.
 - **Rule state is not journaled.** If SQLite cannot be written and the process restarts, rule state starts fresh. An active condition may then be reported again under a new event identity.
 - **Journal evidence beyond its bound.** Only a failure mode that produces far more sends than the largest valid cap can exceed the compacted bound. The oldest evidence is then dropped and the loss logged.
-- **Held-back counts can err high.** If the database pruned a held-back delivery that the journal still repeats, or more deliveries are held back while the counts are unread than the relay tracks by identity (100,000), the merged count can include some twice. A summary then reports more than were held back, never fewer.
+- **Held-back counts can err high.** If the database pruned a held-back delivery that the journal still repeats, or more deliveries are held back while the counts are unread than the relay tracks by identity (100,000), the merged count can include some twice. A delivered summary in the journal that cannot be proven newer than the database is not subtracted. A summary then reports more than were held back, never fewer.
 - **The attempt-number ceiling.** Attempt numbers stop at 100. A recovered delivery whose stored attempts already reach 100 numbers its retry 100 again, so after a restart that one retry may hold no slot. Reaching it takes about ninety recoveries of the same corrupt row.
 - **A residual path race.** The identity checks narrow but cannot fully close a race against a local attacker who can write to the state directory. Keep that directory private to the relay user.
 - **Schema version 1 was changed in place.** It was never released, so no database in use has the earlier layout.
