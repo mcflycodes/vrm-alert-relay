@@ -48,7 +48,7 @@ The only startup failure that stops the relay is a second process on the same st
    - Providers without a lookup always retry.
 
 3. **Record before sending, best effort.** Before the provider is called, the relay tries to make the `IN_FLIGHT` record and its attempt mark durable. SQLite is tried first, then an append-only journal next to the database.
-   - **If neither can record it, the message is sent anyway.** The attempt still counts against the in-memory cap. The relay marks itself unhealthy, logs an error on every run, and sends a storage notice (decision 11).
+   - **If neither can record it, the message is sent anyway.** The attempt still counts against the in-memory cap. The relay marks itself unhealthy, logs an error on every run, and sends a storage notice (decision 11). A run report counts every real provider call as sent, and those that could not be recorded again as a subset.
    - **Journal writes:** the journal is opened with `O_APPEND` and `O_NOFOLLOW` and kept at mode 0600. Each line is written with `fsync` before the call it records. Each line is one JSON object, validated when read.
    - **Other changes:** every other change to a delivery reaches the journal too when SQLite fails, keyed by delivery identity. That includes outcomes, deliveries held back by the cap or by queue overflow, and summary acknowledgements.
    - **Startup:** the journal is replayed into rate limiting, duplicate suppression and the held-back count.
@@ -64,21 +64,24 @@ The only startup failure that stops the relay is a second process on the same st
 5. **An unreadable database never holds alerts.**
    - **Corrupt:** SQLite reports a malformed file or one that is not a database.
      - Every table that can still be read is salvaged.
-     - The file and its sidecars are renamed to `relay-state.sqlite3.corrupt-<UTC time>`, kept at mode 0600, and never overwritten.
+     - The file and its sidecars are renamed to `relay-state.sqlite3.corrupt-<UTC time>`, kept at mode 0600, and never overwritten. Every source is checked first, and the name is chosen clear for the database and every sidecar. Each move refuses to replace a file: a hard link and then an unlink, or, where the filesystem has no hard links, a rename after checking the name.
+     - If a move fails part way, the failure is logged with the files already moved, the relay stays unhealthy and keeps alerting, and the database is read again on the next cycle.
      - A fresh database is created. The relay rewrites everything it holds into it: salvaged rows, the journal, and its own state.
      - The missing history does not fill the cap. Only the attempts that were actually salvaged hold slots.
      - The relay is unhealthy for the rest of the run, and a storage notice goes out.
+     - A summary in progress whose deliveries were lost is forgotten. Its count stands and is summarised again, after the usual wait.
    - **Otherwise unreadable:** permission or I/O errors, a lock, an unsafe path, or a schema from a newer release.
      - The file is left untouched, and nothing is written to it.
      - The relay runs on the journal and in-memory state, and keeps alerting.
      - Every cycle it reads the database again. Once the read succeeds, the stored state is merged in. Slots this process already holds keep their monotonic time.
+     - Held-back counts are merged by delivery identity, not by adding counters. The stored count already covers the deliveries the database shows held back, and already excludes what the summaries it shows delivered reported. Only what this process counted beyond those is added or subtracted, so a delivery that both the database and the journal recorded is counted once.
      - A newer schema is never quarantined.
    - **Each table is read in its own transaction,** so one failing table hides nothing else.
 
 6. **Corrupt rows fail toward alerting.**
    - **Unreadable send-attempt rows and journal lines:** each one occupies one slot for 24 hours from load time, because it records a send that may have happened. The row is rewritten in a readable form so it ages out normally.
    - **Unreadable unfinished deliveries** are never dropped:
-     - If the event and recipient can be read, the delivery is recovered as `AMBIGUOUS` and goes through reconcile-then-retry.
+     - If the event and recipient can be read, the delivery is recovered as `AMBIGUOUS` and marked recovered. It is owed one reconcile-then-retry, whatever its stored attempt count says, and the mark is stored so a restart keeps it. The retry is numbered past every stored attempt of that delivery, so its attempt record is new cap evidence, not a duplicate of an old one. After that retry the normal attempt ceiling applies.
      - Otherwise, if its rule can be read, that rule's stored state is reset so its next evaluation raises the alert again.
      - Otherwise, it is counted as held back and reported in the next summary.
    - **Oversized cells:** no stored cell is read beyond its bound. The size check reads the length from the record header, so an oversized cell is never loaded, and its row counts as corrupt. The bounds are four bytes per character of each field's limit.
@@ -125,7 +128,7 @@ The only startup failure that stops the relay is a second process on the same st
     - **Failover:** a definite failure from the provider moves on to the next recipient. Delivery, or an unknown outcome, ends the notice, because it may have arrived.
     - **Reporting:** the real outcome is reported.
     - **Capacity:** a notice waits for a free slot in the cap.
-    - **Frequency:** at most one notice per 24 hours. Each notice is recorded like any send, so after a restart a notice is not repeated when storage could record it. When nothing can be recorded, each process start may send one.
+    - **Frequency:** at most one notice per 24 hours, counted from the notice's first provider call, not from when it started waiting for a slot. Each notice is recorded like any send, so after a restart a notice is not repeated when storage could record it. When nothing can be recorded, each process start may send one.
     - **After a restart:** a notice is never resent.
 
 12. **System recipients.** System notifications go only to `system_recipients`: the rate-limit summary, the storage notice, and future monitoring notices.
@@ -162,6 +165,8 @@ The only startup failure that stops the relay is a second process on the same st
 - **A forward clock jump across a restart.** If the wall clock jumps forward and the process restarts before it is corrected, stored attempts look older than they are and may free slots early. Without a trusted clock this cannot be detected.
 - **Rule state is not journaled.** If SQLite cannot be written and the process restarts, rule state starts fresh. An active condition may then be reported again under a new event identity.
 - **Journal evidence beyond its bound.** Only a failure mode that produces far more sends than the largest valid cap can exceed the compacted bound. The oldest evidence is then dropped and the loss logged.
+- **Held-back counts can err high.** If the database pruned a held-back delivery that the journal still repeats, or more deliveries are held back while the counts are unread than the relay tracks by identity (100,000), the merged count can include some twice. A summary then reports more than were held back, never fewer.
+- **The attempt-number ceiling.** Attempt numbers stop at 100. A recovered delivery whose stored attempts already reach 100 numbers its retry 100 again, so after a restart that one retry may hold no slot. Reaching it takes about ninety recoveries of the same corrupt row.
 - **A residual path race.** The identity checks narrow but cannot fully close a race against a local attacker who can write to the state directory. Keep that directory private to the relay user.
 - **Schema version 1 was changed in place.** It was never released, so no database in use has the earlier layout.
 
