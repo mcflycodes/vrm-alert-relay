@@ -10,8 +10,11 @@ FROM ghcr.io/astral-sh/uv:0.13.0@sha256:cdc6093146eb3ff6a40107b38f008b789e050e77
 FROM cgr.dev/chainguard/wolfi-base:latest@sha256:256c88bb066424045021090932d50be93c8e3f2ce3586707702a401b146f3e43 AS build
 COPY --from=uv /uv /usr/local/bin/uv
 # The runtime root filesystem gets no shell and no package manager: apk installs into /rootfs
-# without itself, and its keys and repository list are removed afterwards. The relay user is
-# UID and GID 65532, as before. The state directory is created empty and owner-only; COPY
+# without itself, and its keys and repository list are removed afterwards. Package scripts are
+# skipped on purpose, because the root filesystem has no shell to run them; the only one these
+# packages carry is glibc's ldconfig trigger, so the builder's ldconfig builds /etc/ld.so.cache
+# for the root filesystem instead. The relay user is UID and GID 65532 with home and working
+# directory /home/nonroot, as before. The state directory is created empty and owner-only; COPY
 # creates its destination with a default mode but keeps the modes of the entries it copies,
 # so the directory is copied as a child of /staging.
 # hadolint ignore=DL3018
@@ -19,8 +22,11 @@ RUN set -eux; \
     apk add --no-cache python-3.13-base; \
     mkdir -p /rootfs/etc/apk; \
     cp -a /etc/apk/keys /etc/apk/repositories /rootfs/etc/apk/; \
-    apk add --no-cache --root /rootfs --initdb \
+    apk add --no-cache --no-scripts --root /rootfs --initdb \
         wolfi-baselayout ca-certificates-bundle tzdata python-3.13-base; \
+    tar -tf /rootfs/lib/apk/db/scripts.tar || true; \
+    ldconfig -r /rootfs; \
+    test -s /rootfs/etc/ld.so.cache; \
     rm -rf /rootfs/etc/apk/keys /rootfs/etc/apk/repositories /rootfs/var/cache/apk; \
     grep -q '^nonroot:' /rootfs/etc/passwd \
         || echo 'nonroot:x:65532:65532:nonroot:/home/nonroot:/sbin/nologin' >> /rootfs/etc/passwd; \
@@ -53,5 +59,6 @@ ENV PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 USER 65532:65532
+WORKDIR /home/nonroot
 ENTRYPOINT ["/opt/venv/bin/vrm-alert-relay"]
 CMD ["run"]

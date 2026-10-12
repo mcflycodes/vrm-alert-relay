@@ -17,9 +17,9 @@ ADR 0001 chose a distroless base. The Debian 13 distroless Python image carried 
 The runtime image is assembled from [Wolfi](https://github.com/wolfi-dev) packages into a `scratch` image:
 
 - The build stage is `cgr.dev/chainguard/wolfi-base`, pinned by digest. Chainguard's free `python` image only publishes tags that follow the newest CPython minor, so Python comes from Wolfi's versioned `python-3.13-base` package, which keeps the 3.13 line.
-- The build stage installs that package for itself and, with the base layout, CA certificates, and time zone data, into a separate root filesystem that becomes the runtime image. The runtime has no shell and no package manager.
-- The relay user, paths, and state-directory ownership are unchanged: UID and GID 65532, `/opt/venv`, and `/var/lib/vrm-alert-relay` owned by `65532:65532` with mode `0700`. Existing state volumes and the Compose example keep working.
-- Wolfi packages are installed at their newest version on every build, not pinned. Rebuilds are therefore not byte-identical, and each build's SBOM records the exact package versions.
+- The build stage installs that package for itself and, with the base layout, CA certificates, and time zone data, into a separate root filesystem that becomes the runtime image. The runtime has no shell and no package manager. Package scripts are skipped, since that root filesystem has no shell to run them, and the builder's `ldconfig` generates its `/etc/ld.so.cache`.
+- The relay user, paths, and state-directory ownership are unchanged: UID and GID 65532, working directory `/home/nonroot`, `/opt/venv`, and `/var/lib/vrm-alert-relay` owned by `65532:65532` with mode `0700`. Existing state volumes and the Compose example keep working.
+- Wolfi packages are not version-pinned: an uncached build installs the newest versions available. Rebuilds are therefore not byte-identical, and each build's SBOM records the exact package versions. A build that reuses Docker's layer cache with an unchanged, digest-pinned base reuses the packages it installed before; picking up newer packages takes `docker build --pull --no-cache` or a digest bump. CI builds run on fresh GitHub-hosted runners without a layer cache, so every CI build, including the weekly re-scan, installs current packages.
 - Dependabot cannot follow the mutable `latest` tag, so a weekly scheduled workflow rebuilds and re-scans `main` and opens a pull request when the base image's digest changes.
 
 Everything else in ADR 0001's container and supply-chain decision stands.
@@ -33,5 +33,5 @@ Everything else in ADR 0001's container and supply-chain decision stands.
 ## Consequences
 
 - Two builds of the same commit can contain different package versions. The SBOM, not the commit, identifies what an image contains.
-- A rebuild picks up Wolfi's fixes without a code change, so the weekly scan reflects what a rebuild would ship.
-- Pull requests opened by the scheduled workflow do not trigger CI by themselves; the maintainer closes and reopens them to run it.
+- An uncached rebuild picks up Wolfi's fixes without a code change, so the weekly scan reflects what such a rebuild would ship.
+- Pull requests opened by the scheduled workflow with the workflow token create CI runs that wait for approval: a maintainer with write access uses "Approve workflows to run" on the pull request before the checks start.

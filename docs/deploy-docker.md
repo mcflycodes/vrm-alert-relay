@@ -29,7 +29,7 @@ docker build --tag "$tag" .
 echo "$tag"
 ```
 
-The image is built from Wolfi packages, which are not version-pinned, so two builds of the same commit can differ in package versions. The image's SBOM (CI publishes one for every build) records the exact versions; rebuilding picks up the latest fixes.
+The image is built from Wolfi packages, which are not version-pinned, so two builds of the same commit can differ in package versions. The image's SBOM (CI publishes one for every build) records the exact versions. A rebuild reuses Docker's layer cache, and with it the packages installed last time, unless you build with `docker build --pull --no-cache`; do that to pick up the latest fixes.
 
 Once release images are published, use `ghcr.io/OWNER/vrm-alert-relay:VERSION` (the placeholder in the Compose file), ideally pinned by digest, instead of building.
 

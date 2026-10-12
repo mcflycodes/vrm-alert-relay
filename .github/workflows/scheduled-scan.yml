@@ -1,8 +1,9 @@
 name: Scheduled image scan
 
 # Weekly: re-scans main so newly published CVEs surface without a code change, and
-# refreshes the base image's digest pin. Every rebuild also installs the newest Wolfi
-# packages, so the scan covers what a rebuild today would ship.
+# refreshes the base image's digest pin. Hosted runners have no layer cache, so the build
+# installs the newest Wolfi packages and the scan covers what an uncached rebuild today
+# would ship.
 on:
   schedule:
     - cron: "17 6 * * 1"
@@ -38,8 +39,8 @@ jobs:
           image: ${{ env.IMAGE }}
 
   # Dependabot cannot follow Chainguard's mutable tags, so this opens (or updates) a pull
-  # request when a pinned tag in the Dockerfile points at a new digest. Pull requests opened
-  # with the workflow token do not trigger CI: close and reopen the pull request to run it.
+  # request when a pinned tag in the Dockerfile points at a new digest. CI runs for pull
+  # requests opened with the workflow token wait for a maintainer to approve them.
   refresh-digests:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
@@ -65,6 +66,6 @@ jobs:
           description-for-pr: |
             Refreshes the digest pins in the Dockerfile to what their tags point at now.
 
-            Close and reopen this pull request to run CI; pull requests opened by the
-            workflow token do not trigger it. Check the container job's scan and SBOM before
-            merging.
+            CI runs for this pull request wait for approval, because the workflow token
+            opened it: use "Approve workflows to run" on the pull request to start them.
+            Check the container job's scan and SBOM before merging.
