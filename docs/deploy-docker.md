@@ -1,6 +1,6 @@
 # Deploying with Docker Compose
 
-**Updated:** 2026-10-11
+**Updated:** 2026-10-12
 
 VRM Alert Relay is an unofficial, independent project. It is not affiliated with, sponsored by, or endorsed by Victron Energy.
 
@@ -29,7 +29,38 @@ docker build --tag "$tag" .
 echo "$tag"
 ```
 
-Once release images are published, use `ghcr.io/OWNER/vrm-alert-relay:VERSION` (the placeholder in the Compose file), ideally pinned by digest, instead of building.
+Once release images are published, use `ghcr.io/mcflycodes/vrm-alert-relay:VERSION` instead of building, pinned by digest and [verified](#verifying-a-release-image) first. Set it as `VRM_ALERT_RELAY_IMAGE` in step 2, in place of the tag you built.
+
+## Verifying a release image
+
+Release images are published to `ghcr.io/mcflycodes/vrm-alert-relay` for `linux/amd64` and `linux/arm64`, tagged with the version without its `v` (tag `v0.1.0-rc.1` is image `0.1.0-rc.1`). `latest` follows the newest release that is not a pre-release. Each release lists the image's digest in its notes.
+
+The release workflow signs every image with [Sigstore cosign](https://docs.sigstore.dev/) keyless signing: the signing certificate is issued to this repository's release workflow, running for a version tag, through GitHub Actions OIDC. No signing key exists to leak. It also attaches each platform's CycloneDX SBOM to that platform's image as a signed attestation, and to the GitHub Release.
+
+With [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 2.x or 3.x, check the signature before you deploy, using the digest from the release notes:
+
+```sh
+image=ghcr.io/mcflycodes/vrm-alert-relay@sha256:0000000000000000000000000000000000000000000000000000000000000000
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/mcflycodes/vrm-alert-relay/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "$image"
+```
+
+It prints the verified signatures and exits 0; any other result means the image was not published by the release workflow, so do not deploy it. To pin one release exactly, use `--certificate-identity https://github.com/mcflycodes/vrm-alert-relay/.github/workflows/release.yml@refs/tags/v0.1.0-rc.1` instead of the regular expression.
+
+The SBOM attestations belong to the per-platform images, not to the multi-platform index. Look up the digest of your platform (`amd64` or `arm64`) with [jq](https://jqlang.org/), then verify its attestation:
+
+```sh
+platform_digest="$(docker buildx imagetools inspect --raw "$image" |
+  jq -r '.manifests[] | select(.platform.architecture == "amd64") | .digest')"
+cosign verify-attestation --type cyclonedx \
+  --certificate-identity-regexp '^https://github\.com/mcflycodes/vrm-alert-relay/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "ghcr.io/mcflycodes/vrm-alert-relay@${platform_digest}" > /dev/null && echo "SBOM attestation verified"
+```
+
+The same SBOMs are attached to the GitHub Release as `sbom-linux-amd64.cdx.json` and `sbom-linux-arm64.cdx.json`.
 
 ## 2. Create the deployment directory
 
