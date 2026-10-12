@@ -190,15 +190,17 @@ rules:
       - automation_hook
       - audit_log
 
-# Optional: who receives system notifications, such as the "alerts held back
-# by the global rate limit" summary and the "state storage unavailable"
-# warning. Names from the recipients section. When omitted, every recipient
-# used by a rule receives them.
+# Optional: who receives system notifications: the "alerts held back by the
+# global rate limit" summary, the "state storage is failing" notice, and the
+# "monitoring degraded" and "monitoring restored" notices (see
+# docs/operations.md). Names from the recipients section. When omitted, every
+# recipient used by a rule receives them.
 # system_recipients:
 #   - owner_sms
 
-# Optional informational health endpoint. It reports no secrets or recipient
-# data. Keep it on loopback unless something else needs to reach it.
+# Optional informational health endpoint (GET /health; see docs/operations.md).
+# It reports no secrets or recipient data. Keep it on loopback unless
+# something else needs to reach it.
 health:
   enabled: false
   bind: 127.0.0.1

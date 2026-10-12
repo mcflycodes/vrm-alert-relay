@@ -27,3 +27,4 @@ ENV PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/
     PYTHONUNBUFFERED=1
 USER 65532:65532
 ENTRYPOINT ["/opt/venv/bin/vrm-alert-relay"]
+CMD ["run"]

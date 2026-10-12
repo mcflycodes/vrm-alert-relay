@@ -51,11 +51,13 @@ Without a `message`, each kind uses a default:
 | stale | `Stale data: {rule} at {installation} has had no new {label} reading since {time}` |
 | restored | `Data restored: {rule} at {installation} is reporting again: {label} is {value}{unit} ({time})` |
 | rate-limit summary | `VRM Alert Relay: {count} alert(s) held back by the global rate limit since {time}` |
-| storage notice | `VRM Alert Relay: state storage is unavailable; alerts may be held back until it is repaired` |
+| storage notice | `VRM Alert Relay: state storage is failing, so alerts continue under limits kept in memory only. Check the relay.` |
 | monitoring degraded | `VRM Alert Relay: monitoring of {installation} is degraded since {time}; alerts may be delayed or missed` |
 | monitoring restored | `VRM Alert Relay: monitoring of {installation} is restored ({time})` |
 
 A level's `message` replaces the default for escalations into that level. Reminders for the level send `Reminder: ` followed by the level's message.
+
+System notifications (the rate-limit summary, the storage notice and the monitoring notices) go to `system_recipients`. [operations.md](operations.md) explains when monitoring is reported as degraded and restored. The `test-notification` command sends the fixed text `VRM Alert Relay: test notification. If you can read this, delivery to this recipient works.`
 
 ## Providers
 
@@ -104,6 +106,7 @@ POSTs this JSON document (payload version 1) to the configured URL:
 ```
 
 - Every key is always present. Structured fields are `null` when the message does not carry them; `text` is always the rendered message.
+- **Known v1 limitation:** the delivery engine stores only each message's rendered text, not its structured fields, so in v1 every structured field (`kind`, `rule`, `level`, `value`, `unit`, `installation`, `measurement`, `time`) is `null` and receivers should read `text`. The payload shape stays the same when the fields are filled in a later release.
 - `delivery_id` is the same for every retry of one message to one recipient, so a receiver can drop duplicates.
 - With `auth_header_name` and `auth_header_value_file`, the header is sent with every request.
 - The URL path is shown as `/[REDACTED]` in logs, since webhook URLs often embed a token.

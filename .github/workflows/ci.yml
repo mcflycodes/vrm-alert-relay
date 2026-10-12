@@ -146,9 +146,28 @@ jobs:
           echo "Effective UID and GID: ${ids}"
           [[ "${ids%% *}" != 0 ]]
 
-          log="$("${hardened[@]}" "$IMAGE" 2>&1 >/dev/null)"
-          echo "Placeholder log: ${log}"
-          python3 -c 'import json, sys; r = json.loads(sys.argv[1]); assert r["dry_run"] is True, r' "$log"
+          # One dry-run poll cycle of the example configuration. The VRM token is
+          # fictitious and the network is off, so the poll fails and nothing is sent.
+          smoke="$RUNNER_TEMP/smoke"
+          mkdir -p "$smoke"
+          printf 'fictitious-smoke-test-value\n' > "$smoke/vrm_token"
+          chmod 0644 "$smoke/vrm_token"
+          log="$("${hardened[@]}" \
+                 --volume "$PWD/examples/config.example.yaml:/etc/vrm-alert-relay/config.yaml:ro" \
+                 --volume "$smoke/vrm_token:/run/secrets/vrm_token:ro" \
+                 --tmpfs /var/lib/vrm-alert-relay:rw,mode=1777 \
+                 "$IMAGE" run --once)"
+          echo "Run log:"
+          echo "$log"
+          python3 - "$log" <<'PY'
+          import json, sys
+          records = [json.loads(line) for line in sys.argv[1].splitlines()]
+          events = [r.get("event") for r in records]
+          started = next(r for r in records if r.get("event") == "service.started")
+          assert started["dry_run"] is True, started
+          assert events[-1] == "service.stopped", events
+          assert "relay.cycle" in events, events
+          PY
       - name: Generate SBOM
         run: |
           "$RUNNER_TEMP/trivy" image --no-progress --format cyclonedx \
