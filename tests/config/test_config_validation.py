@@ -209,7 +209,11 @@ def test_strict_types(
             "rate_limits.global_per_hour",
         ),
         (
-            lambda d: d.update(rate_limits={"global_per_day": 10_001}),
+            lambda d: d.update(rate_limits={"global_per_hour": 201, "global_per_day": 1000}),
+            "rate_limits.global_per_hour",
+        ),
+        (
+            lambda d: d.update(rate_limits={"global_per_day": 1001}),
             "rate_limits.global_per_day",
         ),
         (lambda d: d.update(rate_limits={"retries": 11}), "rate_limits.retries"),

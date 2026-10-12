@@ -40,10 +40,29 @@ class RateLimiter:
             raise ValueError("rate limits must be positive")  # noqa: TRY003  # per-check validation message
         self._per_hour = per_hour
         self._per_day = per_day
-        ordered = sorted(restored)
-        self._hour: deque[float] = deque(at for at, _ in ordered)
-        self._day: deque[tuple[float, AttemptKey]] = deque(ordered)
+        self._hour: deque[float] = deque()
+        self._day: deque[tuple[float, AttemptKey]] = deque()
         self._expired: deque[AttemptKey] = deque(maxlen=MAX_EXPIRED)
+        self.restore(restored)
+
+    def restore(self, slots: Iterable[tuple[float, AttemptKey]]) -> None:
+        """Add stored sends; a key that already holds a slot keeps the one it has.
+
+        A slot taken in this process is placed on monotonic time and must not
+        move: re-deriving it from the wall clock could free it early.
+        """
+        known = {key for _, key in self._day}
+        fresh: dict[AttemptKey, float] = {}
+        for at, key in slots:
+            if key not in known:
+                fresh[key] = min(at, fresh.get(key, at))
+        if not fresh:
+            return
+        added = [(at, key) for key, at in fresh.items()]
+        merged = sorted([*self._day, *added])
+        hour = sorted([*self._hour, *fresh.values()])
+        self._day = deque(merged)
+        self._hour = deque(hour)
 
     def _expire(self, now: float) -> None:
         hour, day = HOUR.total_seconds(), DAY.total_seconds()

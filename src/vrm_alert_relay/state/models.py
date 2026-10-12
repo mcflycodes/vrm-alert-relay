@@ -52,10 +52,11 @@ _TERMINAL: Final = frozenset(
 
 
 class DeliveryKind(StrEnum):
-    """Whether a delivery carries a rule or direct event, or a rate-limit summary."""
+    """A rule or direct event, a rate-limit summary, or a storage notice."""
 
     EVENT = "event"
     SUMMARY = "summary"
+    NOTICE = "notice"
 
 
 def is_identifier(value: object) -> bool:
@@ -116,6 +117,8 @@ RECORD_FIELDS: Final = (
     "next_attempt_at",
     "last_attempt_at",
     "provider_message_id",
+    "covers",
+    "recovered",
 )
 
 
@@ -136,8 +139,12 @@ class DeliveryRecord:
     provider_message_id: str | None = None
     rule_id: str | None = None
     """The rule whose event this is, so that a lost record can reset that rule."""
+    covers: int = 0
+    """For a summary, how many held-back deliveries it reports."""
+    recovered: bool = False
+    """Rebuilt from a corrupt row: owed one reconcile-then-retry whatever its attempt count."""
 
-    def __post_init__(self) -> None:  # noqa: C901  # flat validation checklist, deliberately not split
+    def __post_init__(self) -> None:  # noqa: C901, PLR0912  # flat validation checklist, deliberately not split
         if not is_identifier(self.event_id):
             raise InvalidRecordError("event_id must be a bounded identifier")  # noqa: TRY003  # per-check validation message
         if not is_identifier(self.recipient):
@@ -161,6 +168,10 @@ class DeliveryRecord:
                 raise InvalidRecordError(f"{name} must be an aware datetime or null")  # noqa: TRY003  # per-check validation message
         if self.provider_message_id is not None and not is_message_id(self.provider_message_id):
             raise InvalidRecordError("provider_message_id must be a bounded printable string")  # noqa: TRY003  # per-check validation message
+        if not is_counter(self.covers):
+            raise InvalidRecordError("covers is outside safe bounds")  # noqa: TRY003  # per-check validation message
+        if not isinstance(self.recovered, bool):
+            raise InvalidRecordError("recovered must be a bool")  # noqa: TRY003  # per-check validation message
 
     @property
     def key(self) -> tuple[str, str]:
@@ -198,6 +209,8 @@ class DeliveryRecord:
             "next_attempt_at": stamp(self.next_attempt_at),
             "last_attempt_at": stamp(self.last_attempt_at),
             "provider_message_id": self.provider_message_id,
+            "covers": self.covers,
+            "recovered": self.recovered,
         }
 
     @classmethod
@@ -217,6 +230,8 @@ class DeliveryRecord:
             next_attempt_at=decode_optional_time(data["next_attempt_at"]),
             last_attempt_at=decode_optional_time(data["last_attempt_at"]),
             provider_message_id=data["provider_message_id"],
+            covers=data["covers"],
+            recovered=data["recovered"],
         )
 
 
@@ -229,7 +244,7 @@ class AttemptMark:
     attempt: int
     at: datetime
     live: bool = True
-    """A real provider call; ``False`` for a dry-run send."""
+    """A real provider call; ``False`` for a dry-run send, which is never stored."""
 
     def __post_init__(self) -> None:
         if not is_identifier(self.event_id) or not is_identifier(self.recipient):
@@ -292,9 +307,19 @@ class Snapshot:
     rule_states: Mapping[str, RuleState] = field(default_factory=_empty_states)
     deliveries: tuple[DeliveryRecord, ...] = ()
     attempts: tuple[AttemptMark, ...] = ()
-    attempts_complete: bool = True
-    """False when the stored send-attempt history could not be read."""
+    complete: bool = True
+    """False when the database could not be read; the store then defers its
+    writes and :meth:`~vrm_alert_relay.state.StateStore.reload` tries again."""
     suppression: SuppressionState = field(default_factory=SuppressionState)
+    suppression_read: bool = True
+    """False when the stored suppression counts could not be read: when either
+    the database's counts or the journal could not be read."""
+    counted_held: frozenset[tuple[str, str]] = frozenset()
+    """Held-back deliveries that ``suppression.count`` already includes."""
+    counted_acknowledged: frozenset[str] = frozenset()
+    """Delivered summaries whose reports ``suppression.count`` already excludes."""
+    reset: bool = False
+    """True when a corrupt database was quarantined and state started afresh."""
     last_seen: datetime | None = None
     clock_moved_backwards: bool = False
     problems: int = 0

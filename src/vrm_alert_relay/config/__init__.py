@@ -18,6 +18,8 @@ from .loader import (
     parse_config,
 )
 from .models import (
+    MAX_GLOBAL_PER_DAY,
+    MAX_GLOBAL_PER_HOUR,
     PROVIDER_NAMES,
     SUPPORTED_VERSIONS,
     DeliveryMode,
@@ -51,6 +53,8 @@ from .secret import (
 )
 
 __all__ = [
+    "MAX_GLOBAL_PER_DAY",
+    "MAX_GLOBAL_PER_HOUR",
     "PROVIDER_NAMES",
     "STRUCTURE_ONLY_NOTE",
     "SUPPORTED_VERSIONS",
