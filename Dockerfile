@@ -26,7 +26,7 @@ RUN set -eux; \
         || echo 'nonroot:x:65532:65532:nonroot:/home/nonroot:/sbin/nologin' >> /rootfs/etc/passwd; \
     grep -q '^nonroot:' /rootfs/etc/group || echo 'nonroot:x:65532:' >> /rootfs/etc/group; \
     install -d -o 65532 -g 65532 -m 0750 /rootfs/home/nonroot; \
-    mkdir -p -m 0700 /staging/vrm-alert-relay
+    install -d -m 0700 /staging/vrm-alert-relay
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_NO_CACHE=1 \
