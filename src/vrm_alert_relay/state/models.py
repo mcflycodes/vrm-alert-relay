@@ -118,6 +118,7 @@ RECORD_FIELDS: Final = (
     "last_attempt_at",
     "provider_message_id",
     "covers",
+    "recovered",
 )
 
 
@@ -140,6 +141,8 @@ class DeliveryRecord:
     """The rule whose event this is, so that a lost record can reset that rule."""
     covers: int = 0
     """For a summary, how many held-back deliveries it reports."""
+    recovered: bool = False
+    """Rebuilt from a corrupt row: owed one reconcile-then-retry whatever its attempt count."""
 
     def __post_init__(self) -> None:  # noqa: C901, PLR0912  # flat validation checklist, deliberately not split
         if not is_identifier(self.event_id):
@@ -167,6 +170,8 @@ class DeliveryRecord:
             raise InvalidRecordError("provider_message_id must be a bounded printable string")  # noqa: TRY003  # per-check validation message
         if not is_counter(self.covers):
             raise InvalidRecordError("covers is outside safe bounds")  # noqa: TRY003  # per-check validation message
+        if not isinstance(self.recovered, bool):
+            raise InvalidRecordError("recovered must be a bool")  # noqa: TRY003  # per-check validation message
 
     @property
     def key(self) -> tuple[str, str]:
@@ -205,6 +210,7 @@ class DeliveryRecord:
             "last_attempt_at": stamp(self.last_attempt_at),
             "provider_message_id": self.provider_message_id,
             "covers": self.covers,
+            "recovered": self.recovered,
         }
 
     @classmethod
@@ -225,6 +231,7 @@ class DeliveryRecord:
             last_attempt_at=decode_optional_time(data["last_attempt_at"]),
             provider_message_id=data["provider_message_id"],
             covers=data["covers"],
+            recovered=data["recovered"],
         )
 
 
@@ -306,6 +313,11 @@ class Snapshot:
     suppression: SuppressionState = field(default_factory=SuppressionState)
     suppression_read: bool = True
     """False when the stored suppression counts could not be read."""
+    stored_held: frozenset[tuple[str, str]] = frozenset()
+    """Held-back deliveries that SQLite itself shows held back, journal aside."""
+    stored_acknowledged: frozenset[str] = frozenset()
+    """Summaries that SQLite itself shows delivered, journal aside: their counts
+    are already subtracted from the stored suppression count."""
     reset: bool = False
     """True when a corrupt database was quarantined and state started afresh."""
     last_seen: datetime | None = None

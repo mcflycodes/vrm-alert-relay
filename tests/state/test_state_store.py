@@ -381,6 +381,8 @@ def test_corrupt_deliveries_are_recovered_or_accounted(tmp_path: Path) -> None:
         _insert_delivery(
             connection, event_id="evt_c", status="delivered", attempts=1, updated_at="x"
         )
+        # An unreadable recovered flag on a finished record: kept as finished.
+        _insert_delivery(connection, event_id="evt_d", status="failed", recovered=7)
         # Unreadable identity, finished: dropped.
         _insert_delivery(connection, event_id="bad id 1", status="failed")
         # Unreadable identity, readable rule: the rule starts fresh.
@@ -390,13 +392,14 @@ def test_corrupt_deliveries_are_recovered_or_accounted(tmp_path: Path) -> None:
     store, snapshot = reopen(tmp_path, BASE + timedelta(minutes=5))
     later = BASE + timedelta(minutes=5)
     by_id = {r.event_id: r for r in snapshot.deliveries}
-    assert set(by_id) == {"evt_a", "evt_b", "evt_c"}
+    assert set(by_id) == {"evt_a", "evt_b", "evt_c", "evt_d"}
     a = by_id["evt_a"]
-    assert (a.status, a.kind, a.attempts, a.created_at) == (
+    assert (a.status, a.kind, a.attempts, a.created_at, a.recovered) == (
         DeliveryStatus.AMBIGUOUS,
         DeliveryKind.EVENT,
-        1,
+        0,
         later,
+        True,
     )
     assert (len(a.text), a.provider_message_id, a.rule_id, a.last_attempt_at) == (
         1000,
@@ -404,11 +407,13 @@ def test_corrupt_deliveries_are_recovered_or_accounted(tmp_path: Path) -> None:
         None,
         None,
     )
-    assert by_id["evt_b"].attempts == 100
-    assert by_id["evt_c"].status is DeliveryStatus.DELIVERED
+    # H1: an out-of-bounds count is not kept; the delivery is owed a retry instead.
+    assert (by_id["evt_b"].attempts, by_id["evt_b"].recovered) == (0, True)
+    assert (by_id["evt_c"].status, by_id["evt_c"].recovered) == (DeliveryStatus.DELIVERED, False)
+    assert (by_id["evt_d"].status, by_id["evt_d"].recovered) == (DeliveryStatus.FAILED, False)
     assert set(snapshot.rule_states) == {"freezer"}
     assert snapshot.suppression.count == 3
-    assert snapshot.problems == 6
+    assert snapshot.problems == 7
     store.close()
     # The repairs were written back, so a second load is clean.
     store, snapshot = reopen(tmp_path, later)
@@ -431,7 +436,7 @@ def test_unreadable_text_is_replaced_by_a_notice(tmp_path: Path) -> None:
             "CREATE TABLE delivery (event_id TEXT, recipient TEXT, rule_id TEXT, kind TEXT, "
             "status TEXT, text TEXT, attempts INTEGER, created_at TEXT, updated_at TEXT, "
             "next_attempt_at TEXT, last_attempt_at TEXT, provider_message_id TEXT, "
-            "covers INTEGER, PRIMARY KEY (event_id, recipient))"
+            "covers INTEGER, recovered INTEGER, PRIMARY KEY (event_id, recipient))"
         )
         _insert_delivery(connection, event_id="evt_t", text=None, attempts=True)
     store, snapshot = reopen(tmp_path)

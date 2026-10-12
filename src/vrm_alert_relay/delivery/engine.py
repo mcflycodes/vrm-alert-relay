@@ -100,6 +100,7 @@ logger = logging.getLogger(__name__)
 type DeliveryKey = tuple[str, str]
 
 DEFAULT_MAX_QUEUE: Final = 1000
+MAX_UNREAD_LEDGER: Final = 100_000
 NOTICE_INTERVAL: Final = timedelta(days=1)
 STORAGE_NOTICE_TEXT: Final = (
     "VRM Alert Relay: state storage is failing, so alerts continue under limits "
@@ -132,7 +133,7 @@ class RunReport:
     """What one :meth:`DeliveryEngine.run_due` call did."""
 
     sent: int = 0
-    """Real provider calls."""
+    """Real provider calls, whether or not they could be recorded."""
     dry_run_sent: int = 0
     delivered: int = 0
     reconciled: int = 0
@@ -141,7 +142,7 @@ class RunReport:
     failed: int = 0
     suppressed: int = 0
     sent_unrecorded: int = 0
-    """Real provider calls made although no attempt record could be made durable."""
+    """The subset of ``sent`` made although no attempt record could be made durable."""
     storage_notice: SendStatus | None = None
     """The outcome of a storage notice sent in this run, if one was."""
 
@@ -171,6 +172,8 @@ class _NoticeEpisode:
     event_id: str
     routes: tuple[Route, ...]
     position: int = 0
+    started: bool = False
+    """Whether a provider call was made: the notice interval starts there."""
 
 
 def _untrusted(value: object) -> object:
@@ -254,6 +257,11 @@ class DeliveryEngine:
         self._summary_wanted_mono: float | None = None
         self._suppressed_total = 0
         self._dry_run_over_cap = 0
+        # While the stored suppression counts are unread: what this process
+        # counted, by identity, so that merging them counts nothing twice.
+        self._held_unread: set[DeliveryKey] = set()
+        self._untracked_unread = 0
+        self._acknowledged_unread: dict[str, int] = {}
 
         wall, mono = clock.wall(), clock.monotonic()
         self._restore(store.load(wall), wall, mono)
@@ -270,6 +278,8 @@ class DeliveryEngine:
             )
         state = snapshot.suppression
         self._suppression = state
+        for record in snapshot.deliveries:
+            self._note_stored(record)
         self._last_summary_mono = self._mono_of(state.last_summary_at, wall, mono)
         if state.count:
             self._summary_wanted_mono = self._mono_of(state.since, wall, mono) or mono
@@ -280,6 +290,8 @@ class DeliveryEngine:
                 extra={"event": "delivery.recovered_in_flight", "count": recovered},
             )
         self._adopt_open_summary()
+        if snapshot.complete:
+            self._forget_lost_summary(mono)
         if snapshot.reset:
             self._start_afresh(snapshot)
         self._prune_memory()
@@ -362,10 +374,15 @@ class DeliveryEngine:
             self._adopt(record, wall, mono)
         for rule_id, state in snapshot.rule_states.items():
             self._rule_states.setdefault(rule_id, state)
-        if not self._suppression_read and snapshot.suppression_read:
-            self._merge_suppression(snapshot.suppression, wall, mono)
+        if not self._suppression_read and (snapshot.suppression_read or snapshot.reset):
+            if snapshot.suppression_read:
+                self._merge_suppression(snapshot, wall, mono)
             self._suppression_read = True
+            self._held_unread.clear()
+            self._untracked_unread = 0
+            self._acknowledged_unread.clear()
         self._adopt_open_summary()
+        self._forget_lost_summary(mono)
         if snapshot.reset:
             self._start_afresh(snapshot)
         self._complete = True
@@ -374,22 +391,76 @@ class DeliveryEngine:
             extra={"event": "delivery.history_restored"},
         )
 
-    def _merge_suppression(self, stored: SuppressionState, wall: datetime, mono: float) -> None:
-        """Add stored counts that this process has not seen to its own."""
-        current = self._suppression
-        count = min(current.count + stored.count, MAX_COUNTER)
+    def _merge_suppression(self, snapshot: Snapshot, wall: datetime, mono: float) -> None:
+        """Merge the stored suppression counts, keyed by delivery identity.
+
+        The stored count already includes the deliveries SQLite shows held
+        back, and already excludes what the summaries it shows delivered
+        reported. Only what this process counted beyond those is added or
+        subtracted, so a delivery that both recorded is counted once.
+        """
+        stored, current = snapshot.suppression, self._suppression
+        added = len(self._held_unread - snapshot.stored_held) + self._untracked_unread
+        reported = sum(
+            covers
+            for event_id, covers in self._acknowledged_unread.items()
+            if event_id not in snapshot.stored_acknowledged
+        )
+        count = min(max(stored.count + added - reported, 0), MAX_COUNTER)
         sinces = [when for when in (current.since, stored.since) if when is not None]
         summaries = [when for when in (current.last_summary_at, stored.last_summary_at) if when]
-        keep_current = current.summary_event_id is not None
+        if current.summary_event_id is not None:
+            summary_event_id, summary_count = current.summary_event_id, current.summary_count
+        elif stored.summary_event_id in self._acknowledged_unread:
+            summary_event_id, summary_count = None, 0  # delivered here: already subtracted
+        else:
+            summary_event_id, summary_count = stored.summary_event_id, stored.summary_count
         self._suppression = SuppressionState(
             count=count,
             since=min(sinces) if sinces and count else None,
             last_summary_at=max(summaries) if summaries else None,
-            summary_event_id=current.summary_event_id if keep_current else stored.summary_event_id,
-            summary_count=current.summary_count if keep_current else stored.summary_count,
+            summary_event_id=summary_event_id,
+            summary_count=summary_count,
         )
         if count and self._summary_wanted_mono is None:
             self._summary_wanted_mono = self._mono_of(self._suppression.since, wall, mono) or mono
+
+    def _note_stored(self, record: DeliveryRecord) -> None:
+        """Note what a record loaded while the counts are unread already accounts for."""
+        if record.status is DeliveryStatus.SUPPRESSED:
+            self._note_held(record)
+        elif record.status is DeliveryStatus.DELIVERED:
+            self._note_acknowledged(record)
+
+    def _note_held(self, record: DeliveryRecord) -> None:
+        if self._suppression_read or record.kind is not DeliveryKind.EVENT:
+            return
+        if len(self._held_unread) < MAX_UNREAD_LEDGER:
+            self._held_unread.add(record.key)
+        else:
+            # Too many to track: counted, perhaps twice; reporting more is safe.
+            self._untracked_unread = min(self._untracked_unread + 1, MAX_COUNTER)
+
+    def _note_acknowledged(self, record: DeliveryRecord) -> None:
+        if not self._suppression_read and record.kind is DeliveryKind.SUMMARY and record.covers:
+            self._acknowledged_unread.setdefault(record.event_id, record.covers)
+
+    def _forget_lost_summary(self, mono: float) -> None:
+        """Forget a summary in progress whose deliveries were lost; its count stands.
+
+        A corrupt database can keep the summary's id while losing its
+        deliveries, which would otherwise block every later summary.
+        """
+        event_id = self._suppression.summary_event_id
+        if event_id is None or any(key[0] == event_id for key in self._active):
+            return
+        self._suppression = replace(self._suppression, summary_event_id=None, summary_count=0)
+        if self._suppression.count:
+            self._summary_wanted_mono = mono
+        logger.warning(
+            "a summary in progress was lost with stored state; the count will be summarised again",
+            extra={"event": "delivery.summary_lost", "count": self._suppression.count},
+        )
 
     def _consume(self, mark: AttemptMark, mono: float) -> None:
         (self._live if mark.live else self._shadow).consume(mark.key, mono)
@@ -461,7 +532,6 @@ class DeliveryEngine:
                     continue
                 if len(self._active) >= self._limits.max_queue:
                     status = DeliveryStatus.SUPPRESSED
-                    self._count_suppressed()
                     held += 1
                 else:
                     status = DeliveryStatus.PENDING
@@ -479,6 +549,8 @@ class DeliveryEngine:
                     next_attempt_at=None if status.terminal else wall,
                 )
                 self._put(record, mono)
+                if status is DeliveryStatus.SUPPRESSED:
+                    self._count_suppressed(record)
                 if len(self._records) > self._limits.max_records + self._limits.max_queue:
                     self._prune_memory()
         if held:
@@ -599,7 +671,8 @@ class DeliveryEngine:
         ):
             report.reconciled += 1
             return
-        if record.attempts >= self._retry.max_attempts:
+        if record.attempts >= self._retry.max_attempts and not record.recovered:
+            # A delivery recovered from a corrupt row is owed one retry first.
             self._finish(record, DeliveryStatus.FAILED)
             report.failed += 1
             logger.error(
@@ -615,7 +688,7 @@ class DeliveryEngine:
         if live and not self._live.available(mono):
             self._finish(record, DeliveryStatus.SUPPRESSED)
             if record.kind is DeliveryKind.EVENT:
-                self._count_suppressed()
+                self._count_suppressed(record)
             report.suppressed += 1
             return
         in_flight = self._begin_attempt(record, report, live=live)
@@ -633,6 +706,7 @@ class DeliveryEngine:
             record,
             status=DeliveryStatus.IN_FLIGHT,
             attempts=record.attempts + 1,
+            recovered=False,
             last_attempt_at=wall,
             next_attempt_at=None,
             updated_at=wall,
@@ -641,9 +715,8 @@ class DeliveryEngine:
         self._put(in_flight, mono)
         if live:
             self._new_attempts.append(mark)
-            if self._make_durable(in_flight):
-                report.sent += 1
-            else:
+            report.sent += 1
+            if not self._make_durable(in_flight):
                 report.sent_unrecorded += 1
             self._consume(mark, mono)
         else:
@@ -679,7 +752,8 @@ class DeliveryEngine:
     def _storage_notice(self, report: RunReport) -> None:
         """Tell the system recipients, in order, that storage is failing.
 
-        At most one notice per :data:`NOTICE_INTERVAL`, remembered in storage
+        At most one notice per :data:`NOTICE_INTERVAL`, counted from its
+        first provider call and remembered in storage
         when anything can record it. Recipients are tried in order (live ones
         first) until one reports the notice delivered or its outcome is
         unknown; only a definite failure moves on to the next. The notice
@@ -697,7 +771,6 @@ class DeliveryEngine:
                 return
             digest = hashlib.sha256(f"notice|{encode_time(wall)}|{mono!r}".encode()).hexdigest()
             self._notice = _NoticeEpisode(f"notice_{digest[:32]}", tuple(routes))
-            self._notice_mono = mono
         episode = self._notice
         while episode.position < len(episode.routes):
             route = episode.routes[episode.position]
@@ -714,6 +787,9 @@ class DeliveryEngine:
                 created_at=wall,
                 updated_at=wall,
             )
+            if not episode.started:
+                episode.started = True
+                self._notice_mono = mono
             in_flight = self._begin_attempt(record, report, live=live)
             result = self._send(
                 self._provider_for(route),
@@ -856,7 +932,8 @@ class DeliveryEngine:
 
     # Suppression and summaries --------------------------------------------
 
-    def _count_suppressed(self) -> None:
+    def _count_suppressed(self, record: DeliveryRecord) -> None:
+        self._note_held(record)
         state = self._suppression
         self._suppression = replace(
             state,
@@ -930,6 +1007,7 @@ class DeliveryEngine:
         if record.event_id != state.summary_event_id:
             return
         if record.status is DeliveryStatus.DELIVERED and state.summary_count:
+            self._note_acknowledged(record)
             remaining = max(state.count - record.covers, 0)
             state = replace(
                 state,

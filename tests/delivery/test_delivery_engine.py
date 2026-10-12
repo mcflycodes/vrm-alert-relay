@@ -436,7 +436,7 @@ def test_durable_accounting_recovers_at_the_next_run(
     (tmp_path / "relay-state.journal").mkdir()  # the journal is unusable too
     engine.accept_cycle(rule_states={}, notifications=[rule_note(1)])
     report = engine.run_due()
-    assert (report.sent, report.sent_unrecorded) == (0, 2)  # alert and notice, sent anyway (R1)
+    assert (report.sent, report.sent_unrecorded) == (2, 2)  # alert and notice, sent anyway (R1)
     assert engine.health().durable_accounting is False
     (tmp_path / "relay-state.journal").rmdir()
     switch.on = False

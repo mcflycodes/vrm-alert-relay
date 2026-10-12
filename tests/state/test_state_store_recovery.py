@@ -5,11 +5,15 @@ Every identifier here is fictitious.
 
 from __future__ import annotations
 
+import errno
+import logging
+import os
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pytest
 
@@ -28,9 +32,6 @@ from vrm_alert_relay.state import (
     UnsafeStateError,
 )
 from vrm_alert_relay.state import store as store_module
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 BASE = datetime(2035, 1, 1, tzinfo=UTC)
 
@@ -281,10 +282,10 @@ def test_quarantine_names_never_collide_and_failures_keep_the_file(
     (tmp_path / DB_FILENAME).unlink(missing_ok=True)
     (tmp_path / DB_FILENAME).write_bytes(b"not a database" * 64)
 
-    def refuse(self: Path, target: Path) -> Path:
-        raise PermissionError(13, "Permission denied")
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise PermissionError(errno.EACCES, "Permission denied")
 
-    monkeypatch.setattr(type(tmp_path), "replace", refuse)
+    monkeypatch.setattr(store_module.os, "link", refuse)
     store = StateStore(tmp_path)
     snapshot = store.load(BASE)
     assert not snapshot.reset
@@ -351,13 +352,7 @@ def test_quarantine_moves_the_sidecars_with_the_database(tmp_path: Path) -> None
     (tmp_path / DB_FILENAME).write_bytes(b"not a database" * 64)
     (tmp_path / f"{DB_FILENAME}-wal").write_bytes(b"wal frames")
 
-    def not_a_database(path: Path) -> sqlite3.Connection:
-        # As SQLite reports it, but before SQLite could tidy the sidecars away.
-        error = sqlite3.DatabaseError("file is not a database")
-        error.sqlite_errorcode = 26
-        raise error
-
-    store = StateStore(tmp_path, connect=not_a_database)
+    store = StateStore(tmp_path, connect=_not_a_database)
     assert store.load(BASE).reset
     [moved_wal] = tmp_path.glob(f"{DB_FILENAME}.corrupt-*-wal")
     assert moved_wal.read_bytes() == b"wal frames"
@@ -407,4 +402,93 @@ def test_old_notices_are_pruned_whatever_their_status(tmp_path: Path) -> None:
     store.close()
     store = StateStore(tmp_path)
     assert [r.event_id for r in store.load(BASE + timedelta(days=3)).deliveries] == ["evt_0001"]
+    store.close()
+
+
+def _not_a_database(path: Path) -> sqlite3.Connection:
+    # As SQLite reports it, but before SQLite could tidy the sidecars away.
+    error = sqlite3.DatabaseError("file is not a database")
+    error.sqlite_errorcode = 26  # type: ignore[attr-defined]
+    raise error
+
+
+STAMP = "20350101T000000000000Z"
+
+
+def test_quarantine_never_overwrites_an_earlier_sidecar(tmp_path: Path) -> None:
+    """M3: the name is clear for the database and every sidecar before anything moves."""
+    leftover = tmp_path / f"{DB_FILENAME}.corrupt-{STAMP}-wal"
+    leftover.write_bytes(b"earlier wal frames")
+    (tmp_path / DB_FILENAME).write_bytes(b"not a database" * 64)
+    (tmp_path / f"{DB_FILENAME}-wal").write_bytes(b"wal frames")
+    store = StateStore(tmp_path, connect=_not_a_database)
+    assert store.load(BASE).reset
+    assert leftover.read_bytes() == b"earlier wal frames"
+    assert (tmp_path / f"{DB_FILENAME}.corrupt-{STAMP}-1-wal").read_bytes() == b"wal frames"
+    assert (tmp_path / f"{DB_FILENAME}.corrupt-{STAMP}-1").read_bytes().startswith(b"not a")
+    assert not (tmp_path / f"{DB_FILENAME}.corrupt-{STAMP}").exists()
+    store.close()
+
+
+def test_without_hard_links_quarantine_renames_into_a_free_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unsupported(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(store_module.os, "link", unsupported)
+    leftover = tmp_path / f"{DB_FILENAME}.corrupt-{STAMP}-shm"
+    leftover.write_bytes(b"earlier shm")
+    (tmp_path / DB_FILENAME).write_bytes(b"not a database" * 64)
+    (tmp_path / f"{DB_FILENAME}-shm").write_bytes(b"shm")
+    store = StateStore(tmp_path, connect=_not_a_database)
+    assert store.load(BASE).reset
+    assert leftover.read_bytes() == b"earlier shm"
+    assert (tmp_path / f"{DB_FILENAME}.corrupt-{STAMP}-1").read_bytes().startswith(b"not a")
+    assert (tmp_path / f"{DB_FILENAME}.corrupt-{STAMP}-1-shm").read_bytes() == b"shm"
+    store.close()
+
+
+@pytest.mark.parametrize("hard_links", [True, False])
+def test_a_quarantine_move_never_replaces_a_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hard_links: bool
+) -> None:
+    """M3: a name taken after it was checked is refused, with or without hard links."""
+    if not hard_links:
+
+        def unsupported(*args: object, **kwargs: object) -> None:
+            raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+
+        monkeypatch.setattr(store_module.os, "link", unsupported)
+    source, taken = tmp_path / "source", tmp_path / "taken"
+    source.write_text("corrupt")
+    taken.write_text("earlier")
+    with pytest.raises(FileExistsError):
+        store_module._move_no_clobber(source, taken)
+    assert (source.read_text(), taken.read_text()) == ("corrupt", "earlier")
+
+
+def test_a_partial_quarantine_is_logged_and_leaves_the_store_unhealthy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """M3: when a later move fails, nothing is hidden and alerting continues."""
+    link = os.link
+
+    def refuse_the_database(source: Path, destination: Path, **kwargs: bool) -> None:
+        if Path(source).name == DB_FILENAME:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        link(source, destination, **kwargs)
+
+    monkeypatch.setattr(store_module.os, "link", refuse_the_database)
+    (tmp_path / DB_FILENAME).write_bytes(b"not a database" * 64)
+    (tmp_path / f"{DB_FILENAME}-wal").write_bytes(b"wal frames")
+    store = StateStore(tmp_path, connect=_not_a_database)
+    with caplog.at_level(logging.ERROR, logger="vrm_alert_relay.state"):
+        snapshot = store.load(BASE)
+    assert not snapshot.reset
+    assert not snapshot.complete
+    assert not store.healthy
+    partial = [r for r in caplog.records if r.__dict__.get("event") == "state.quarantine_partial"]
+    assert [r.__dict__["files"] for r in partial] == [[f"{DB_FILENAME}.corrupt-{STAMP}-wal"]]
+    assert (tmp_path / DB_FILENAME).read_bytes().startswith(b"not a database")
     store.close()

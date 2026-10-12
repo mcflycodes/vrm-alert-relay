@@ -27,11 +27,12 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import itertools
 import json
 import logging
 import os
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -132,6 +133,7 @@ _RUNTIME_FAILURES: Final = (
     StateLockedError,
 )
 _READ_ONLY_ERRNOS: Final = frozenset({errno.EROFS, errno.EACCES, errno.EPERM})
+_NO_HARD_LINKS: Final = frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.EMLINK, errno.ENOSYS})
 _SQLITE_CORRUPT: Final = 11
 _SQLITE_NOTADB: Final = 26
 _UTF8_MAX_BYTES: Final = 4
@@ -173,9 +175,11 @@ _DELIVERY_COLUMNS: Final = (
     ("last_attempt_at", MAX_TIME_LENGTH),
     ("provider_message_id", MAX_PROVIDER_MESSAGE_ID_LENGTH),
     ("covers", None),
+    ("recovered", None),
 )
 _DELIVERY_NAMES: Final = ", ".join(name for name, _ in _DELIVERY_COLUMNS)
 _DELIVERY_SELECT: Final = _bounded_select(_DELIVERY_COLUMNS)
+_DELIVERY_PLACEHOLDERS: Final = ", ".join("?" for _ in _DELIVERY_COLUMNS)
 _ATTEMPT_SELECT: Final = _bounded_select(
     (
         ("event_id", MAX_IDENTIFIER_LENGTH),
@@ -246,7 +250,10 @@ def _decode_delivery(row: tuple[object, ...]) -> DeliveryRecord:
         last_attempt_at,
         provider_message_id,
         covers,
+        recovered,
     ) = row
+    if recovered not in (0, 1):
+        raise InvalidRecordError("recovered must be 0 or 1")  # noqa: TRY003  # per-check validation message
     return DeliveryRecord(
         event_id=event_id,  # type: ignore[arg-type]  # validated by DeliveryRecord
         recipient=recipient,  # type: ignore[arg-type]  # validated by DeliveryRecord
@@ -261,6 +268,7 @@ def _decode_delivery(row: tuple[object, ...]) -> DeliveryRecord:
         last_attempt_at=decode_optional_time(last_attempt_at),
         provider_message_id=provider_message_id,  # type: ignore[arg-type]  # validated by DeliveryRecord
         covers=covers,  # type: ignore[arg-type]  # validated by DeliveryRecord
+        recovered=recovered == 1,
     )
 
 
@@ -279,6 +287,7 @@ def _encode_delivery(record: DeliveryRecord) -> tuple[object, ...]:
         None if record.last_attempt_at is None else encode_time(record.last_attempt_at),
         record.provider_message_id,
         record.covers,
+        int(record.recovered),
     )
 
 
@@ -320,6 +329,34 @@ def _decode_mark(row: tuple[object, ...]) -> AttemptMark:
     )
 
 
+def _move_no_clobber(source: Path, destination: Path) -> None:
+    """Rename ``source`` to ``destination``, never replacing an existing file.
+
+    A hard link fails if the destination exists. Where the filesystem has no
+    hard links, the name is checked and then renamed: the state directory is
+    private and locked, so only its owner could race the check.
+    """
+    try:
+        os.link(source, destination, follow_symlinks=False)
+    except OSError as exc:
+        if exc.errno not in _NO_HARD_LINKS:
+            raise
+        if os.path.lexists(destination):
+            raise FileExistsError(errno.EEXIST, "quarantine name already taken") from exc
+        source.rename(destination)
+        return
+    source.unlink()
+
+
+def _highest_attempts(marks: Iterable[AttemptMark]) -> dict[tuple[str, str], int]:
+    """The highest stored attempt number of each delivery."""
+    highest: dict[tuple[str, str], int] = {}
+    for mark in marks:
+        key = (mark.event_id, mark.recipient)
+        highest[key] = max(mark.attempt, highest.get(key, 0))
+    return highest
+
+
 def _newer(candidate: DeliveryRecord, existing: DeliveryRecord | None) -> bool:
     return existing is None or candidate.progress() > existing.progress()
 
@@ -355,6 +392,8 @@ class _Loaded:
     invalidated_rules: set[str] = field(default_factory=set)
     repaired: list[DeliveryRecord] = field(default_factory=list)
     delete_delivery_rows: list[int] = field(default_factory=list)
+    stored_held: set[tuple[str, str]] = field(default_factory=set)
+    stored_acknowledged: set[str] = field(default_factory=set)
     replace_attempt_rows: list[tuple[int, AttemptMark]] = field(default_factory=list)
     expired_attempt_rows: list[int] = field(default_factory=list)
     failures: list[BaseException] = field(default_factory=list)
@@ -501,6 +540,8 @@ class StateStore:
             complete=outcome is _Read.OK and self._journal_read,
             suppression=loaded.suppression,
             suppression_read=loaded.suppression_read,
+            stored_held=frozenset(loaded.stored_held),
+            stored_acknowledged=frozenset(loaded.stored_acknowledged),
             last_seen=loaded.last_seen,
             clock_moved_backwards=backwards,
             problems=loaded.problems,
@@ -520,13 +561,20 @@ class StateStore:
         prune = loaded.suppression_read and not (
             loaded.last_seen is not None and now < loaded.last_seen
         )
+        # Attempts first: a recovered delivery's next attempt is numbered past them.
         readers: tuple[tuple[str, Callable[[_Loaded], None]], ...] = (
+            ("load_attempts", partial(self._read_attempts, connection, now, prune=prune)),
             ("load_deliveries", partial(self._read_deliveries, connection, now)),
             ("load_rule_states", partial(self._read_rule_states, connection)),
-            ("load_attempts", partial(self._read_attempts, connection, now, prune=prune)),
         )
         for action, reader in readers:
             self._read_table(connection, loaded, action, reader)
+        # What SQLite itself holds, before the journal is merged in (see Snapshot).
+        for record in loaded.deliveries.values():
+            if record.kind is DeliveryKind.EVENT and record.status is DeliveryStatus.SUPPRESSED:
+                loaded.stored_held.add(record.key)
+            elif record.kind is DeliveryKind.SUMMARY and record.status is DeliveryStatus.DELIVERED:
+                loaded.stored_acknowledged.add(record.event_id)
         if not loaded.failures:
             return _Read.OK
         self._close_connection()
@@ -620,6 +668,7 @@ class StateStore:
             f"{select}WHERE status NOT IN ({_TERMINAL_IN}) ORDER BY rowid LIMIT ?",
             f"{select}WHERE status IN ({_TERMINAL_IN}) ORDER BY updated_at DESC LIMIT ?",
         )
+        highest: dict[tuple[str, str], int] | None = None
         for query in queries:
             for row in connection.execute(query, (*_TERMINAL, self._max_records * 2)):
                 rowid, *columns, oversize = row
@@ -629,20 +678,39 @@ class StateStore:
                     record = _decode_delivery(tuple(columns))
                 except (ValueError, TypeError):
                     loaded.problems += 1
-                    self._salvage(rowid, tuple(columns), now, loaded)
+                    if highest is None:
+                        highest = _highest_attempts(loaded.marks.values())
+                    self._salvage(rowid, tuple(columns), now, loaded, highest)
                     continue
                 loaded.deliveries[record.key] = record
 
     @staticmethod
-    def _salvage(rowid: int, columns: tuple[object, ...], now: datetime, loaded: _Loaded) -> None:
-        """Keep what an unreadable delivery row can still tell us."""
+    def _salvage(
+        rowid: int,
+        columns: tuple[object, ...],
+        now: datetime,
+        loaded: _Loaded,
+        highest: dict[tuple[str, str], int],
+    ) -> None:
+        """Keep what an unreadable delivery row can still tell us.
+
+        An unfinished delivery is marked recovered: it is owed one
+        reconcile-then-retry whatever its stored attempt count, and its count
+        is set past every stored attempt of it, so the retry's attempt record
+        is new evidence rather than a duplicate of an existing one.
+        """
         event_id, recipient, rule_id, kind, status, text, attempts = columns[:7]
-        created_at, _, _, last_attempt_at, provider_message_id, covers = columns[7:]
+        created_at, _, _, last_attempt_at, provider_message_id, covers = columns[7:13]
         parsed_status = _status_or_none(status)
         finished = parsed_status is not None and parsed_status.terminal
         rule = rule_id if is_identifier(rule_id) else None
         if is_identifier(event_id) and is_identifier(recipient):
-            count = attempts if isinstance(attempts, int) and is_counter(attempts) else 1
+            ceiling = MAX_ATTEMPTS if finished else MAX_ATTEMPTS - 1
+            count = (
+                attempts if isinstance(attempts, int) and is_counter(attempts, upper=ceiling) else 0
+            )
+            if not finished:
+                count = max(count, min(highest.get((str(event_id), str(recipient)), 0), ceiling))
             record = DeliveryRecord(
                 event_id=str(event_id),
                 recipient=str(recipient),
@@ -651,7 +719,7 @@ class StateStore:
                 # An unfinished record may have been sent: reconcile, then retry.
                 status=parsed_status if finished else DeliveryStatus.AMBIGUOUS,  # type: ignore[arg-type]
                 text=text[:MAX_MESSAGE_LENGTH] if isinstance(text, str) else UNREADABLE_TEXT,
-                attempts=min(max(count, 0 if finished else 1), MAX_ATTEMPTS),
+                attempts=count,
                 created_at=_time_or(created_at, now),
                 updated_at=now,
                 next_attempt_at=None if finished else now,
@@ -660,6 +728,7 @@ class StateStore:
                     str(provider_message_id) if is_message_id(provider_message_id) else None
                 ),
                 covers=covers if isinstance(covers, int) and is_counter(covers) else 0,
+                recovered=not finished,
             )
             loaded.deliveries[record.key] = record
             loaded.repaired.append(record)
@@ -817,26 +886,37 @@ class StateStore:
             self._fail("repair", exc)
 
     def _quarantine(self, now: datetime) -> bool:
-        """Move a corrupt database and its sidecars aside, keeping them; True if done."""
+        """Move a corrupt database and its sidecars aside, keeping them; True if done.
+
+        Every source is checked before anything moves, and the name chosen is
+        clear for the database and every sidecar. Each move refuses to replace
+        an existing file. A move that fails part way is logged and leaves the
+        store unhealthy; the database is then read again on the next cycle.
+        """
         self._close_connection()
-        stamp = now.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-        target = self._path.with_name(f"{DB_FILENAME}{QUARANTINE_INFIX}{stamp}")
-        suffix = 0
-        while target.exists() or target.is_symlink():
-            suffix += 1
-            target = self._path.with_name(f"{DB_FILENAME}{QUARANTINE_INFIX}{stamp}-{suffix}")
+        names = [DB_FILENAME + extra for extra in (*SIDECAR_SUFFIXES, "")]
+        moved: list[str] = []
         try:
             self._acquire()
-            secure_existing(self._path)
-            for extra in SIDECAR_SUFFIXES:
-                source = self._path.with_name(DB_FILENAME + extra)
-                secure_existing(source)
-                if source.exists():
-                    source.replace(target.with_name(target.name + extra))
-            self._path.replace(target)
+            for name in names:
+                secure_existing(self._directory / name)
+            target = self._quarantine_name(now)
+            for name in names:
+                source = self._directory / name
+                if os.path.lexists(source):
+                    destination = target.with_name(target.name + name.removeprefix(DB_FILENAME))
+                    _move_no_clobber(source, destination)
+                    moved.append(destination.name)
             self._sync_directory()
         except _RUNTIME_FAILURES as exc:
             self._fail("quarantine", exc)
+            if moved:
+                with suppress(OSError):
+                    self._sync_directory()
+                logger.error(  # noqa: TRY400  # _fail logged the failure itself
+                    "the corrupt database was only partly moved aside",
+                    extra={"event": "state.quarantine_partial", "files": moved},
+                )
             return False
         self._reset = True
         logger.error(
@@ -844,6 +924,20 @@ class StateStore:
             extra={"event": "state.quarantined", "file": target.name},
         )
         return True
+
+    def _quarantine_name(self, now: datetime) -> Path:
+        """A quarantine name that no file uses, with any sidecar suffix."""
+        stamp = now.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        base = f"{DB_FILENAME}{QUARANTINE_INFIX}{stamp}"
+        candidates = (base if n == 0 else f"{base}-{n}" for n in itertools.count())
+        return self._directory / next(
+            name
+            for name in candidates
+            if not any(
+                os.path.lexists(self._directory / (name + extra))
+                for extra in ("", *SIDECAR_SUFFIXES)
+            )
+        )
 
     # Writes -------------------------------------------------------------------
 
@@ -923,7 +1017,7 @@ class StateStore:
     ) -> None:
         connection.executemany(
             f"INSERT OR REPLACE INTO delivery ({_DELIVERY_NAMES}) "  # noqa: S608  # constant column list
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"VALUES ({_DELIVERY_PLACEHOLDERS})",
             [_encode_delivery(record) for record in records],
         )
 

@@ -16,6 +16,7 @@ from delivery_fakes import (
     FailSwitch,
     FakeClock,
     FakeProvider,
+    FakeReconcilingProvider,
     flaky_store,
     make_config,
     make_engine,
@@ -24,8 +25,18 @@ from delivery_fakes import (
 )
 
 from vrm_alert_relay.delivery import STORAGE_NOTICE_TEXT, SendResult, SendStatus
+from vrm_alert_relay.delivery import engine as engine_module
 from vrm_alert_relay.engine import RuleState
-from vrm_alert_relay.state import DB_FILENAME, JOURNAL_FILENAME, StateStore
+from vrm_alert_relay.state import (
+    DB_FILENAME,
+    JOURNAL_FILENAME,
+    Changes,
+    DeliveryKind,
+    DeliveryStatus,
+    JournalEntry,
+    StateStore,
+    SuppressionState,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -320,3 +331,285 @@ def test_a_database_found_corrupt_after_a_transient_failure_is_replaced(tmp_path
     store.close()
     engine = make_engine(StateStore(tmp_path), clock=clock, voipms=provider)
     assert engine.record(rule_note(1).event_id, "owner_sms") is not None  # rewritten afresh
+
+
+def _seed_pending_with_corrupt_attempts(tmp_path: Path, clock: FakeClock, *, marks: int) -> None:
+    """A pending delivery whose stored attempt count is out of bounds, after ``marks`` sends."""
+    seed = make_engine(StateStore(tmp_path), clock=clock)
+    seed.accept_cycle(rule_states={}, notifications=[rule_note(1)])
+    seed._store.close()
+    with closing(sqlite3.connect(tmp_path / DB_FILENAME, autocommit=True)) as connection:
+        connection.executemany(
+            "INSERT INTO send_attempt (event_id, recipient, attempt, at) VALUES (?, ?, ?, ?)",
+            [
+                (rule_note(1).event_id, "owner_sms", n, "2035-01-01T00:00:00.000000+00:00")
+                for n in range(1, marks + 1)
+            ],
+        )
+        connection.execute("UPDATE delivery SET attempts = 500")
+
+
+@pytest.mark.parametrize("reconciling", [False, True])
+def test_a_corrupt_unfinished_delivery_is_reconciled_then_retried(
+    tmp_path: Path, reconciling: bool
+) -> None:
+    """H1: an out-of-bounds attempt count never fails a delivery without a provider call."""
+    clock = FakeClock()
+    _seed_pending_with_corrupt_attempts(tmp_path, clock, marks=0)
+    provider = FakeReconcilingProvider() if reconciling else FakeProvider()
+    engine = make_engine(StateStore(tmp_path), clock=clock, voipms=provider)
+    report = engine.run_due()
+    assert provider.texts()[0] == "Freezer warming"
+    assert report.delivered >= 1
+    if reconciling:
+        assert len(provider.queries) == 1  # reconciled before the retry
+
+
+def test_a_recovered_delivery_keeps_its_retry_across_a_restart(tmp_path: Path) -> None:
+    """H1: the recovered mark is stored, and the retry is numbered past every stored attempt."""
+    clock = FakeClock()
+    _seed_pending_with_corrupt_attempts(tmp_path, clock, marks=3)
+    salvage = StateStore(tmp_path)
+    salvage.load(clock.now)  # salvages and writes the repair back, then stops
+    salvage.close()
+    provider = FakeProvider()
+    store = StateStore(tmp_path)
+    engine = make_engine(store, clock=clock, config=make_config(per_hour=5), voipms=provider)
+    engine.run_due()
+    assert provider.texts() == ["Freezer warming"]
+    store.close()
+    engine = make_engine(StateStore(tmp_path), clock=clock, config=make_config(per_hour=5))
+    assert engine.health().sent_last_hour == 4  # three stored sends and the retry, all kept
+
+
+def test_a_recovered_retry_is_bounded(tmp_path: Path) -> None:
+    """H1: the guaranteed retry is one attempt; past the ceiling it then fails."""
+    clock = FakeClock()
+    _seed_pending_with_corrupt_attempts(tmp_path, clock, marks=4)
+    provider = FakeProvider()
+    provider.script(SendResult(SendStatus.FAILED, retryable=True))
+    engine = make_engine(StateStore(tmp_path), clock=clock, voipms=provider)
+    engine.run_due()
+    clock.advance(timedelta(hours=1))
+    report = engine.run_due()
+    assert len(provider.sent) == 1
+    assert report.failed == 0  # it already failed at the end of the retry
+    record = engine.record(rule_note(1).event_id, "owner_sms")
+    assert record is not None
+    assert record.status is DeliveryStatus.FAILED
+
+
+@pytest.mark.parametrize("with_summary", [False, True])
+def test_suppression_unread_at_startup_is_merged_by_identity(
+    tmp_path: Path, with_summary: bool
+) -> None:
+    """M2: a held-back delivery stored in SQLite and repeated in the journal counts once,
+    and a summary stored as delivered is not subtracted again."""
+    clock = FakeClock()
+    config = make_config(per_hour=1)
+    store = StateStore(tmp_path)
+    seed = make_engine(store, clock=clock, config=config)
+    seed.accept_cycle(rule_states={}, notifications=[rule_note(n) for n in range(3)])
+    seed.run_due()  # one sent, two held back
+    held = [rule_note(n).event_id for n in (1, 2)]
+    if with_summary:
+        clock.advance(timedelta(hours=1, seconds=1))
+        seed.run_due()  # the summary reports both
+        seed.accept_cycle(rule_states={}, notifications=[rule_note(3)])
+        seed.run_due()  # held back: the summary took the slot
+        held.append(rule_note(3).event_id)
+    expected = 1 if with_summary else 2
+    assert seed.health().suppressed_pending == expected
+    # Everything reached SQLite, and the same changes were also journaled.
+    repeated = [seed.record(event, "owner_sms") for event in held]
+    repeated += [r for r in seed._records.values() if r.kind is DeliveryKind.SUMMARY]
+    assert store.journal(
+        tuple(JournalEntry(r, attempt=False) for r in repeated if r is not None), clock.now
+    )
+    store.close()
+
+    failing = {"on": True}
+
+    def connect(path: Path) -> sqlite3.Connection:
+        if failing["on"]:
+            raise sqlite3.OperationalError("database is locked")
+        return sqlite3.connect(path, autocommit=True)
+
+    store = StateStore(tmp_path, connect=connect)
+    engine = make_engine(store, clock=clock, config=config)
+    failing["on"] = False
+    engine.run_due()
+    assert engine.health().suppressed_pending == expected
+    store.close()
+
+
+def test_a_summary_lost_with_a_corrupt_database_is_opened_again(tmp_path: Path) -> None:
+    """M4: the stored summary id outlived its deliveries; the count is still summarised."""
+    provider = FakeProvider()
+    clock = _held_back_then_summary_attempted(tmp_path, FailSwitch(), provider)
+    with closing(sqlite3.connect(tmp_path / DB_FILENAME, autocommit=True)) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        root = connection.execute(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'delivery'"
+        ).fetchone()[0]
+        size = connection.execute("PRAGMA page_size").fetchone()[0]
+    with (tmp_path / DB_FILENAME).open("r+b") as handle:
+        handle.seek((root - 1) * size)
+        handle.write(b"\xa5" * size)
+    config = make_config(per_hour=1)
+    store = StateStore(tmp_path)
+    engine = make_engine(store, clock=clock, config=config, voipms=provider)
+    assert engine.health().suppressed_pending == 2
+    for _ in range(4):
+        clock.advance(timedelta(hours=1, seconds=1))
+        engine.run_due()
+    held_back = [text for text in summaries(provider) if text != STORAGE_NOTICE_TEXT]
+    assert held_back[-1] == (
+        "VRM Alert Relay: 2 alerts held back by the global rate limit since 2035-01-01 00:00 UTC."
+    )
+    assert len(held_back) == 2
+    assert engine.health().suppressed_pending == 0
+    store.close()
+
+
+def test_a_delayed_storage_notice_waits_a_day_from_when_it_was_sent(tmp_path: Path) -> None:
+    """L5: the notice interval starts at the first provider call, not when it was due."""
+    clock = FakeClock()
+    switch = FailSwitch(error="disk I/O error", only="FROM send_attempt")
+    switch.on = True
+    provider = FakeProvider()
+    config = make_config(per_hour=2, per_day=2)
+    engine = make_engine(flaky_store(tmp_path, switch), clock=clock, config=config, voipms=provider)
+    engine.accept_cycle(rule_states={}, notifications=[rule_note(1), rule_note(2)])
+    engine.run_due()  # both alerts fill the day; the notice waits
+    assert STORAGE_NOTICE_TEXT not in provider.texts()
+    clock.advance(timedelta(days=1, seconds=1))
+    engine.run_due()
+    assert provider.texts().count(STORAGE_NOTICE_TEXT) == 1
+    clock.advance(timedelta(minutes=1))
+    engine.run_due()
+    assert provider.texts().count(STORAGE_NOTICE_TEXT) == 1
+    clock.advance(timedelta(days=1))
+    engine.run_due()
+    assert provider.texts().count(STORAGE_NOTICE_TEXT) == 2
+
+
+def test_sent_counts_every_real_call_and_unrecorded_is_a_subset(tmp_path: Path) -> None:
+    """L6: ``sent`` is every real provider call; ``sent_unrecorded`` those not recorded."""
+    clock = FakeClock()
+    switch = FailSwitch()
+    store = flaky_store(tmp_path, switch)
+    engine = make_engine(store, clock=clock)
+    engine.accept_cycle(rule_states={}, notifications=[rule_note(1)])
+    journal = tmp_path / JOURNAL_FILENAME
+    journal.mkdir()  # the journal cannot be written either
+    switch.on = True
+    report = engine.run_due()
+    assert (report.sent, report.sent_unrecorded) == (2, 2)  # the alert and the notice
+    journal.rmdir()
+    engine.accept_cycle(rule_states={}, notifications=[rule_note(2)])
+    report = engine.run_due()
+    assert (report.sent, report.sent_unrecorded) == (1, 0)  # journaled, so recorded
+
+
+def _unreadable_until_switched(tmp_path: Path) -> tuple[StateStore, dict[str, bool]]:
+    failing = {"on": True}
+
+    def connect(path: Path) -> sqlite3.Connection:
+        if failing["on"]:
+            raise sqlite3.OperationalError("database is locked")
+        return sqlite3.connect(path, autocommit=True)
+
+    return StateStore(tmp_path, connect=connect), failing
+
+
+def test_a_summary_opened_while_the_counts_were_unread_settles_them(tmp_path: Path) -> None:
+    """M2: a summary this process started is kept through the merge, and the delivery it
+    reports, stored in SQLite and repeated in the journal, is not left over afterwards."""
+    clock = FakeClock()
+    config = make_config(per_hour=1)
+    store = StateStore(tmp_path)
+    seed = make_engine(store, clock=clock, config=config)
+    seed.accept_cycle(rule_states={}, notifications=[rule_note(0), rule_note(1)])
+    seed.run_due()  # one sent, one held back
+    held = seed.record(rule_note(1).event_id, "owner_sms")
+    assert held is not None
+    assert store.journal((JournalEntry(held, attempt=False),), clock.now)
+    store.close()
+    clock.advance(timedelta(hours=1, seconds=1))
+    provider = FakeProvider()
+    store, failing = _unreadable_until_switched(tmp_path)
+    engine = make_engine(store, clock=clock, config=config, voipms=provider)
+    provider.script(SendResult(SendStatus.FAILED, retryable=True))
+    engine.run_due()  # the summary starts while SQLite is unreadable, and stays open
+    failing["on"] = False
+    clock.advance(timedelta(hours=1, seconds=1))
+    engine.run_due()
+    held_back = [text for text in summaries(provider) if text != STORAGE_NOTICE_TEXT]
+    assert held_back == [held_back[0]] * 2  # the same summary, retried
+    assert engine.health().suppressed_pending == 0
+    store.close()
+
+
+def test_a_stored_summary_delivered_while_the_counts_were_unread_settles_them(
+    tmp_path: Path,
+) -> None:
+    """M2: the journal resumed the stored summary; delivering it settles the stored count."""
+    provider = FakeProvider()
+    switch = FailSwitch(only="INSERT")
+    clock = _held_back_then_summary_attempted(tmp_path, switch, provider)
+    store = StateStore(tmp_path)
+    engine = make_engine(store, clock=clock, config=make_config(per_hour=1))
+    [summary] = [r for r in engine._records.values() if r.kind is DeliveryKind.SUMMARY]
+    assert store.journal((JournalEntry(summary, attempt=False),), clock.now)
+    store.close()
+    store, failing = _unreadable_until_switched(tmp_path)
+    engine = make_engine(store, clock=clock, config=make_config(per_hour=1), voipms=provider)
+    clock.advance(timedelta(hours=1, seconds=1))
+    engine.run_due()  # the summary is delivered while SQLite is still unreadable
+    failing["on"] = False
+    clock.advance(timedelta(hours=1, seconds=1))
+    engine.run_due()
+    assert engine.health().suppressed_pending == 0
+    held_back = [text for text in summaries(provider) if text != STORAGE_NOTICE_TEXT]
+    assert len(held_back) == 2  # the failed attempt and its retry; nothing reported again
+    store.close()
+
+
+def test_held_back_deliveries_past_the_ledger_bound_are_still_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M2: beyond its bound the ledger counts without identities, erring towards more."""
+    monkeypatch.setattr(engine_module, "MAX_UNREAD_LEDGER", 1)
+    clock = FakeClock()
+    setup = StateStore(tmp_path)
+    setup.load(clock.now)
+    setup.close()
+    store, failing = _unreadable_until_switched(tmp_path)
+    engine = make_engine(store, clock=clock, config=make_config(per_hour=1))
+    engine.accept_cycle(rule_states={}, notifications=[rule_note(n) for n in range(4)])
+    engine.run_due()
+    assert engine.health().suppressed_pending == 3
+    failing["on"] = False
+    engine.run_due()
+    assert engine.health().suppressed_pending == 3
+    store.close()
+
+
+def test_a_lost_summary_with_nothing_held_back_is_simply_forgotten(tmp_path: Path) -> None:
+    """M4: a stored summary id with no deliveries and no count blocks nothing."""
+    clock = FakeClock()
+    store = StateStore(tmp_path)
+    store.load(clock.now)
+    assert store.flush(
+        Changes(suppression=SuppressionState(summary_event_id="sum_lost")), clock.now
+    )
+    store.close()
+    store = StateStore(tmp_path)
+    engine = make_engine(store, clock=clock, config=make_config(per_hour=1))
+    engine.accept_cycle(rule_states={}, notifications=[rule_note(n) for n in range(2)])
+    engine.run_due()
+    clock.advance(timedelta(hours=1, seconds=1))
+    engine.run_due()
+    assert engine.health().suppressed_pending == 0
+    store.close()

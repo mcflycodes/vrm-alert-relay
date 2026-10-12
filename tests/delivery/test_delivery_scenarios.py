@@ -466,7 +466,7 @@ def test_unrecordable_sends_still_go_out_with_one_notice_per_process_start(
                 )
                 with caplog.at_level(logging.ERROR, logger="vrm_alert_relay.delivery"):
                     report = engine.run_due()
-                assert (report.sent, report.sent_unrecorded) == (0, 2 + (cycle == 0))
+                assert (report.sent, report.sent_unrecorded) == (2 + (cycle == 0),) * 2
                 clock.advance(timedelta(minutes=1))
             assert engine.health().durable_accounting is False
             assert engine.health().sent_last_hour == 9  # the in-memory cap still counts

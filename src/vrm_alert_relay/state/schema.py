@@ -36,6 +36,7 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
             last_attempt_at TEXT,
             provider_message_id TEXT,
             covers INTEGER NOT NULL DEFAULT 0,
+            recovered INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (event_id, recipient)
         ) STRICT
         """,

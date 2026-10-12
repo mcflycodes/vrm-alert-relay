@@ -62,6 +62,7 @@ def test_valid_record_has_a_key() -> None:
         ("provider_message_id", "id\x1b[0m"),
         ("provider_message_id", 7),
         ("covers", -1),
+        ("recovered", 1),
         ("covers", True),
     ],
 )
