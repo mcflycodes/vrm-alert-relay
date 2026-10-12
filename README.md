@@ -51,7 +51,7 @@ Then follow [docs/deploy-docker.md](docs/deploy-docker.md): it copies [compose.e
 
 ## Development
 
-The service is written in Python 3.13 and packaged as a distroless, non-root container image. With [uv](https://docs.astral.sh/uv/) installed:
+The service is written in Python 3.13 and packaged as a minimal, non-root container image built from [Wolfi](https://github.com/wolfi-dev) packages, with no shell or package manager. With [uv](https://docs.astral.sh/uv/) installed:
 
 ```sh
 uv sync

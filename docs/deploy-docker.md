@@ -1,6 +1,6 @@
 # Deploying with Docker Compose
 
-**Updated:** 2026-10-11
+**Updated:** 2026-10-12
 
 VRM Alert Relay is an unofficial, independent project. It is not affiliated with, sponsored by, or endorsed by Victron Energy.
 
@@ -28,6 +28,8 @@ tag="vrm-alert-relay:$(git describe --tags --always)"
 docker build --tag "$tag" .
 echo "$tag"
 ```
+
+The image is built from Wolfi packages, which are not version-pinned, so two builds of the same commit can differ in package versions. The image's SBOM (CI publishes one for every build) records the exact versions; rebuilding picks up the latest fixes.
 
 Once release images are published, use `ghcr.io/OWNER/vrm-alert-relay:VERSION` (the placeholder in the Compose file), ideally pinned by digest, instead of building.
 
