@@ -1,6 +1,6 @@
 [project]
 name = "vrm-alert-relay"
-version = "0.1.0.dev0"
+version = "0.1.0rc1"
 description = "Unofficial stateful alert escalation and notification relay for Victron VRM measurements."
 readme = "README.md"
 license = "MIT"

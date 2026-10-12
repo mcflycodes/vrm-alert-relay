@@ -6,21 +6,39 @@ description: >-
 
 inputs:
   image:
-    description: Local image reference to scan.
-    required: true
+    description: Local image reference to scan. Give this or input, not both.
+    required: false
+    default: ""
+  input:
+    description: Path to an OCI image layout holding one image to scan. Give this or image, not both.
+    required: false
+    default: ""
 
 runs:
   using: composite
   steps:
+    - name: Check inputs
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        INPUT: ${{ inputs.input }}
+      run: |
+        if [[ -z "$IMAGE" && -z "$INPUT" || -n "$IMAGE" && -n "$INPUT" ]]; then
+          echo "::error::scan-image needs exactly one of image and input"
+          exit 1
+        fi
+
     # Non-blocking: lists fixed and unfixed findings so unfixed ones stay visible.
     - name: Report all HIGH and CRITICAL findings
       shell: bash
       env:
         IMAGE: ${{ inputs.image }}
+        INPUT: ${{ inputs.input }}
       run: |
+        if [[ -n "$IMAGE" ]]; then target=("$IMAGE"); else target=(--input "$INPUT"); fi
         report="$RUNNER_TEMP/trivy-report.json"
         if ! "$RUNNER_TEMP/trivy" image --no-progress --severity HIGH,CRITICAL \
-            --format json --output "$report" "$IMAGE"; then
+            --format json --output "$report" "${target[@]}"; then
           echo "::warning::Trivy report scan failed; the blocking scan still runs"
           exit 0
         fi
@@ -49,6 +67,8 @@ runs:
       shell: bash
       env:
         IMAGE: ${{ inputs.image }}
+        INPUT: ${{ inputs.input }}
       run: |
+        if [[ -n "$IMAGE" ]]; then target=("$IMAGE"); else target=(--input "$INPUT"); fi
         "$RUNNER_TEMP/trivy" image --no-progress --severity HIGH,CRITICAL \
-          --ignore-unfixed --exit-code 1 "$IMAGE"
+          --ignore-unfixed --exit-code 1 "${target[@]}"
