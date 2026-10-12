@@ -9,7 +9,7 @@ import socket
 from typing import TYPE_CHECKING
 
 import pytest
-from app_helpers import CABIN_SITE, OWNER_PHONE, SECRETS
+from app_helpers import CABIN_SITE, OWNER_PHONE, SECRETS, FakeStop
 
 from vrm_alert_relay.app import HealthServer, HealthState
 from vrm_alert_relay.app.health import SCHEMA_VERSION
@@ -135,6 +135,7 @@ def test_service_health_binds_loopback_and_holds_no_secrets_or_recipients(
     assert document["monitoring"] == {
         "status": "ok",
         "cycles": 2,
+        "last_cycle_failed": False,
         "last_cycle_at": "2035-01-01T00:01:00+00:00",
         "last_successful_poll_at": "2035-01-01T00:01:00+00:00",
         "installations": 1,
@@ -197,3 +198,63 @@ def test_service_can_override_the_health_port(harness: Harness) -> None:
         service.start_health(port=0)
         assert service.health_server is not None
         assert request(service.health_server.address)[0] == 200
+
+
+def test_health_reports_starting_until_the_first_cycle_completes(
+    harness: Harness, free_port: int
+) -> None:
+    harness.write_config(health={"enabled": True, "port": free_port})
+    harness.vrm.set("tsT", 20, -20)
+    with harness.service() as service:
+        service.start_health()
+        assert service.health_server is not None
+        before = json.loads(request(service.health_server.address)[2])
+        service.run(FakeStop(limit=1), max_cycles=1)
+        after = json.loads(request(service.health_server.address)[2])
+
+    assert before["status"] == "starting"
+    assert before["monitoring"]["cycles"] == 0
+    assert after["status"] == "ok"
+
+
+def test_a_first_cycle_that_raises_reports_degraded_never_ok(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness.write_config()
+    harness.vrm.set("tsT", 20, -20)
+    with harness.service() as service:
+        real = service.relay.run_cycle
+        calls: list[int] = []
+
+        def first_fails() -> object:
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("cycle bug")
+            return real()
+
+        monkeypatch.setattr(service.relay, "run_cycle", first_fails)
+        service.run(FakeStop(limit=1), max_cycles=1)
+        failed = json.loads(service.health_state.body())
+        service.run(FakeStop(limit=1), max_cycles=1)
+        recovered = json.loads(service.health_state.body())
+
+    assert failed["status"] == "degraded"
+    assert failed["monitoring"]["last_cycle_failed"] is True
+    assert failed["monitoring"]["cycles"] == 0
+    assert recovered["status"] == "ok"
+    assert recovered["monitoring"]["last_cycle_failed"] is False
+
+
+def test_failing_persistence_before_the_first_cycle_is_degraded_not_starting(
+    harness: Harness,
+) -> None:
+    harness.write_config()
+    real = harness.root / "real-state"
+    real.mkdir(mode=0o700)
+    link = harness.root / "linked-state"
+    link.symlink_to(real)
+    with harness.service(state_dir=link) as service:
+        service.publish_health()
+        document = json.loads(service.health_state.body())
+
+    assert document["status"] == "degraded"

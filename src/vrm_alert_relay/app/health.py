@@ -49,19 +49,32 @@ def health_document(
     dry_run: bool,
     status: RelayStatus,
     delivery: DeliveryHealth,
+    cycle_failed: bool = False,
 ) -> dict[str, object]:
-    """The health document; see docs/operations.md for the schema."""
-    monitoring_ok = status.degraded == 0
+    """The health document; see docs/operations.md for the schema.
+
+    ``status`` is ``degraded`` when the latest cycle raised, an installation is
+    degraded, or state persistence is not healthy and durable; otherwise
+    ``starting`` until the first cycle completes, then ``ok``.
+    """
+    monitoring_ok = status.degraded == 0 and not cycle_failed
     persistence_ok = delivery.persistence_healthy and delivery.durable_accounting
+    if not (monitoring_ok and persistence_ok):
+        overall = "degraded"
+    elif status.cycles == 0:
+        overall = "starting"
+    else:
+        overall = "ok"
     return {
         "schema": SCHEMA_VERSION,
-        "status": "ok" if monitoring_ok and persistence_ok else "degraded",
+        "status": overall,
         "version": version,
         "dry_run": dry_run,
         "started_at": _time(status.started_at),
         "monitoring": {
             "status": "ok" if monitoring_ok else "degraded",
             "cycles": status.cycles,
+            "last_cycle_failed": cycle_failed,
             "last_cycle_at": _time(status.last_cycle_at),
             "last_successful_poll_at": _time(status.last_successful_poll_at),
             "installations": status.installations,

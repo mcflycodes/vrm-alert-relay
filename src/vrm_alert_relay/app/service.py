@@ -201,6 +201,16 @@ class Service:
         self.health_state = HealthState()
         self.health_server: HealthServer | None = None
         self.dry_run = not self.config.live_providers()
+        self._cycle_failed = False
+
+    def run_cycle(self) -> None:
+        """Run one cycle, remembering whether it raised (for health)."""
+        try:
+            self.relay.run_cycle()
+        except BaseException:
+            self._cycle_failed = True
+            raise
+        self._cycle_failed = False
 
     def publish_health(self) -> None:
         self.health_state.publish(
@@ -209,6 +219,7 @@ class Service:
                 dry_run=self.dry_run,
                 status=self.relay.status,
                 delivery=self.runtime.delivery.health(),
+                cycle_failed=self._cycle_failed,
             )
         )
 
@@ -258,7 +269,7 @@ class Service:
         if rng is not None:
             scheduler_options["rng"] = rng
         scheduler = Scheduler(
-            self.relay.run_cycle,
+            self.run_cycle,
             interval=float(self.config.vrm.poll_interval),
             stop=stop,
             after_cycle=self.publish_health,

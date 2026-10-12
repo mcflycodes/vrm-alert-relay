@@ -21,11 +21,19 @@ vrm-alert-relay --version
 | State directory | `--state-dir` | `VRM_ALERT_RELAY_STATE_DIR` | `/var/lib/vrm-alert-relay` |
 | Log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) | `--log-level` | `VRM_ALERT_RELAY_LOG_LEVEL` | `INFO` |
 
-A flag wins over its environment variable. The state directory must be on a local filesystem and writable only by the relay user (ADR 0002). The container image runs `run` by default.
+A flag wins over its environment variable. The container image runs `run` by default.
 
 - **`run`** starts the relay. It logs one JSON object per line to standard output, starting with a `service.started` record whose `dry_run` field is `true` unless some provider is live. `--once` runs a single poll cycle and exits, which is useful for a first test of a new configuration.
 - **`check-config`** validates the configuration and the secret files it references, without contacting any service, and prints a report. Recipient names that look like phone numbers (five or more digits) are shown by position, such as `[#3]`, everywhere the relay prints or logs a recipient name. `--structure-only` skips the secret files; its result is never "ready".
 - **`test-notification --recipient NAME`** sends one test message to one configured recipient and prints the outcome. It sends only when you run it, goes through the delivery engine like any alert (so the global cap, dry-run routing, attempt records and reconciliation all apply), and sends nothing else that is waiting. While sending is disabled for the recipient's provider, the message is only written to the log. It needs the state directory, so stop the relay first: a running relay holds the directory's lock.
+
+### The state directory
+
+The state directory must be on a local filesystem, owned by the relay user and writable by nobody else (ADR 0002). The image runs as UID and GID 65532 and ships `/var/lib/vrm-alert-relay` owned by `65532:65532` with mode `0700`.
+
+- **Named volume (recommended):** mount it at `/var/lib/vrm-alert-relay`. Docker initialises a new named volume from the image, so it starts with the right owner and mode.
+- **Bind mount:** Docker does not change a host directory's ownership. Create it first and give it to UID 65532, for example `install -d -o 65532 -g 65532 -m 0700 /srv/vrm-alert-relay/state`. If you run the container with another `--user`, the directory must belong to that UID instead.
+- A directory the relay cannot write leaves it running and alerting from memory, with `state_persistence.healthy` false and a storage notice to the system recipients. A directory that group or others can write draws a warning in the log.
 
 ### Exit codes
 
@@ -53,7 +61,7 @@ Cycles start the configured `vrm.poll_interval` apart, plus up to 10% random jit
 
 A failure inside a cycle never stops the relay. An unexpected error from the poll counts as a failed poll of every installation; an error evaluating one rule is retried from fresh rule state (which may repeat an active alert, never lose one); an error rendering a level message falls back to the default text.
 
-A rule that has never had a sample reports stale data on its first cycle without one, as the rules engine defines it, and reports "data restored" when samples arrive.
+A rule that has never had a usable sample reports neither stale data nor its restoration: until its first sample it is not evaluated without one, and acquisition problems are reported by the installation's monitor instead. A fresh installation with VRM unreachable therefore sends only "monitoring degraded". From its first sample on (remembered in the rule's stored state, so across restarts too), a rule reports stale data when its newest sample is older than `stale_after_minutes`, and "data restored" when samples return.
 
 **Shutdown:** SIGTERM or SIGINT lets the cycle in progress finish (its HTTP calls are bounded by timeouts), then the relay stops the health endpoint, writes pending state and closes the state store.
 
@@ -73,13 +81,13 @@ An installation becomes **degraded**:
 
 It is **restored** by the first poll that fetches it with every measurement usable.
 
-One "degraded" goes out per outage and one "restored" when it ends. The outage is stored as the monitor's rule state (key `monitoring:<installation>`), so a restart during an outage neither sends "degraded" again nor forgets to send "restored". A new outage that starts within 15 minutes of the last "degraded" is announced only if it is still open when those 15 minutes are up, which bounds a flapping connection. Both notifications count against the global cap like any message.
+One "degraded" goes out per outage and one "restored" when it ends. Both the outage (key `monitoring:<installation>`) and the failure streak behind it (key `monitoring-streak:<installation>`: the count of consecutive failed polls, at most 1,000,000, and the time of the first) are stored, so a restart neither sends "degraded" again, nor forgets to send "restored", nor restarts the count: a restart between the first and second failed poll still reports the outage on the second, with the first failure's time. If the stored streak cannot be read, it counts as one failure already seen, so the next failed poll reports the outage. A new outage that starts within 15 minutes of the last "degraded" is announced only if it is still open when those 15 minutes are up, which bounds a flapping connection. Both notifications count against the global cap like any message.
 
 ## Health endpoint
 
 Enable it with `health.enabled: true`. It listens on `health.bind` (default `127.0.0.1`, loopback) and `health.port` (default 8080). `check-config` warns when the address is not loopback. If the port cannot be bound, the relay logs an error and keeps running without it.
 
-`GET /health` (or `/`) returns a small JSON document, always with status 200: the endpoint is informational, not a gate. `HEAD` returns the headers only, other paths 404, other methods 501. No CORS headers are sent and requests are not logged. The document holds no secrets, recipient names or addresses, installation or site ids, or message text. It is refreshed after every cycle; before the first cycle it reads `{"schema": 1, "status": "starting"}`.
+`GET /health` (or `/`) returns a small JSON document, always with status 200: the endpoint is informational, not a gate. `HEAD` returns the headers only, other paths 404, other methods 501. No CORS headers are sent and requests are not logged. The document holds no secrets, recipient names or addresses, installation or site ids, or message text. It is refreshed after every cycle. Its `status` is `starting` until the first cycle completes, and never `ok` before then.
 
 ```json
 {
@@ -91,6 +99,7 @@ Enable it with `health.enabled: true`. It listens on `health.bind` (default `127
   "monitoring": {
     "status": "ok",
     "cycles": 42,
+    "last_cycle_failed": false,
     "last_cycle_at": "2026-01-15T12:41:03+00:00",
     "last_successful_poll_at": "2026-01-15T12:41:03+00:00",
     "installations": 1,
@@ -117,7 +126,9 @@ Enable it with `health.enabled: true`. It listens on `health.bind` (default `127
 
 | Field | Meaning |
 |---|---|
-| `status` | `ok`, or `degraded` when any installation is degraded or state persistence is not healthy and durable. |
+| `status` | `degraded` when the latest cycle failed, any installation is degraded, or state persistence is not healthy and durable; otherwise `starting` until the first cycle completes, then `ok`. |
+| `monitoring.cycles` | Cycles completed since the relay started. |
+| `monitoring.last_cycle_failed` | Whether the latest cycle stopped with an unexpected error. |
 | `dry_run` | `true` when no provider is live. |
 | `monitoring.last_successful_poll_at` | The last cycle in which every installation was fetched (measurement problems aside). |
 | `monitoring.failing_installations` | Installations whose last poll failed. |

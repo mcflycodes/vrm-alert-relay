@@ -21,6 +21,7 @@ from app_helpers import (
 )
 
 from vrm_alert_relay.delivery import STORAGE_NOTICE_TEXT
+from vrm_alert_relay.engine import RuleState
 
 if TYPE_CHECKING:
     import httpx
@@ -189,9 +190,13 @@ def test_non_numeric_vrm_values_count_as_measurement_problems(harness: Harness) 
     with harness.service() as service:
         harness.cycle(service, 3)
 
-    texts = harness.voipms.texts()
-    assert any(text.startswith("Stale data: freezer at cabin") for text in texts)
-    assert sum(DEGRADED in text for text in texts) == 1
+    # The rule never had a usable sample, so only the monitor reports it.
+    assert harness.voipms.texts() == [
+        (
+            "VRM Alert Relay: monitoring of cabin is degraded since 2035-01-01 00:00 UTC; "
+            "alerts may be delayed or missed"
+        )
+    ]
 
 
 def test_vrm_outage_sends_one_degraded_and_one_restored_across_a_restart(
@@ -233,12 +238,9 @@ def test_restart_after_an_outage_ended_sends_the_restored_notice(harness: Harnes
     with harness.service() as service:
         harness.cycle(service, 2)
 
-    texts = monitoring_texts(harness)
+    texts = harness.voipms.texts()
     assert [DEGRADED in t for t in texts] == [True, False]
     assert RESTORED in texts[1]
-    # A rule that never had a sample reports stale data, and then its restoration.
-    assert harness.voipms.texts()[0].startswith("Stale data: freezer at cabin")
-    assert any(t.startswith("Data restored: freezer") for t in harness.voipms.texts())
 
 
 def test_flapping_vrm_is_bounded_by_the_monitor_cooldown(harness: Harness) -> None:
@@ -381,3 +383,156 @@ def test_log_output_never_holds_secrets_or_full_phone_numbers(
         rendered = f"{record.getMessage()} {record.__dict__}"
         assert not any(secret in rendered for secret in SECRETS)
         assert OWNER_PHONE not in rendered.replace("-", "")
+
+
+# Persisted failure streaks (monitoring across restarts) ---------------------------
+
+
+def restart_cycles(harness: Harness, count: int) -> None:
+    """Run ``count`` cycles, restarting the relay before each one."""
+    for _ in range(count):
+        with harness.service() as service:
+            harness.cycle(service)
+
+
+def test_a_restart_after_the_first_failed_poll_still_reports_the_outage(
+    harness: Harness,
+) -> None:
+    harness.write_config()
+    harness.vrm.set("tsT", 20, -20)
+    restart_cycles(harness, 1)
+    harness.vrm.fail(503)
+    restart_cycles(harness, 1)
+    assert monitoring_texts(harness) == []
+
+    restart_cycles(harness, 1)
+
+    assert monitoring_texts(harness) == [
+        (
+            "VRM Alert Relay: monitoring of cabin is degraded since 2035-01-01 00:01 UTC; "
+            "alerts may be delayed or missed"
+        )
+    ]
+
+
+def test_restarts_during_an_announced_outage_send_one_degraded_and_one_restored(
+    harness: Harness,
+) -> None:
+    harness.write_config()
+    harness.vrm.set("tsT", 20, -20)
+    restart_cycles(harness, 1)
+    harness.vrm.fail(503)
+    restart_cycles(harness, 6)
+    harness.vrm.heal()
+    restart_cycles(harness, 2)
+
+    texts = monitoring_texts(harness)
+    assert [DEGRADED in t for t in texts] == [True, False]
+    assert RESTORED in texts[1]
+    assert len(harness.voipms.texts()) == 2
+
+
+def test_restarts_during_cooldown_delayed_flapping_report_the_outage_once_it_is_due(
+    harness: Harness,
+) -> None:
+    harness.write_config()
+    harness.vrm.set("tsT", 20, -20)
+    restart_cycles(harness, 1)
+    harness.vrm.fail(503)
+    restart_cycles(harness, 2)  # degraded at 00:02
+    harness.vrm.heal()
+    restart_cycles(harness, 1)  # restored at 00:03
+    harness.vrm.fail(503)
+    restart_cycles(harness, 4)  # a new outage inside the 15-minute cooldown waits
+    assert [DEGRADED in t for t in monitoring_texts(harness)] == [True, False]
+
+    harness.clock.advance(timedelta(minutes=10))
+    restart_cycles(harness, 1)  # the cooldown is over and the outage is still open
+
+    texts = monitoring_texts(harness)
+    assert [DEGRADED in t for t in texts] == [True, False, True]
+    assert texts[2] == (
+        "VRM Alert Relay: monitoring of cabin is degraded since 2035-01-01 00:04 UTC; "
+        "alerts may be delayed or missed"
+    )
+
+
+def test_an_unreadable_stored_streak_reports_the_outage_on_the_next_failure(
+    harness: Harness,
+) -> None:
+    harness.write_config()
+    harness.vrm.set("tsT", 20, -20)
+    with harness.service() as service:
+        harness.cycle(service)
+        service.runtime.delivery.accept_cycle(
+            rule_states={"monitoring-streak:cabin": RuleState(newest_value=0.5)},
+            notifications=[],
+        )
+    harness.vrm.fail(503)
+
+    restart_cycles(harness, 1)
+
+    assert len(monitoring_texts(harness)) == 1
+
+
+# Rules that never had a sample -----------------------------------------------------
+
+
+def test_a_fresh_install_with_vrm_down_sends_only_the_monitoring_alert(harness: Harness) -> None:
+    harness.write_config()
+    harness.vrm.fail(503)
+    with harness.service() as service:
+        harness.cycle(service, 3)
+        harness.clock.advance(timedelta(hours=1))
+        harness.cycle(service, 2)
+
+    assert harness.voipms.texts() == [
+        (
+            "VRM Alert Relay: monitoring of cabin is degraded since 2035-01-01 00:00 UTC; "
+            "alerts may be delayed or missed"
+        )
+    ]
+
+
+def test_stale_data_is_reported_once_a_rule_has_had_a_sample(harness: Harness) -> None:
+    harness.write_config()
+    harness.vrm.set("tsT", 20, -20)
+    with harness.service() as service:
+        harness.cycle(service)
+        harness.vrm.values.clear()  # the measurement stops reporting
+        harness.clock.advance(timedelta(minutes=40))
+        harness.cycle(service)
+
+    texts = harness.voipms.texts()
+    assert texts[0] == (
+        "Stale data: freezer at cabin has had no new Fictitious tsT reading "
+        "since 2035-01-01 00:00 UTC"
+    )
+
+
+def test_a_restart_keeps_a_rule_observed(harness: Harness) -> None:
+    harness.write_config()
+    harness.vrm.set("tsT", 20, -20)
+    with harness.service() as service:
+        harness.cycle(service)
+    harness.vrm.fail(503)
+    harness.clock.advance(timedelta(minutes=40))
+    with harness.service() as service:
+        harness.cycle(service)
+
+    texts = harness.voipms.texts()
+    assert any(t.startswith("Stale data: freezer at cabin") for t in texts)
+    assert monitoring_texts(harness) == []  # one failed poll is not yet an outage
+
+
+def test_an_unusable_sample_leaves_a_rule_unobserved(harness: Harness) -> None:
+    harness.write_config()
+    # Accepted by the VRM adapter (within five minutes) but too far ahead for the engine.
+    harness.vrm.skew = timedelta(minutes=3)
+    harness.vrm.set("tsT", 20, -2)
+    with harness.service() as service:
+        harness.cycle(service)
+        state = service.runtime.delivery.rule_state("freezer")
+
+    assert harness.voipms.texts() == []
+    assert state == RuleState()

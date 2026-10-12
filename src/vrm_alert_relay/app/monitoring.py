@@ -10,6 +10,16 @@ recovery ("monitoring restored") when it ends, stable event identities so a
 restart mid-outage neither resends nor forgets, and a cooldown that bounds a
 flapping connection.
 
+The failure streak (how many consecutive polls failed, and when the first of
+them did) is stored too, under ``monitoring-streak:<id>``, so a restart
+between failed polls neither loses the outage nor its start time. It is kept
+in a :class:`~vrm_alert_relay.engine.RuleState` record that the engine never
+evaluates: ``newest_value`` holds the count (bounded by :data:`MAX_STREAK`)
+and ``newest_sample_time`` the time of the first failure. A streak record
+that cannot be read while the monitor itself has state counts as one failure
+already seen, so the next failed poll reports the outage (failures favour
+alerting).
+
 **What counts as a failed poll** (failures favour alerting, ADR 0002): any
 failure to fetch the installation's Diagnostics (authentication, rate
 limiting, unavailability, a bad or rejected response), including cycles in
@@ -32,7 +42,15 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Final
 
 from vrm_alert_relay.delivery import Notification, SystemTarget
-from vrm_alert_relay.engine import Direction, EventKind, LevelSpec, RuleSpec, Sample, evaluate
+from vrm_alert_relay.engine import (
+    Direction,
+    EventKind,
+    LevelSpec,
+    RuleSpec,
+    RuleState,
+    Sample,
+    evaluate,
+)
 from vrm_alert_relay.templates import NotificationKind, TemplateFields, render_notification
 from vrm_alert_relay.vrm import FailureKind
 
@@ -40,23 +58,29 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
     from datetime import datetime
 
-    from vrm_alert_relay.engine import RuleState
     from vrm_alert_relay.vrm import InstallationOutcome
 
 __all__ = [
     "DEGRADED_AFTER_CYCLES",
+    "MAX_STREAK",
     "MONITOR_COOLDOWN",
     "MONITOR_PREFIX",
+    "STREAK_PREFIX",
+    "MonitorCycle",
     "MonitoringTracker",
     "PollHealth",
+    "Streak",
     "assess",
     "monitor_id",
     "monitor_spec",
+    "streak_id",
 ]
 
 logger = logging.getLogger(__name__)
 
 MONITOR_PREFIX: Final = "monitoring:"
+STREAK_PREFIX: Final = "monitoring-streak:"
+MAX_STREAK: Final = 1_000_000
 DEGRADED_LEVEL: Final = "degraded"
 DEGRADED_AFTER_CYCLES: Final = 2
 MONITOR_COOLDOWN: Final = timedelta(minutes=15)
@@ -69,6 +93,10 @@ _NEVER_STALE: Final = timedelta(days=7)
 
 def monitor_id(installation: str) -> str:
     return f"{MONITOR_PREFIX}{installation}"
+
+
+def streak_id(installation: str) -> str:
+    return f"{STREAK_PREFIX}{installation}"
 
 
 def monitor_spec(installation: str) -> RuleSpec:
@@ -97,6 +125,49 @@ class PollHealth:
 HEALTHY: Final = PollHealth(failed=False)
 
 
+@dataclass(frozen=True, slots=True)
+class Streak:
+    """Consecutive failed polls of one installation, and when the first failed."""
+
+    count: int = 0
+    since: datetime | None = None
+
+    def to_state(self) -> RuleState:
+        return RuleState(newest_value=float(self.count), newest_sample_time=self.since)
+
+    @classmethod
+    def read(cls, stored: RuleState, monitor: RuleState, now: datetime) -> Streak:
+        """Decode a stored streak; an unreadable one counts as one failure seen."""
+        value = stored.newest_value
+        if value is None and monitor.generation is None:
+            return cls()  # Nothing stored yet: a fresh installation.
+        if value is None or not value.is_integer() or not 0 <= value <= MAX_STREAK:
+            logger.warning(
+                "stored monitoring streak is unreadable; counting one failure as seen",
+                extra={"event": "monitoring.streak_unreadable"},
+            )
+            return cls(1, now)
+        count = int(value)
+        if count == 0:
+            return cls()
+        since = stored.newest_sample_time
+        return cls(count, since if since is not None and since <= now else now)
+
+    def after(self, poll: PollHealth, now: datetime) -> Streak:
+        if not poll.failed:
+            return Streak()
+        return Streak(min(self.count + 1, MAX_STREAK), self.since or now)
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorCycle:
+    """One cycle's monitor results, keyed by installation id."""
+
+    states: dict[str, RuleState]
+    streaks: dict[str, RuleState]
+    notifications: list[Notification]
+
+
 def assess(outcome: InstallationOutcome | None) -> PollHealth:
     """Classify an installation's outcome; ``None`` means the poll itself failed."""
     if outcome is None:
@@ -115,14 +186,12 @@ def assess(outcome: InstallationOutcome | None) -> PollHealth:
 class MonitoringTracker:
     """Turns each cycle's poll health into monitor rule states and notifications.
 
-    Failure streaks live in memory; the open outage itself lives in the
-    monitor's stored rule state, so a restart keeps it.
+    The open outage lives in the monitor's stored rule state and the failure
+    streak in its stored streak record, so a restart keeps both.
     """
 
     def __init__(self, installations: Iterable[str]) -> None:
         self._specs = {name: monitor_spec(name) for name in installations}
-        self._streaks: dict[str, int] = dict.fromkeys(self._specs, 0)
-        self._since: dict[str, datetime] = {}
         self._degraded: set[str] = set()
         self._failing: set[str] = set()
 
@@ -144,54 +213,61 @@ class MonitoringTracker:
         self,
         health: Mapping[str, PollHealth],
         states: Mapping[str, RuleState],
+        streaks: Mapping[str, RuleState],
         now: datetime,
-    ) -> tuple[dict[str, RuleState], list[Notification]]:
+    ) -> MonitorCycle:
         """Evaluate every monitor for this cycle.
 
-        ``health`` and ``states`` are keyed by installation id; an installation
-        missing from ``health`` counts as a failed poll.
+        Every mapping is keyed by installation id. An installation missing
+        from ``health`` counts as a failed poll; one missing from ``states``
+        or ``streaks`` has nothing stored.
         """
-        new_states: dict[str, RuleState] = {}
-        notifications: list[Notification] = []
+        result = MonitorCycle(states={}, streaks={}, notifications=[])
         for name, spec in self._specs.items():
             poll = health.get(name, PollHealth(failed=True, reason="no_outcome"))
-            state = states[name]
-            degraded = self._update_streak(
-                name, poll, now, open_outage=state.active_level is not None
+            state = states.get(name, RuleState())
+            streak = Streak.read(streaks.get(name, RuleState()), state, now).after(poll, now)
+            degraded = poll.failed and (
+                poll.immediate
+                or state.active_level is not None
+                or streak.count >= DEGRADED_AFTER_CYCLES
             )
             new_state, events = evaluate(spec, state, Sample(1.0 if degraded else 0.0, now), now)
-            new_states[name] = new_state
-            if new_state.active_level is not None:
-                self._degraded.add(name)
-            else:
-                self._degraded.discard(name)
+            result.states[name] = new_state
+            result.streaks[name] = streak.to_state()
+            self._track(self._failing, name, active=poll.failed)
+            self._track(self._degraded, name, active=new_state.active_level is not None)
             for event in events:
-                notification = self._notification(name, event.kind, event.event_id, now, poll)
+                since = streak.since or now
+                notification = self._notification(
+                    name, event.kind, event.event_id, since=since, now=now, poll=poll
+                )
                 if notification is not None:
-                    notifications.append(notification)
-        return new_states, notifications
+                    result.notifications.append(notification)
+        return result
 
-    def _update_streak(
-        self, name: str, poll: PollHealth, now: datetime, *, open_outage: bool
-    ) -> bool:
-        if not poll.failed:
-            self._streaks[name] = 0
-            self._since.pop(name, None)
-            self._failing.discard(name)
-            return False
-        self._streaks[name] += 1
-        self._since.setdefault(name, now)
-        self._failing.add(name)
-        return poll.immediate or open_outage or self._streaks[name] >= DEGRADED_AFTER_CYCLES
+    @staticmethod
+    def _track(names: set[str], name: str, *, active: bool) -> None:
+        if active:
+            names.add(name)
+        else:
+            names.discard(name)
 
-    def _notification(
-        self, name: str, kind: EventKind, event_id: str, now: datetime, poll: PollHealth
+    @staticmethod
+    def _notification(  # noqa: PLR0913  # every field of the message is explicit
+        name: str,
+        kind: EventKind,
+        event_id: str,
+        *,
+        since: datetime,
+        now: datetime,
+        poll: PollHealth,
     ) -> Notification | None:
         if kind is EventKind.ESCALATED:
             fields = TemplateFields(
                 kind=NotificationKind.MONITORING_DEGRADED,
                 installation=name,
-                time=self._since.get(name, now),
+                time=since,
             )
             logger.error(
                 "monitoring is degraded",

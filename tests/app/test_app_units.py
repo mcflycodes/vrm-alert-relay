@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from app_helpers import START, freezer_rule
+from app_helpers import START, FakeStop, freezer_rule
 
 from vrm_alert_relay.app import (
     DEGRADED_AFTER_CYCLES,
@@ -21,7 +20,7 @@ from vrm_alert_relay.app import (
 )
 from vrm_alert_relay.app import relay as relay_module
 from vrm_alert_relay.app import service as service_module
-from vrm_alert_relay.app.monitoring import monitor_id
+from vrm_alert_relay.app.monitoring import MAX_STREAK, Streak, monitor_id
 from vrm_alert_relay.app.rules import poll_targets
 from vrm_alert_relay.app.scheduler import JITTER
 from vrm_alert_relay.config import Installation, Measurement, RelaySecrets, parse_config
@@ -47,25 +46,6 @@ FREEZER = Measurement(code="tsT", instance=20)
 
 
 # Scheduler -------------------------------------------------------------------
-
-
-@dataclass
-class FakeStop:
-    """Stops after ``limit`` waits; records how long each wait was."""
-
-    limit: int = 1_000
-    waits: list[float] = field(default_factory=list)
-    stopped: bool = False
-
-    def is_set(self) -> bool:
-        return self.stopped
-
-    def wait(self, timeout: float | None = None) -> bool:
-        assert timeout is not None
-        self.waits.append(timeout)
-        if len(self.waits) >= self.limit:
-            self.stopped = True
-        return self.stopped
 
 
 def test_scheduler_waits_the_interval_plus_jitter_between_cycle_starts() -> None:
@@ -190,16 +170,25 @@ def test_assess_classifies_outcomes() -> None:
         assert health == PollHealth(failed=True, immediate=immediate, reason=error.kind.value)
 
 
-def run_monitor(tracker: MonitoringTracker, polls: list[PollHealth]) -> tuple[RuleState, list[str]]:
-    state = RuleState()
+def run_monitor(
+    tracker: MonitoringTracker,
+    polls: list[PollHealth],
+    *,
+    restart_each: bool = False,
+    start: tuple[RuleState, RuleState] = (RuleState(), RuleState()),
+) -> tuple[RuleState, RuleState, list[str]]:
+    """Feed ``polls`` a minute apart; with ``restart_each`` a new tracker reads each one."""
+    state, streak = start
     texts: list[str] = []
     now = START
     for poll in polls:
-        states, notifications = tracker.observe({"cabin": poll}, {"cabin": state}, now)
-        state = states["cabin"]
-        texts.extend(n.text for n in notifications)
+        if restart_each:
+            tracker = MonitoringTracker(tracker.installations)
+        result = tracker.observe({"cabin": poll}, {"cabin": state}, {"cabin": streak}, now)
+        state, streak = result.states["cabin"], result.streaks["cabin"]
+        texts.extend(n.text for n in result.notifications)
         now += timedelta(minutes=1)
-    return state, texts
+    return state, streak, texts
 
 
 FAIL = PollHealth(failed=True, reason="unavailable")
@@ -207,7 +196,7 @@ OK = PollHealth(failed=False)
 
 
 def test_one_failed_poll_is_not_an_outage() -> None:
-    _, texts = run_monitor(MonitoringTracker(["cabin"]), [FAIL, OK, FAIL, OK])
+    _, _, texts = run_monitor(MonitoringTracker(["cabin"]), [FAIL, OK, FAIL, OK])
 
     assert texts == []
 
@@ -216,19 +205,36 @@ def test_a_streak_degrades_once_and_restores_once() -> None:
     tracker = MonitoringTracker(["cabin"])
     polls = [FAIL] * (DEGRADED_AFTER_CYCLES + 3) + [OK, OK]
 
-    state, texts = run_monitor(tracker, polls)
+    state, streak, texts = run_monitor(tracker, polls)
 
     assert len(texts) == 2
     assert "degraded since 2035-01-01 00:00 UTC" in texts[0]
     assert texts[1] == "VRM Alert Relay: monitoring of cabin is restored (2035-01-01 00:05 UTC)"
     assert state.active_level is None
+    assert Streak.read(streak, state, START) == Streak()
     assert tracker.degraded == frozenset()
     assert tracker.failing == frozenset()
 
 
+@pytest.mark.parametrize("restart_each", [False, True])
+def test_the_streak_and_its_start_survive_restarts(restart_each: bool) -> None:
+    polls = [FAIL] * DEGRADED_AFTER_CYCLES
+
+    _, streak, texts = run_monitor(MonitoringTracker(["cabin"]), polls, restart_each=restart_each)
+
+    assert texts == [
+        (
+            "VRM Alert Relay: monitoring of cabin is degraded since 2035-01-01 00:00 UTC; "
+            "alerts may be delayed or missed"
+        )
+    ]
+    assert streak.newest_value == DEGRADED_AFTER_CYCLES
+    assert streak.newest_sample_time == START
+
+
 def test_an_immediate_failure_degrades_at_once() -> None:
     tracker = MonitoringTracker(["cabin"])
-    _, texts = run_monitor(tracker, [PollHealth(failed=True, immediate=True, reason="auth")])
+    _, _, texts = run_monitor(tracker, [PollHealth(failed=True, immediate=True, reason="auth")])
 
     assert len(texts) == 1
     assert tracker.degraded == frozenset({"cabin"})
@@ -236,38 +242,97 @@ def test_an_immediate_failure_degrades_at_once() -> None:
 
 
 def test_an_open_outage_is_kept_after_a_restart() -> None:
-    state, texts = run_monitor(MonitoringTracker(["cabin"]), [FAIL, FAIL])
+    state, streak, texts = run_monitor(MonitoringTracker(["cabin"]), [FAIL, FAIL])
     assert len(texts) == 1
 
-    restarted = MonitoringTracker(["cabin"])
-    states, notifications = restarted.observe(
-        {"cabin": FAIL}, {"cabin": state}, START + timedelta(hours=1)
+    _, _, later = run_monitor(
+        MonitoringTracker(["cabin"]), [FAIL, FAIL, OK], restart_each=True, start=(state, streak)
     )
 
-    assert notifications == []
-    assert states["cabin"].active_level == "degraded"
+    assert later == ["VRM Alert Relay: monitoring of cabin is restored (2035-01-01 00:02 UTC)"]
 
 
 def test_a_missing_poll_outcome_counts_as_failed() -> None:
     tracker = MonitoringTracker(["cabin"])
-    state = RuleState()
+    state, streak = RuleState(), RuleState()
     for minute in range(DEGRADED_AFTER_CYCLES):
-        states, notifications = tracker.observe(
-            {}, {"cabin": state}, START + timedelta(minutes=minute)
+        result = tracker.observe(
+            {}, {"cabin": state}, {"cabin": streak}, START + timedelta(minutes=minute)
         )
-        state = states["cabin"]
+        state, streak = result.states["cabin"], result.streaks["cabin"]
 
-    assert len(notifications) == 1
+    assert len(result.notifications) == 1
     assert tracker.installations == ("cabin",)
+
+
+def test_missing_stored_states_mean_nothing_is_stored() -> None:
+    result = MonitoringTracker(["cabin"]).observe({"cabin": FAIL}, {}, {}, START)
+
+    assert result.notifications == []
+    assert result.streaks["cabin"].newest_value == 1
 
 
 def test_monitor_events_other_than_escalation_and_recovery_send_nothing() -> None:
     tracker = MonitoringTracker(["cabin"])
     # A stored monitor state marked stale makes the engine report "data restored".
-    states, notifications = tracker.observe({"cabin": OK}, {"cabin": RuleState(stale=True)}, START)
+    result = tracker.observe({"cabin": OK}, {"cabin": RuleState(stale=True)}, {}, START)
 
-    assert notifications == []
-    assert states["cabin"].stale is False
+    assert result.notifications == []
+    assert result.states["cabin"].stale is False
+
+
+SEEN = RuleState(generation=START.isoformat())
+"""A monitor that has been evaluated before."""
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        RuleState(),  # the record is missing although the monitor has state
+        RuleState(newest_value=1.5, newest_sample_time=START),
+        RuleState(newest_value=-1.0, newest_sample_time=START),
+        RuleState(newest_value=float(MAX_STREAK + 1), newest_sample_time=START),
+    ],
+)
+def test_an_unreadable_streak_counts_as_one_failure_seen(
+    stored: RuleState, caplog: pytest.LogCaptureFixture
+) -> None:
+    now = START + timedelta(hours=2)
+    with caplog.at_level(logging.WARNING):
+        assert Streak.read(stored, SEEN, now) == Streak(1, now)
+    assert "monitoring.streak_unreadable" in [getattr(r, "event", None) for r in caplog.records]
+
+
+def test_an_unreadable_streak_reports_the_outage_on_the_next_failed_poll() -> None:
+    corrupt = RuleState(newest_value=0.5)
+
+    _, _, texts = run_monitor(MonitoringTracker(["cabin"]), [FAIL], start=(SEEN, corrupt))
+
+    assert len(texts) == 1
+
+
+def test_a_fresh_installation_has_no_streak() -> None:
+    assert Streak.read(RuleState(), RuleState(), START) == Streak()
+
+
+@pytest.mark.parametrize(
+    ("since", "expected"),
+    [(None, START), (START + timedelta(days=1), START), (START - timedelta(hours=1), None)],
+)
+def test_a_streak_start_is_never_missing_or_in_the_future(
+    since: datetime | None, expected: datetime | None
+) -> None:
+    stored = RuleState(newest_value=3.0, newest_sample_time=since)
+
+    streak = Streak.read(stored, SEEN, START)
+
+    assert streak == Streak(3, expected or since)
+
+
+def test_a_streak_count_is_bounded() -> None:
+    stored = Streak(MAX_STREAK, START).to_state()
+
+    assert Streak.read(stored, SEEN, START).after(FAIL, START) == Streak(MAX_STREAK, START)
 
 
 # Rule bindings -------------------------------------------------------------------

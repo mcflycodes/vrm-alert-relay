@@ -87,6 +87,8 @@ class FakeVrm:
     extra_records: list[dict[str, object]] = field(default_factory=list)
     requests: list[httpx.Request] = field(default_factory=list)
     on_request: Callable[[], None] | None = None
+    skew: timedelta = timedelta(0)
+    """Added to every record's timestamp, as by a GX device with a wrong clock."""
 
     def set(
         self,
@@ -118,7 +120,7 @@ class FakeVrm:
         site = int(match.group(1))
         if site in self.failures:
             return respond(request, self.failures[site], {"success": False, "errors": "down"})
-        stamp = int(self.now().timestamp())
+        stamp = int((self.now() + self.skew).timestamp())
         records: list[dict[str, object]] = [
             {
                 "idSite": site,
@@ -306,3 +308,22 @@ class Harness:
         for _ in range(count):
             service.relay.run_cycle()
             self.clock.advance(CYCLE)
+
+
+@dataclass
+class FakeStop:
+    """Stops after ``limit`` waits; records how long each wait was."""
+
+    limit: int = 1_000
+    waits: list[float] = field(default_factory=list)
+    stopped: bool = False
+
+    def is_set(self) -> bool:
+        return self.stopped
+
+    def wait(self, timeout: float | None = None) -> bool:
+        assert timeout is not None
+        self.waits.append(timeout)
+        if len(self.waits) >= self.limit:
+            self.stopped = True
+        return self.stopped

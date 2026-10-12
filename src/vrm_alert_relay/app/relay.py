@@ -1,6 +1,13 @@
 """One poll cycle: poll, evaluate, render, hand over to delivery, deliver.
 
 :meth:`Relay.run_cycle` never sleeps; the scheduler decides when it runs.
+A rule that has never had a usable sample is not evaluated without one, and
+an evaluation that still leaves it unobserved is discarded, so it reports
+neither stale data nor its restoration: until its first sample, acquisition
+problems are reported by the installation's monitor instead. Once a rule has
+had a sample (``newest_sample_time`` in its stored state), it is evaluated
+every cycle and stale data is reported as the rules engine defines it.
+
 A failure in one stage is contained so the rest of the cycle still alerts:
 an exception from the poll counts as a failed poll of every installation,
 and an exception while evaluating or rendering one rule is retried with
@@ -17,7 +24,7 @@ from vrm_alert_relay.delivery import Notification
 from vrm_alert_relay.engine import RuleState, evaluate
 from vrm_alert_relay.templates import fields_for_event, render_notification
 
-from .monitoring import MonitoringTracker, PollHealth, assess, monitor_id
+from .monitoring import MonitoringTracker, PollHealth, assess, monitor_id, streak_id
 from .rules import RuleBinding, bind_rules, poll_targets
 
 if TYPE_CHECKING:
@@ -171,6 +178,9 @@ class Relay:
         if result is not None and result.label is not None:
             self._labels[rule_id] = result.label
         state = self._delivery.rule_state(rule_id)
+        observed = _observed(state)
+        if sample is None and not observed:
+            return
         try:
             new_state, events = evaluate(binding.spec, state, sample, now)
         except Exception:
@@ -187,6 +197,8 @@ class Relay:
                     extra={"event": "relay.evaluation_error", "rule_id": rule_id},
                 )
                 return
+        if not observed and not _observed(new_state):
+            return  # The sample was unusable; the rule is still unobserved.
         cycle.rule_states[rule_id] = new_state
         for event in events:
             text = self._render(binding, event)
@@ -218,9 +230,19 @@ class Relay:
     ) -> None:
         names = self._monitoring.installations
         health: dict[str, PollHealth] = {name: assess(outcomes.get(name)) for name in names}
-        states = {name: self._delivery.rule_state(monitor_id(name)) for name in names}
-        new_states, notifications = self._monitoring.observe(health, states, now)
-        for name, state in new_states.items():
-            cycle.rule_states[monitor_id(name)] = state
-        cycle.notifications.extend(notifications)
-        cycle.events += len(notifications)
+        result = self._monitoring.observe(
+            health,
+            {name: self._delivery.rule_state(monitor_id(name)) for name in names},
+            {name: self._delivery.rule_state(streak_id(name)) for name in names},
+            now,
+        )
+        for name in names:
+            cycle.rule_states[monitor_id(name)] = result.states[name]
+            cycle.rule_states[streak_id(name)] = result.streaks[name]
+        cycle.notifications.extend(result.notifications)
+        cycle.events += len(result.notifications)
+
+
+def _observed(state: RuleState) -> bool:
+    """Whether a rule's state shows that it has had a usable sample."""
+    return state.newest_sample_time is not None or state.last_evaluated_sample_time is not None
