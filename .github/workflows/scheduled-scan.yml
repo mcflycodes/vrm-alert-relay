@@ -1,6 +1,9 @@
 name: Scheduled image scan
 
-# Re-scans main weekly so newly published CVEs surface without a code change.
+# Weekly: re-scans main so newly published CVEs surface without a code change, and
+# refreshes the base image's digest pin. Hosted runners have no layer cache, so the build
+# installs the newest Wolfi packages and the scan covers what an uncached rebuild today
+# would ship.
 on:
   schedule:
     - cron: "17 6 * * 1"
@@ -34,3 +37,35 @@ jobs:
       - uses: ./.github/actions/scan-image
         with:
           image: ${{ env.IMAGE }}
+
+  # Dependabot cannot follow Chainguard's mutable tags, so this opens (or updates) a pull
+  # request when a pinned tag in the Dockerfile points at a new digest. CI runs for pull
+  # requests opened with the workflow token wait for a maintainer to approve them.
+  refresh-digests:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: chainguard-dev/digestabot@33d0b78e580aa0c83fe188eb3dfad6611b662479 # v1.3.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          include-files: Dockerfile
+          use-gitsign: false
+          signoff: false
+          branch-for-pr: digestabot/base-image
+          labels-for-pr: dependencies
+          title-for-pr: "build: refresh base image digests"
+          commit-message: "build: refresh base image digests"
+          description-for-pr: |
+            Refreshes the digest pins in the Dockerfile to what their tags point at now.
+
+            CI runs for this pull request wait for approval, because the workflow token
+            opened it: use "Approve workflows to run" on the pull request to start them.
+            Check the container job's scan and SBOM before merging.

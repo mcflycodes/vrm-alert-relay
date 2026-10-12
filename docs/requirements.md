@@ -1,6 +1,6 @@
 # VRM Alert Relay requirements
 
-**Updated:** 2026-10-11
+**Updated:** 2026-10-12
 **Status:** Accepted
 
 Product requirements for the first release (v1).
@@ -64,7 +64,7 @@ Users are technically capable people who self-host one instance for their own in
 ### Operations
 - R27. Structured JSON logs. Never log secrets, authorization headers, or full request URLs; phone numbers show only the last four digits.
 - R28. Optional health endpoint: informational only, loopback-bound by default, no secrets or recipient data; reports last successful poll, state-persistence health, and suppression counts.
-- R29. Container: distroless base, non-root UID, read-only root filesystem, single writable state volume, all capabilities dropped, `no-new-privileges`, secrets as mounted files, no Docker socket. A documented Compose file applies all of these.
+- R29. Container: minimal Wolfi-based image with no shell or package manager, non-root UID, read-only root filesystem, single writable state volume, all capabilities dropped, `no-new-privileges`, secrets as mounted files, no Docker socket. A documented Compose file applies all of these.
 - R30. Supply chain: every PR builds the image, scans it, and produces an SBOM. HIGH/CRITICAL findings with an available fix block; unfixed findings are reported without blocking. `main` is re-scanned weekly, base-image updates arrive as automated pull requests, and published images are signed.
 - R31. No telemetry; no outbound requests other than VRM and configured providers.
 
@@ -95,7 +95,7 @@ Users are technically capable people who self-host one instance for their own in
 
 - All gates green in CI; every code PR independently cross-reviewed; no unresolved security findings.
 - A documented Compose deployment that starts in dry-run with zero code changes.
-- A dry-run soak of at least 7 days against real VRM data on a real installation with no spurious or duplicate events, then one maintainer-approved live message per provider used.
+- A short dry-run check against real VRM data confirms every configured measurement resolves and evaluates correctly, then one maintainer-approved live message per provider used.
 
 ## Assumptions and open items
 

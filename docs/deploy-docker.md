@@ -29,6 +29,8 @@ docker build --tag "$tag" .
 echo "$tag"
 ```
 
+The image is built from Wolfi packages, which are not version-pinned, so two builds of the same commit can differ in package versions. The image's SBOM (CI publishes one for every build) records the exact versions. A rebuild reuses Docker's layer cache, and with it the packages installed last time, unless you build with `docker build --pull --no-cache`; do that to pick up the latest fixes.
+
 Once release images are published, use `ghcr.io/mcflycodes/vrm-alert-relay:VERSION` instead of building, pinned by digest and [verified](#verifying-a-release-image) first. Set it as `VRM_ALERT_RELAY_IMAGE` in step 2, in place of the tag you built.
 
 ## Verifying a release image
