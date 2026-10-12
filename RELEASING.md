@@ -29,7 +29,7 @@ Other forms, such as `0.1.0-rc1`, `0.1.0.rc1` or `v0.1.0+build.1`, are rejected.
 
    Push one release tag at a time. Releases run one after another, but GitHub keeps only one waiting run: a third tag pushed while one release runs and another waits cancels the waiting run before it starts. That run published nothing; re-run it from the Actions tab.
 
-3. Watch the Release workflow in the Actions tab. When it finishes, check the release notes and [verify the image](docs/deploy-docker.md#verifying-a-release-image).
+3. Watch the Release workflow in the Actions tab. When it finishes, check the release notes and [verify the image](docs/deploy-docker.md#verifying-a-release-image). Verification needs cosign 3.x or newer; cosign 2 reports "no signatures found" for images signed with cosign 3.
 
 To promote a release candidate, repeat the steps with the final version (`0.1.0`, tag `v0.1.0`). Only the version changes, so the code is the one that was tested as the candidate. Wolfi packages are not version-pinned, so the image is a new build with its own scan and SBOM.
 

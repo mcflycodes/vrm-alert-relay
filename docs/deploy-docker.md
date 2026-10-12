@@ -39,7 +39,7 @@ Release images are published to `ghcr.io/mcflycodes/vrm-alert-relay` for `linux/
 
 The release workflow signs every image with [Sigstore cosign](https://docs.sigstore.dev/) keyless signing: the signing certificate is issued to this repository's release workflow, running for a version tag, through GitHub Actions OIDC. No signing key exists to leak. It also attaches each platform's CycloneDX SBOM to that platform's image as a signed attestation, and to the GitHub Release.
 
-With [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 2.x or 3.x, check the signature before you deploy, using the digest from the release notes:
+With [cosign](https://docs.sigstore.dev/cosign/system_config/installation/), check the signature before you deploy, using the digest from the release notes. Cosign 3.x or newer is required: releases are signed with cosign 3, and cosign 2 reports "no signatures found" for them.
 
 ```sh
 image=ghcr.io/mcflycodes/vrm-alert-relay@sha256:0000000000000000000000000000000000000000000000000000000000000000
