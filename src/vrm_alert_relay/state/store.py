@@ -345,7 +345,12 @@ def _move_no_clobber(source: Path, destination: Path) -> None:
             raise FileExistsError(errno.EEXIST, "quarantine name already taken") from exc
         source.rename(destination)
         return
-    source.unlink()
+    try:
+        source.unlink()
+    except OSError:
+        with suppress(OSError):
+            destination.unlink()  # roll back, so no second name is left behind
+        raise
 
 
 def _highest_attempts(marks: Iterable[AttemptMark]) -> dict[tuple[str, str], int]:
@@ -387,13 +392,15 @@ class _Loaded:
     suppression: SuppressionState = field(default_factory=SuppressionState)
     suppression_read: bool = False
     last_seen: datetime | None = None
+    never_written: bool = False
+    """The counts were read, and nothing was written since the database was created."""
     problems: int = 0
     unrecoverable: int = 0
     invalidated_rules: set[str] = field(default_factory=set)
     repaired: list[DeliveryRecord] = field(default_factory=list)
     delete_delivery_rows: list[int] = field(default_factory=list)
-    stored_held: set[tuple[str, str]] = field(default_factory=set)
-    stored_acknowledged: set[str] = field(default_factory=set)
+    counted_held: set[tuple[str, str]] = field(default_factory=set)
+    counted_acknowledged: set[str] = field(default_factory=set)
     replace_attempt_rows: list[tuple[int, AttemptMark]] = field(default_factory=list)
     expired_attempt_rows: list[int] = field(default_factory=list)
     failures: list[BaseException] = field(default_factory=list)
@@ -493,14 +500,14 @@ class StateStore:
         return self._finish_read(loaded, now, outcome)
 
     def reload(self, now: datetime) -> Snapshot | None:
-        """Read what could not be read before; None while some of it still cannot be.
+        """Read the database and the journal again, as one snapshot; None while
+        either still cannot be read.
 
-        The database is read again only if it was unreadable, and the journal
-        is read again in full. Journal suppression changes are applied only
-        by the first successful read of the journal.
+        Journal suppression changes are applied only by the first successful
+        read of the journal.
         """
         loaded = _Loaded()
-        outcome = self._read_database(now, loaded) if self._deferred else _Read.OK
+        outcome = self._read_database(now, loaded)
         if outcome is _Read.UNREADABLE:
             return None
         self._read_journal(loaded, now)
@@ -539,9 +546,9 @@ class StateStore:
             attempts=self._clamped(loaded, now),
             complete=outcome is _Read.OK and self._journal_read,
             suppression=loaded.suppression,
-            suppression_read=loaded.suppression_read,
-            stored_held=frozenset(loaded.stored_held),
-            stored_acknowledged=frozenset(loaded.stored_acknowledged),
+            suppression_read=loaded.suppression_read and self._journal_read,
+            counted_held=frozenset(loaded.counted_held),
+            counted_acknowledged=frozenset(loaded.counted_acknowledged),
             last_seen=loaded.last_seen,
             clock_moved_backwards=backwards,
             problems=loaded.problems,
@@ -572,9 +579,9 @@ class StateStore:
         # What SQLite itself holds, before the journal is merged in (see Snapshot).
         for record in loaded.deliveries.values():
             if record.kind is DeliveryKind.EVENT and record.status is DeliveryStatus.SUPPRESSED:
-                loaded.stored_held.add(record.key)
+                loaded.counted_held.add(record.key)
             elif record.kind is DeliveryKind.SUMMARY and record.status is DeliveryStatus.DELIVERED:
-                loaded.stored_acknowledged.add(record.event_id)
+                loaded.counted_acknowledged.add(record.event_id)
         if not loaded.failures:
             return _Read.OK
         self._close_connection()
@@ -650,6 +657,7 @@ class StateStore:
             loaded.problems += 1
             summary_id = None
         loaded.last_seen = time_of(_META_LAST_SEEN)
+        loaded.never_written = _META_LAST_SEEN not in meta
         loaded.suppression = SuppressionState(
             # An unreadable count still reports that something was held back.
             count=count_of(_META_COUNT, 1),
@@ -799,13 +807,16 @@ class StateStore:
 
         With ``adjust_suppression``, suppression changes that only the journal
         holds are applied once each, keyed by delivery identity: a delivery
-        held back adds one unless the database already shows it held back,
-        and a delivered summary subtracts what it reported unless the
-        database already shows it delivered.
+        held back adds one unless the database already shows it held back.
+        A delivered summary subtracts what it reported only when that is
+        provably not yet subtracted: the database does not show it delivered,
+        and it is the database's open summary or was delivered after the
+        database was last written (or was never written). In any other case
+        nothing is subtracted, so the count errs high.
         """
         base = dict(loaded.deliveries)
         held: dict[tuple[str, str], datetime] = {}
-        reported: dict[str, int] = {}
+        reported: dict[str, DeliveryRecord] = {}
         for entry in contents.entries:
             record = entry.record
             if _newer(record, loaded.deliveries.get(record.key)):
@@ -818,7 +829,7 @@ class StateStore:
                 if stored is None or stored.status is not DeliveryStatus.SUPPRESSED:
                     held.setdefault(record.key, record.updated_at)
             elif record.kind is DeliveryKind.SUMMARY and record.status is DeliveryStatus.DELIVERED:
-                reported.setdefault(record.event_id, record.covers)
+                reported.setdefault(record.event_id, record)
         for index, at in enumerate(contents.unreadable):
             mark = _unreadable_mark("journal", index, at or now)
             loaded.marks[mark.key] = mark
@@ -830,8 +841,20 @@ class StateStore:
             for record in base.values()
             if record.kind is DeliveryKind.SUMMARY and record.status is DeliveryStatus.DELIVERED
         }
-        acknowledged = {event: n for event, n in reported.items() if event not in already}
         state = loaded.suppression
+        written = loaded.last_seen
+        acknowledged = {
+            event: record.covers
+            for event, record in reported.items()
+            if event not in already
+            and (
+                event == state.summary_event_id
+                or loaded.never_written
+                or (written is not None and record.updated_at > written)
+            )
+        }
+        loaded.counted_held.update(held)
+        loaded.counted_acknowledged.update(acknowledged)
         count = min(max(state.count + len(held) - sum(acknowledged.values()), 0), MAX_COUNTER)
         settled = state.summary_event_id in acknowledged
         earliest = min(held.values(), default=now)

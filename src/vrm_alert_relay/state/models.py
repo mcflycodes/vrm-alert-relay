@@ -312,12 +312,12 @@ class Snapshot:
     writes and :meth:`~vrm_alert_relay.state.StateStore.reload` tries again."""
     suppression: SuppressionState = field(default_factory=SuppressionState)
     suppression_read: bool = True
-    """False when the stored suppression counts could not be read."""
-    stored_held: frozenset[tuple[str, str]] = frozenset()
-    """Held-back deliveries that SQLite itself shows held back, journal aside."""
-    stored_acknowledged: frozenset[str] = frozenset()
-    """Summaries that SQLite itself shows delivered, journal aside: their counts
-    are already subtracted from the stored suppression count."""
+    """False when the stored suppression counts could not be read: when either
+    the database's counts or the journal could not be read."""
+    counted_held: frozenset[tuple[str, str]] = frozenset()
+    """Held-back deliveries that ``suppression.count`` already includes."""
+    counted_acknowledged: frozenset[str] = frozenset()
+    """Delivered summaries whose reports ``suppression.count`` already excludes."""
     reset: bool = False
     """True when a corrupt database was quarantined and state started afresh."""
     last_seen: datetime | None = None

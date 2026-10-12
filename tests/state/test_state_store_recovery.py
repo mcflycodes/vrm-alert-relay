@@ -492,3 +492,23 @@ def test_a_partial_quarantine_is_logged_and_leaves_the_store_unhealthy(
     assert [r.__dict__["files"] for r in partial] == [[f"{DB_FILENAME}.corrupt-{STAMP}-wal"]]
     assert (tmp_path / DB_FILENAME).read_bytes().startswith(b"not a database")
     store.close()
+
+
+def test_a_move_whose_unlink_fails_leaves_no_second_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 4, item 4: the new link is rolled back, so nothing untracked is left."""
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.write_text("corrupt")
+    unlink = Path.unlink
+
+    def refuse_the_source(self: Path, *, missing_ok: bool = False) -> None:
+        if self == source:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", refuse_the_source)
+    with pytest.raises(PermissionError):
+        store_module._move_no_clobber(source, destination)
+    assert source.read_text() == "corrupt"
+    assert not destination.exists()

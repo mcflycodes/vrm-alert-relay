@@ -279,7 +279,7 @@ class DeliveryEngine:
         state = snapshot.suppression
         self._suppression = state
         for record in snapshot.deliveries:
-            self._note_stored(record)
+            self._note_stored(record, snapshot)
         self._last_summary_mono = self._mono_of(state.last_summary_at, wall, mono)
         if state.count:
             self._summary_wanted_mono = self._mono_of(state.since, wall, mono) or mono
@@ -382,29 +382,33 @@ class DeliveryEngine:
             self._untracked_unread = 0
             self._acknowledged_unread.clear()
         self._adopt_open_summary()
-        self._forget_lost_summary(mono)
         if snapshot.reset:
             self._start_afresh(snapshot)
-        self._complete = True
-        logger.warning(
-            "stored state is readable again and was merged",
-            extra={"event": "delivery.history_restored"},
-        )
+        # Partly read (say, a corrupt file that could not be moved aside):
+        # what was read is merged, and the next cycle reads it all again.
+        self._complete = snapshot.complete
+        if self._complete:
+            self._forget_lost_summary(mono)
+            logger.warning(
+                "stored state is readable again and was merged",
+                extra={"event": "delivery.history_restored"},
+            )
 
     def _merge_suppression(self, snapshot: Snapshot, wall: datetime, mono: float) -> None:
         """Merge the stored suppression counts, keyed by delivery identity.
 
-        The stored count already includes the deliveries SQLite shows held
-        back, and already excludes what the summaries it shows delivered
-        reported. Only what this process counted beyond those is added or
-        subtracted, so a delivery that both recorded is counted once.
+        The stored count, read from SQLite and the journal as one snapshot,
+        already includes the held-back deliveries it names and excludes what
+        the delivered summaries it names reported. Only what this process
+        counted beyond those, over the whole time the counts were unread, is
+        added or subtracted, so a delivery that both recorded is counted once.
         """
         stored, current = snapshot.suppression, self._suppression
-        added = len(self._held_unread - snapshot.stored_held) + self._untracked_unread
+        added = len(self._held_unread - snapshot.counted_held) + self._untracked_unread
         reported = sum(
             covers
             for event_id, covers in self._acknowledged_unread.items()
-            if event_id not in snapshot.stored_acknowledged
+            if event_id not in snapshot.counted_acknowledged
         )
         count = min(max(stored.count + added - reported, 0), MAX_COUNTER)
         sinces = [when for when in (current.since, stored.since) if when is not None]
@@ -425,11 +429,11 @@ class DeliveryEngine:
         if count and self._summary_wanted_mono is None:
             self._summary_wanted_mono = self._mono_of(self._suppression.since, wall, mono) or mono
 
-    def _note_stored(self, record: DeliveryRecord) -> None:
+    def _note_stored(self, record: DeliveryRecord, snapshot: Snapshot) -> None:
         """Note what a record loaded while the counts are unread already accounts for."""
         if record.status is DeliveryStatus.SUPPRESSED:
             self._note_held(record)
-        elif record.status is DeliveryStatus.DELIVERED:
+        elif record.event_id in snapshot.counted_acknowledged:
             self._note_acknowledged(record)
 
     def _note_held(self, record: DeliveryRecord) -> None:

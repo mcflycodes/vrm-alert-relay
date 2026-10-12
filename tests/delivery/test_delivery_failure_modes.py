@@ -6,10 +6,12 @@ message here is fictitious.
 
 from __future__ import annotations
 
+import errno
+import os
 import sqlite3
 from contextlib import closing
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 from delivery_fakes import (
@@ -37,9 +39,6 @@ from vrm_alert_relay.state import (
     StateStore,
     SuppressionState,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def test_journal_keeps_a_full_day_of_sends_while_sqlite_is_down(tmp_path: Path) -> None:
@@ -612,4 +611,88 @@ def test_a_lost_summary_with_nothing_held_back_is_simply_forgotten(tmp_path: Pat
     clock.advance(timedelta(hours=1, seconds=1))
     engine.run_due()
     assert engine.health().suppressed_pending == 0
+    store.close()
+
+
+def test_a_journal_unreadable_at_startup_keeps_its_held_back_count(tmp_path: Path) -> None:
+    """Round 4, item 1: SQLite was readable and only the journal was not; once the
+    journal can be read, the alerts it held back are counted."""
+    clock = FakeClock()
+    config = make_config(per_hour=1)
+    switch = FailSwitch(only="INSERT")
+    store = flaky_store(tmp_path, switch)
+    engine = make_engine(store, clock=clock, config=config)
+    switch.on = True  # from here on only the journal records anything
+    engine.accept_cycle(rule_states={}, notifications=[rule_note(n) for n in range(3)])
+    engine.run_due()  # one sent, two held back
+    assert engine.health().suppressed_pending == 2
+    store.close()
+    switch.on = False
+    journal = tmp_path / JOURNAL_FILENAME
+    journal.chmod(0o000)
+    try:
+        store = StateStore(tmp_path)
+        engine = make_engine(store, clock=clock, config=config)
+    finally:
+        journal.chmod(0o600)
+    engine.run_due()
+    assert engine.health().suppressed_pending == 2
+    store.close()
+
+
+def test_a_stale_delivered_summary_line_never_subtracts_a_newer_alert(tmp_path: Path) -> None:
+    """Round 4, item 2: a summary line left in the journal after SQLite recorded it, and
+    after SQLite pruned it, does not settle an alert held back later."""
+    clock = FakeClock()
+    config = make_config(per_hour=1)
+    store = StateStore(tmp_path)
+    engine = make_engine(store, clock=clock, config=config)
+    engine.accept_cycle(rule_states={}, notifications=[rule_note(0), rule_note(1)])
+    engine.run_due()  # one sent, one held back
+    clock.advance(timedelta(hours=1, seconds=1))
+    engine.run_due()  # the summary reports it
+    [summary] = [r for r in engine._records.values() if r.kind is DeliveryKind.SUMMARY]
+    assert summary.status is DeliveryStatus.DELIVERED
+    clock.advance(timedelta(days=8))
+    engine.run_due()  # retention prunes the summary's row
+    engine.accept_cycle(rule_states={}, notifications=[rule_note(2), rule_note(3)])
+    engine.run_due()  # one sent, one held back
+    assert engine.health().suppressed_pending == 1
+    # The summary's line outlived it in the journal, as when clearing the journal failed.
+    assert store.journal((JournalEntry(summary, attempt=False),), clock.now)
+    store.close()
+    store = StateStore(tmp_path)
+    engine = make_engine(store, clock=clock, config=config)
+    assert engine.health().suppressed_pending == 1
+    store.close()
+
+
+def test_a_partial_quarantine_during_reload_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 4, item 3: while the database is still unread, every cycle reads it again."""
+    clock = FakeClock()
+    setup = StateStore(tmp_path)
+    setup.load(clock.now)
+    setup.close()
+    store, failing = _unreadable_until_switched(tmp_path)
+    engine = make_engine(store, clock=clock)
+    (tmp_path / DB_FILENAME).write_bytes(b"not a database" * 64)
+    link = os.link
+
+    def refuse_the_database(source: Path, destination: Path, **kwargs: bool) -> None:
+        if Path(source).name == DB_FILENAME:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        link(source, destination, **kwargs)
+
+    monkeypatch.setattr(os, "link", refuse_the_database)
+    failing["on"] = False
+    engine.run_due()  # found corrupt, but it cannot be moved aside
+    assert list(tmp_path.glob(f"{DB_FILENAME}.corrupt-*")) == []
+    engine.run_due()
+    monkeypatch.setattr(os, "link", link)
+    clock.advance(timedelta(minutes=1))
+    engine.run_due()
+    assert len(list(tmp_path.glob(f"{DB_FILENAME}.corrupt-*"))) == 1
+    assert engine.health().durable_accounting is False  # unhealthy for the rest of the run
     store.close()
