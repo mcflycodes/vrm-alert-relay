@@ -231,7 +231,7 @@ def test_queue_bound_holds_back_and_counts_overflow(
     # The real alerts first, then the summary of what was held back.
     assert provider.texts()[:2] == ["Freezer warming", "Freezer warming"]
     assert summaries(provider) == [
-        "VRM Alert Relay: 8 alerts held back by the global rate limit since 2035-01-01 00:00 UTC."
+        "VRM Alert Relay: 8 alert(s) held back by the global rate limit since 2035-01-01 00:00 UTC"
     ]
 
 

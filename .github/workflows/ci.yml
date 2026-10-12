@@ -146,9 +146,57 @@ jobs:
           echo "Effective UID and GID: ${ids}"
           [[ "${ids%% *}" != 0 ]]
 
-          log="$("${hardened[@]}" "$IMAGE" 2>&1 >/dev/null)"
-          echo "Placeholder log: ${log}"
-          python3 -c 'import json, sys; r = json.loads(sys.argv[1]); assert r["dry_run"] is True, r' "$log"
+          cmd="$(docker image inspect --format '{{json .Config.Cmd}}' "$IMAGE")"
+          echo "Image Cmd: ${cmd}"
+          [[ "$cmd" == '["run"]' ]]
+
+          stat_state='import os, stat; s = os.stat("/var/lib/vrm-alert-relay"); print(s.st_uid, s.st_gid, oct(stat.S_IMODE(s.st_mode)))'
+          perms="$("${hardened[@]}" --entrypoint /opt/venv/bin/python "$IMAGE" -c "$stat_state")"
+          echo "Image state directory: ${perms}"
+          [[ "$perms" == "65532 65532 0o700" ]]
+
+          # A named volume, initialised from the image, holds the state across two
+          # runs. The VRM token is fictitious and the network is off, so every poll
+          # fails and nothing is sent; the second run reports monitoring degraded
+          # only because the first run's failed poll was stored.
+          smoke="$RUNNER_TEMP/smoke"
+          mkdir -p "$smoke"
+          printf 'fictitious-smoke-test-value\n' > "$smoke/vrm_token"
+          chmod 0644 "$smoke/vrm_token"
+          docker volume create vrm-smoke-state
+          state=(--volume vrm-smoke-state:/var/lib/vrm-alert-relay)
+          perms="$("${hardened[@]}" "${state[@]}" --entrypoint /opt/venv/bin/python "$IMAGE" -c "$stat_state")"
+          echo "Volume state directory: ${perms}"
+          [[ "$perms" == "65532 65532 0o700" ]]
+
+          relay=("${hardened[@]}" "${state[@]}"
+                 --volume "$PWD/examples/config.example.yaml:/etc/vrm-alert-relay/config.yaml:ro"
+                 --volume "$smoke/vrm_token:/run/secrets/vrm_token:ro"
+                 "$IMAGE" run --once)
+          for run in 1 2; do
+            log="$("${relay[@]}")"
+            echo "Run ${run} log:"
+            echo "$log"
+            python3 - "$run" "$log" <<'PY'
+          import json, sys
+          run = int(sys.argv[1])
+          records = [json.loads(line) for line in sys.argv[2].splitlines()]
+          events = [r.get("event") for r in records]
+          started = next(r for r in records if r.get("event") == "service.started")
+          assert started["dry_run"] is True, started
+          assert "relay.cycle" in events, events
+          assert events[-1] == "service.stopped", events
+          for bad in ("state.persistence_failed", "state.directory_permissive", "delivery.history_unknown"):
+              assert bad not in events, (bad, events)
+          degraded = events.count("monitoring.degraded")
+          assert degraded == (0 if run == 1 else 1), (run, events)
+          PY
+          done
+          files="$("${hardened[@]}" "${state[@]}" --entrypoint /opt/venv/bin/python "$IMAGE" \
+                   -c 'import os; print(" ".join(sorted(os.listdir("/var/lib/vrm-alert-relay"))))')"
+          echo "State files: ${files}"
+          [[ " $files " == *" relay-state.sqlite3 "* && " $files " == *" relay-state.lock "* ]]
+          docker volume rm vrm-smoke-state
       - name: Generate SBOM
         run: |
           "$RUNNER_TEMP/trivy" image --no-progress --format cyclonedx \

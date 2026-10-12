@@ -220,7 +220,10 @@ def test_global_cap_holds_under_a_flood_of_1000_events(tmp_path: Path) -> None:
     clock.set(BASE + timedelta(hours=1, seconds=1))
     assert engine.run_due().sent == 1
     assert summaries(provider) == [
-        "VRM Alert Relay: 980 alerts held back by the global rate limit since 2035-01-01 00:00 UTC."
+        (
+            "VRM Alert Relay: 980 alert(s) held back by the global rate limit "
+            "since 2035-01-01 00:00 UTC"
+        )
     ]
     assert engine.health().suppressed_pending == 0
     for minutes in (2, 30, 120):
@@ -258,7 +261,7 @@ def test_real_alerts_get_capacity_before_the_summary(tmp_path: Path) -> None:
     clock.advance(timedelta(hours=1, seconds=1))
     engine.run_due()
     assert summaries(provider) == [
-        "VRM Alert Relay: 3 alerts held back by the global rate limit since 2035-01-01 00:00 UTC."
+        "VRM Alert Relay: 3 alert(s) held back by the global rate limit since 2035-01-01 00:00 UTC"
     ]
 
 
@@ -281,7 +284,7 @@ def test_a_summary_waits_at_most_an_hour_for_real_alerts(tmp_path: Path) -> None
     texts = provider.texts()
     assert len(summaries(provider)) == 1
     assert texts.index(summaries(provider)[0]) == 4
-    assert summaries(provider)[0].startswith("VRM Alert Relay: 20 alerts held back")
+    assert summaries(provider)[0].startswith("VRM Alert Relay: 20 alert(s) held back")
 
 
 def test_at_most_one_summary_per_hour_while_a_flood_continues(tmp_path: Path) -> None:
@@ -301,7 +304,7 @@ def test_at_most_one_summary_per_hour_while_a_flood_continues(tmp_path: Path) ->
     assert len(summaries(provider)) == 1
     clock.set(BASE + timedelta(hours=2, seconds=2))
     engine.run_due()
-    assert summaries(provider)[-1].startswith("VRM Alert Relay: 81 alerts")
+    assert summaries(provider)[-1].startswith("VRM Alert Relay: 81 alert(s)")
     assert len(summaries(provider)) == 2
 
 
@@ -323,7 +326,7 @@ def test_summary_count_is_kept_until_a_summary_is_delivered(tmp_path: Path) -> N
     assert engine.health().suppressed_pending == 2
     clock.advance(timedelta(hours=1, seconds=1))
     engine.run_due()
-    assert summaries(provider)[-1].startswith("VRM Alert Relay: 2 alerts")
+    assert summaries(provider)[-1].startswith("VRM Alert Relay: 2 alert(s)")
     assert engine.health().suppressed_pending == 0
 
 
@@ -560,7 +563,7 @@ def test_corrupt_attempt_rows_keep_their_slots(tmp_path: Path) -> None:
     engine.accept_cycle(rule_states={}, notifications=[rule_note(2)])
     assert engine.run_due().sent == 2
     # The summary has waited an hour, so it takes the first free slot (M7).
-    assert summaries(provider)[0].startswith("VRM Alert Relay: 1 alert held back")
+    assert summaries(provider)[0].startswith("VRM Alert Relay: 1 alert(s) held back")
     assert provider.texts() == [summaries(provider)[0], "Freezer warming"]
 
 

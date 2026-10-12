@@ -11,6 +11,10 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     UV_PYTHON=/usr/bin/python3.13 \
     UV_PYTHON_DOWNLOADS=never
+# An empty, owner-only directory for the runtime's state volume (the debug image has
+# busybox). COPY creates its destination with a default mode but keeps the modes of
+# the entries it copies, so the directory is copied as a child of /staging.
+RUN ["/busybox/mkdir", "-p", "-m", "0700", "/staging/vrm-alert-relay"]
 WORKDIR /src
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
@@ -22,8 +26,12 @@ LABEL org.opencontainers.image.title="vrm-alert-relay" \
       org.opencontainers.image.source="https://github.com/mcflycodes/vrm-alert-relay" \
       org.opencontainers.image.licenses="MIT"
 COPY --from=build /opt/venv /opt/venv
+# The state directory belongs to the relay user and nobody else (ADR 0002). A named
+# volume mounted here starts with this ownership and mode.
+COPY --from=build --chown=65532:65532 /staging/ /var/lib/
 ENV PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 USER 65532:65532
 ENTRYPOINT ["/opt/venv/bin/vrm-alert-relay"]
+CMD ["run"]

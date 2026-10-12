@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Final, cast
 
 from .models import (
+    FUTURE_TOLERANCE,
     MAX_COUNTER,
     MAX_LEVELS,
     Direction,
@@ -21,7 +22,6 @@ from .models import (
     Sample,
 )
 
-FUTURE_TOLERANCE: Final = timedelta(seconds=60)
 NO_SAMPLE_DISCRIMINATOR: Final = datetime(1970, 1, 1, tzinfo=UTC)
 
 
@@ -51,6 +51,15 @@ def _usable_sample(sample: object, now: datetime) -> Sample | None:
     if _elapsed(timestamp, now) > FUTURE_TOLERANCE:
         return None
     return sample
+
+
+def sample_is_usable(sample: object, now: datetime) -> bool:
+    """Whether :func:`evaluate` would use ``sample`` at ``now``.
+
+    A usable sample has a finite numeric value and a timezone-aware timestamp
+    at most :data:`~vrm_alert_relay.engine.models.FUTURE_TOLERANCE` after ``now``.
+    """
+    return _usable_sample(sample, now) is not None
 
 
 def _mapping_set_time(

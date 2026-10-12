@@ -45,7 +45,7 @@ import logging
 import random
 from collections import deque
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
@@ -63,6 +63,7 @@ from vrm_alert_relay.state import (
 )
 from vrm_alert_relay.state.models import MAX_COUNTER, encode_time, is_message_id
 from vrm_alert_relay.state.store import MAX_ATTEMPT_ROWS, MAX_RULE_STATES
+from vrm_alert_relay.templates import NotificationKind, TemplateFields, render_notification
 
 from .limits import DAY, HOUR, MAX_EXPIRED, RateLimiter, RetryPolicy
 from .protocol import (
@@ -102,9 +103,8 @@ type DeliveryKey = tuple[str, str]
 DEFAULT_MAX_QUEUE: Final = 1000
 MAX_UNREAD_LEDGER: Final = 100_000
 NOTICE_INTERVAL: Final = timedelta(days=1)
-STORAGE_NOTICE_TEXT: Final = (
-    "VRM Alert Relay: state storage is failing, so alerts continue under limits "
-    "kept in memory only. Check the relay."
+STORAGE_NOTICE_TEXT: Final = render_notification(
+    TemplateFields(kind=NotificationKind.STORAGE_NOTICE)
 )
 
 
@@ -182,9 +182,9 @@ def _untrusted(value: object) -> object:
 
 
 def _summary_text(count: int, since: datetime) -> str:
-    noun = "alert" if count == 1 else "alerts"
-    stamp = since.astimezone(UTC).strftime("%Y-%m-%d %H:%M")
-    return f"VRM Alert Relay: {count} {noun} held back by the global rate limit since {stamp} UTC."
+    return render_notification(
+        TemplateFields(kind=NotificationKind.SUPPRESSION_SUMMARY, count=count, time=since)
+    )
 
 
 def _seconds(delta: timedelta) -> float:
@@ -611,10 +611,7 @@ class DeliveryEngine:
     def run_due(self) -> RunReport:
         """Process due deliveries: real alerts first, then any summary, then any notice."""
         report = RunReport()
-        if not self._complete:
-            self._reload()
-        if not self._durable and self.flush():
-            self._set_durable(durable=True)
+        self._prepare_run()
         overdue = self._summary_overdue()
         if overdue:
             self._process_summary(report)
@@ -639,6 +636,29 @@ class DeliveryEngine:
         self._prune_memory()
         self._save()
         return report
+
+    def run_only(self, event_id: str) -> RunReport:
+        """Process the due deliveries of one event, and nothing else.
+
+        For an explicitly requested one-off message such as a test
+        notification (R26). The global cap and dry-run routing apply as in
+        :meth:`run_due`; other due deliveries, summaries and storage notices
+        wait for the next :meth:`run_due`.
+        """
+        report = RunReport()
+        self._prepare_run()
+        for record in self._due_records(DeliveryKind.EVENT):
+            if record.event_id == event_id:
+                self._process(record, report)
+        self._prune_memory()
+        self._save()
+        return report
+
+    def _prepare_run(self) -> None:
+        if not self._complete:
+            self._reload()
+        if not self._durable and self.flush():
+            self._set_durable(durable=True)
 
     def _degraded(self) -> bool:
         """Whether accounting is not fully durable: the case for a storage notice."""

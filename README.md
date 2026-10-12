@@ -29,10 +29,11 @@ The service is written in Python 3.13 and packaged as a distroless, non-root con
 ```sh
 uv sync
 uv run vrm-alert-relay --version
+uv run vrm-alert-relay check-config --config examples/config.example.yaml --structure-only
 uv run pytest
 ```
 
-The current build is a placeholder: it logs that it is running in dry-run mode and exits. See [CONTRIBUTING.md](CONTRIBUTING.md) for all checks, [docs/requirements.md](docs/requirements.md) for the v1 requirements, and [docs/adr/](docs/adr/) for design decisions.
+The relay starts in dry-run mode: until sending and a provider are both enabled, every message is written to the log instead of being sent. [docs/operations.md](docs/operations.md) describes the commands, exit codes, monitoring notifications and the health endpoint. See [CONTRIBUTING.md](CONTRIBUTING.md) for all checks, [docs/requirements.md](docs/requirements.md) for the v1 requirements, and [docs/adr/](docs/adr/) for design decisions.
 
 ## Security and privacy
 
