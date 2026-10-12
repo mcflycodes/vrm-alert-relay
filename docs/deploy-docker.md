@@ -209,51 +209,109 @@ The document's fields are described in [operations.md](operations.md#health-endp
 
 ## Upgrades
 
-1. Read the release notes for configuration changes.
-2. [Back up the state volume](#backup-and-restore).
-3. Build (or, later, pull) the new image with a new tag, and set it in `.env`. Keep the previous image for rollback.
-4. Check the configuration with the new image: `docker compose run --rm --no-deps relay check-config`.
-5. Restart: `docker compose up -d`.
-6. Watch the logs for `service.started` and the first `relay.cycle`, with no `state.*` errors.
+Every upgrade starts with a backup: it is what makes a [rollback](#rollback) possible, because a newer release may upgrade the state database's format and an older release cannot read it.
 
-State is kept across upgrades. A newer release may upgrade the state database's format when it starts.
+1. Read the release notes for configuration changes.
+2. Build (or, later, pull) the new image with a new tag. Do not change `.env` yet, and keep the previous image for rollback.
+3. Stop the relay and [take a backup](#back-up-the-state-volume). Note the archive's name.
+4. Set the new tag in `.env` (`VRM_ALERT_RELAY_IMAGE`), and check the configuration with it: `docker compose run --rm --no-deps relay check-config`.
+5. Start it: `docker compose up -d`.
+6. Watch the logs for `service.started` and the first `relay.cycle`, with no `state.*` errors.
 
 ## Backup and restore
 
-The state volume holds rule state, delivery records and the send history behind the rate limits. Back it up before every upgrade. Stop the relay for the copy, so the SQLite database, its WAL file and the journal are consistent. Any image with `tar` will do; this uses BusyBox:
+The state volume holds rule state, delivery records and the send history behind the rate limits. The commands below use a BusyBox image, pinned by digest, as a throwaway tool container with no network. They run as root inside that container, because they have to read and write files owned by UID 65532. Set these two variables first, in the deployment directory (the second needs [jq](https://jqlang.org/)):
 
 ```sh
 cd /opt/vrm-alert-relay
-sudo install -d -m 0700 backups
-docker compose stop relay
-docker run --rm --network none \
-  -v vrm-alert-relay-state:/state:ro -v "$PWD/backups:/backup" \
-  busybox:1.37 tar -C /state -czf "/backup/state-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" .
-docker compose start relay
+busybox='busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e'  # BusyBox 1.37.0
+state_volume="$(docker compose config --format json | jq -r '.volumes.state.name')"
+echo "$state_volume"
 ```
 
-The archive holds delivery records and message text, so keep it private.
+`state_volume` is the volume the relay uses now: `vrm-alert-relay-state`, or the one named by `VRM_ALERT_RELAY_STATE_VOLUME` in `.env` after a restore.
 
-To restore, stop the relay, replace the volume's contents, and fix the directory's owner and mode:
+### Back up the state volume
+
+Stop the relay for the copy, so the SQLite database, its WAL file and the journal are consistent. The archive is owned by root with mode `0600`, in a directory only root can read, because it holds delivery records and message text:
 
 ```sh
+sudo install -d -m 0700 backups
 docker compose stop relay
+archive="state-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
 docker run --rm --network none \
-  -v vrm-alert-relay-state:/state -v "$PWD/backups:/backup:ro" \
-  busybox:1.37 sh -c 'find /state -mindepth 1 -delete &&
-    tar -C /state -xzpf /backup/state-20260115T120000Z.tar.gz &&
-    chown 65532:65532 /state && chmod 0700 /state'
-docker compose start relay
+  -v "$state_volume:/state:ro" -v "$PWD/backups:/backup" "$busybox" \
+  sh -euc 'tar -C /state -czf "/backup/$1" . && chown 0:0 "/backup/$1" && chmod 0600 "/backup/$1"' sh "$archive"
+echo "$archive"
 ```
+
+Inside the archive, the files keep their numeric owner (65532) and modes. Then start the relay again with `docker compose start relay`, or, during an upgrade, continue with upgrade step 4.
+
+### Restore into a new volume
+
+A restore never empties or overwrites the volume in use. It checks the archive, restores it into a new volume, verifies the result, and only then points the relay at the new volume. The old volume stays untouched, so you can switch back to it.
+
+1. Stop the relay and choose the archive:
+
+   ```sh
+   docker compose stop relay
+   archive=state-20260115T120000Z.tar.gz
+   ```
+
+2. Check the archive. This lists it in full, which fails on a truncated or corrupt file, and requires the state database:
+
+   ```sh
+   docker run --rm --network none -v "$PWD/backups:/backup:ro" "$busybox" \
+     sh -euc 'tar -tzf "/backup/$1" > /tmp/contents && cat /tmp/contents &&
+       grep -qx "./relay-state.sqlite3" /tmp/contents && echo "archive ok"' sh "$archive"
+   ```
+
+   Stop if it does not end with `archive ok`.
+
+3. Restore it into a new volume, set the owner and modes explicitly (directory `0700`, files `0600`, all owned by `65532:65532`), and check that the database is a SQLite file:
+
+   ```sh
+   new_volume="vrm-alert-relay-state-$(date -u +%Y%m%dT%H%M%SZ)"
+   docker volume create "$new_volume"
+   docker run --rm --network none \
+     -v "$new_volume:/state" -v "$PWD/backups:/backup:ro" "$busybox" \
+     sh -euc 'tar -C /state -xzf "/backup/$1"
+       chown -R 65532:65532 /state
+       chmod 0700 /state
+       find /state -type f -exec chmod 0600 {} \;
+       [ "$(head -c 15 /state/relay-state.sqlite3)" = "SQLite format 3" ]
+       ls -lan /state
+       echo "restore ok"' sh "$archive"
+   ```
+
+   Stop if it does not end with `restore ok`; the relay's current volume is unchanged.
+
+4. Point the relay at the new volume and start it:
+
+   ```sh
+   sudo sed -i '/^VRM_ALERT_RELAY_STATE_VOLUME=/d' .env
+   echo "VRM_ALERT_RELAY_STATE_VOLUME=$new_volume" | sudo tee -a .env
+   docker compose up -d
+   docker compose logs relay | grep -E '"event": ?"(service.started|relay.cycle|state\.[a-z_]+)"'
+   ```
+
+   Compose may warn that the volume was not created by Compose; that is expected. Look for `service.started` and `relay.cycle` without `state.*` errors.
+
+To switch back, set `VRM_ALERT_RELAY_STATE_VOLUME` to the previous volume (the original one is `vrm-alert-relay-state`) and run `docker compose up -d` again. Once you are sure you no longer need an old volume, remove it with `docker volume rm <name>`.
 
 Restoring older state can repeat notifications that were sent after the backup was taken, because the relay no longer knows it sent them. The global cap still applies.
 
 ## Rollback
 
-1. Set `VRM_ALERT_RELAY_IMAGE` in `.env` back to the previous image tag, and restore the previous `config.yaml` if you changed it.
-2. Restart: `docker compose up -d`.
+Roll back state and image together, before the older image ever starts: if the newer release upgraded the state database's format, the older one cannot read it and would run from memory only.
 
-If the newer release upgraded the state database's format, the older one cannot read it. It does not touch the file, keeps alerting from memory, and reports `state_persistence.healthy: false` and sends a storage notice. In that case stop the relay, restore the backup taken before the upgrade, and start it again.
+1. Stop the relay: `docker compose stop relay`.
+2. Restore the backup taken in upgrade step 3 into a new volume: follow [restore](#restore-into-a-new-volume) steps 2 and 3, then set `VRM_ALERT_RELAY_STATE_VOLUME` in `.env` as in restore step 4, but do not start the relay yet.
+3. Set `VRM_ALERT_RELAY_IMAGE` in `.env` back to the previous image tag, and restore the previous `config.yaml` if you changed it.
+4. Check the configuration with the older image: `docker compose run --rm --no-deps relay check-config`.
+5. Start it: `docker compose up -d`, and watch the logs as after a restore.
+
+The volume the newer release used is kept, so you can return to it when you upgrade again. Anything the relay recorded after the backup is not carried back, so some notifications sent since then may repeat, within the global cap.
 
 ## Uninstall
 

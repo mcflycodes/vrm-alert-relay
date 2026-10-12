@@ -120,27 +120,50 @@ jobs:
       - uses: ./.github/actions/install-scanners
       - name: Lint Dockerfile
         run: '"$RUNNER_TEMP/hadolint" Dockerfile'
+      - name: Install Docker Compose
+        env:
+          COMPOSE_VERSION: "2.39.4"
+          COMPOSE_SHA256: 7af95166a730b87e172d4fc9aefea8725d3c6c7327d59149267b452114ddb7d4
+        run: |
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$RUNNER_TEMP/docker-compose" \
+            "https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-linux-x86_64"
+          echo "${COMPOSE_SHA256}  $RUNNER_TEMP/docker-compose" | sha256sum --check --strict
+          chmod +x "$RUNNER_TEMP/docker-compose"
+          "$RUNNER_TEMP/docker-compose" version
       - name: Validate Compose example
         run: |
-          docker compose version
-          docker compose -f compose.example.yaml config --quiet
-          docker compose -f compose.example.yaml config --format json | python3 -c '
-          import json, sys
-          relay = json.load(sys.stdin)["services"]["relay"]
-          assert relay["user"] == "65532:65532", relay.get("user")
-          assert relay["read_only"] is True
-          assert relay["cap_drop"] == ["ALL"], relay.get("cap_drop")
-          assert relay["security_opt"] == ["no-new-privileges:true"], relay.get("security_opt")
-          assert not relay.get("privileged"), "privileged"
-          for key in ("network_mode", "pid", "ports", "devices", "cap_add", "env_file"):
-              assert key not in relay, key
-          assert relay.get("ipc") == "private", relay.get("ipc")
-          for mount in relay["volumes"]:
-              assert "docker.sock" not in str(mount.get("source")), mount
-              assert mount["type"] == "volume" or mount.get("read_only") is True, mount
-          assert all(not name.upper().endswith(("TOKEN", "PASSWORD")) for name in relay["environment"])
-          print("Compose example keeps the hardened settings")
-          '
+          compose="$RUNNER_TEMP/docker-compose"
+          check=.github/scripts/check_compose_hardening.py
+          "$compose" -f compose.example.yaml config --quiet
+          "$compose" -f compose.example.yaml config --format json | python3 "$check"
+
+          # Self-test: each weakened copy must be rejected, for the expected reason.
+          weak="$RUNNER_TEMP/weakened"
+          mkdir -p "$weak"
+          printf 'services:\n  relay:\n    volumes:\n      - ./extra:/data\n' > "$weak/writable-bind.yaml"
+          printf 'services:\n  relay:\n    cap_add: [NET_ADMIN]\n' > "$weak/cap-add.yaml"
+          printf 'services:\n  relay:\n    ports: ["8080:8080"]\n' > "$weak/published-port.yaml"
+          printf 'services:\n  relay:\n    environment:\n      VOIPMS_API_PASSWORD: x\n' > "$weak/secret-env.yaml"
+          printf 'services:\n  relay:\n    read_only: false\n' > "$weak/writable-root.yaml"
+          declare -A expect=(
+            [writable-bind]='expected exactly one writable mount'
+            [cap-add]='cap_add: must not be set'
+            [published-port]='ports: must not be set'
+            [secret-env]='secrets must be files'
+            [writable-root]='read_only: must be'
+          )
+          for name in "${!expect[@]}"; do
+            if output="$("$compose" -f compose.example.yaml -f "$weak/$name.yaml" config --format json \
+                         | python3 "$check" 2>&1)"; then
+              echo "::error::self-test: the weakened copy '${name}' was accepted"
+              exit 1
+            fi
+            if ! grep -qF -- "${expect[$name]}" <<< "$output"; then
+              echo "::error::self-test: '${name}' was rejected for the wrong reason: ${output}"
+              exit 1
+            fi
+            echo "Self-test '${name}' rejected as expected: $(grep -F -- "${expect[$name]}" <<< "$output")"
+          done
       - name: Build image
         run: docker build --pull --tag "$IMAGE" .
       - name: Smoke test hardened runtime

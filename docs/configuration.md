@@ -32,8 +32,9 @@ Every URL setting must:
 
 - use `https://` (Home Assistant and the webhook can opt in to `http://`, see [`allow_insecure_http`](#private-certificates-and-plain-http));
 - be at most 2048 characters, with no whitespace, control characters or `\`;
-- include a host: an ASCII (or punycode) host name, an IPv4 address, or an IPv6 address in brackets. Private network addresses are allowed;
-- have no credentials before the host (`user:pass@`), no `#fragment`, and no port 0.
+- include a host: an IPv4 address, an IPv6 address in brackets, or an ASCII (or punycode) host name of at most 253 characters, made of dot-separated labels of 1 to 63 letters, digits and `-` that neither start nor end with `-` (a trailing dot is allowed). Private network addresses are allowed;
+- have no credentials before the host (`user:pass@`) and no `#fragment`;
+- use a port from 1 to 65535, if it gives one.
 
 ## Top-level settings
 
@@ -44,7 +45,7 @@ Every URL setting must:
 | `vrm` | mapping | required | VRM API access and the installations to poll. |
 | `rate_limits` | mapping | see below | The global cap and retries. |
 | `recipients` | mapping | empty | The recipient allowlist. |
-| `providers` | mapping | all disabled | Notification provider settings. |
+| `providers` | mapping | external providers disabled | Notification provider settings. The `log` provider is always available. |
 | `rules` | list | empty | Alert rules. With none, `check-config` warns that nothing is monitored. |
 | `system_recipients` | list | not set | Who receives system notifications. |
 | `health` | mapping | disabled | The optional health endpoint. |
@@ -100,7 +101,7 @@ Every recipient has a `provider`: one of `voipms`, `homeassistant`, `webhook` or
 
 | Provider | Other keys | Rules |
 |---|---|---|
-| `voipms` | `phone` (string, required) | A US or Canadian number: 10 digits, 11 digits starting with `1`, or `+1` and 10 digits. Spaces, `-`, `.`, `(` and `)` are ignored. The area code and exchange must not start with 0 or 1. Quote it, or YAML reads it as a number. Logs show only the last four digits. |
+| `voipms` | `phone` (string, required) | A US or Canadian number: 10 digits, 11 digits starting with `1`, or `+1` and 10 digits. Spaces, `-`, `.`, `(` and `)` are ignored; the value may be at most 32 characters including them. The area code and exchange must not start with 0 or 1. Quote it, or YAML reads it as a number. Logs show only the last four digits. |
 | `homeassistant` | `service` (string, required) | The Home Assistant notify service, without the `notify.` prefix: 1 to 255 lowercase letters, digits and `_`, for example `mobile_app_example_phone`. |
 | `webhook` | none | Messages go to `providers.webhook.url`. |
 | `log` | none | Messages are only logged. |
@@ -109,7 +110,7 @@ Every recipient has a `provider`: one of `voipms`, `homeassistant`, `webhook` or
 
 ## `providers`
 
-Every provider section is optional, and every provider is disabled by default. A provider's required settings must be present as soon as it is `enabled`. Its secret files are read only once it is live; `check-config` reads them for every enabled provider and reports a problem with a provider that is not yet live as a warning ("required before sending is enabled").
+Every provider section is optional. The external providers (`voipms`, `homeassistant`, `webhook`) are disabled by default; the `log` provider has no switch and is always available. A provider's required settings must be present as soon as it is `enabled`. Its secret files are read only once it is live; `check-config` reads them for every enabled provider and reports a problem with a provider that is not yet live as a warning ("required before sending is enabled").
 
 ### `providers.voipms`
 
@@ -152,7 +153,7 @@ The payload is described in [notifications.md](notifications.md#webhook).
 
 For `homeassistant` and `webhook` only:
 
-- **`ca_file`**: an absolute path (at most 4096 characters) to a PEM file holding the CA certificate, or the self-signed certificate, of the receiver. The provider then trusts only the certificates in that file, instead of the bundled trust store. Certificate and hostname verification always stay on; nothing turns them off. `check-config` loads the file for an enabled provider and reports a file that holds no usable certificate. It is not a secret, so its file mode is not checked. With a plain `http://` URL it has no effect, and `check-config` says so.
+- **`ca_file`**: an absolute path (at most 4096 characters, with no control or line-separator characters) to a PEM file holding the CA certificate, or the self-signed certificate, of the receiver. The provider then trusts only the certificates in that file, instead of the bundled trust store. Certificate and hostname verification always stay on; nothing turns them off. `check-config` loads the file for an enabled provider and reports a file that holds no usable certificate. It is not a secret, so its file mode is not checked. With a plain `http://` URL it has no effect, and `check-config` says so.
 - **`allow_insecure_http: true`**: permits a plain `http://` URL for that one provider. **The provider's token or header value, and every message, then cross the network unencrypted**, readable and alterable by anything on the path. `check-config` prints an `INSECURE` warning whenever it is on. Use it only on a network segment you control, and prefer `ca_file`. [home-assistant.md](home-assistant.md#http-https-or-a-private-ca) compares the options.
 
 Neither setting affects redirects (never followed), timeouts or response-size limits.
@@ -208,7 +209,7 @@ How the timing settings work:
 
 ### Message templates
 
-A level's `message` is a single-line template of at most 320 characters, with no line breaks or control characters. Its only placeholders are `{rule}`, `{level}`, `{value}`, `{unit}`, `{installation}`, `{measurement}`, `{label}`, `{time}`, `{kind}` and `{count}`; `{{` and `}}` are literal braces. Anything else, such as `{rule.x}`, `{value:>10}` or an unknown name, is rejected when the file is loaded. [notifications.md](notifications.md#message-templates) defines each placeholder, the default texts and how rendered text is sanitized and shortened.
+A level's `message` is a non-empty, single-line template of at most 320 characters. It must not contain control characters (including line breaks and tabs), Unicode format characters (such as bidirectional overrides and zero-width characters), the line and paragraph separators, or private-use and unassigned code points. Braces must match. Its only placeholders are `{rule}`, `{level}`, `{value}`, `{unit}`, `{installation}`, `{measurement}`, `{label}`, `{time}`, `{kind}` and `{count}`; `{{` and `}}` are literal braces. Anything else, such as `{rule.x}`, `{value:>10}` or an unknown name, is rejected when the file is loaded. [notifications.md](notifications.md#message-templates) defines each placeholder, the default texts and how rendered text is sanitized and shortened.
 
 ## `system_recipients`
 
@@ -244,7 +245,7 @@ Every `*_file` setting other than `ca_file` names a secret file:
 | `providers.homeassistant.token_file` | Home Assistant long-lived access token | When Home Assistant is live. |
 | `providers.webhook.auth_header_value_file` | Webhook header value | When the webhook is live. |
 
-Each path must be absolute and at most 4096 characters. Each file must:
+Each path must be absolute and at most 4096 characters, with no control or line-separator characters. Each file must:
 
 - be a regular file (not a directory, device or FIFO) of at most 4096 bytes;
 - hold UTF-8 text: the secret on one line. One trailing newline (`\n` or `\r\n`) is removed; the rest must be non-empty, with no other line breaks or control characters.

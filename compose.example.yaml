@@ -120,7 +120,9 @@ services:
 volumes:
   state:
     # A fixed name, so backups and restores do not depend on the project name.
-    name: vrm-alert-relay-state
+    # After a restore, VRM_ALERT_RELAY_STATE_VOLUME in .env names the restored
+    # volume instead (see docs/deploy-docker.md).
+    name: ${VRM_ALERT_RELAY_STATE_VOLUME:-vrm-alert-relay-state}
 
 secrets:
   vrm_token:
