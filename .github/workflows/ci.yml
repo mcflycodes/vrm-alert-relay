@@ -170,7 +170,20 @@ jobs:
             done
           done
       - name: Build image
-        run: docker build --pull --tag "$IMAGE" .
+        run: |
+          log="$RUNNER_TEMP/build.log"
+          docker build --pull --progress=plain --tag "$IMAGE" . 2>&1 | tee "$log"
+
+          # The runtime root filesystem was installed in this build, not taken from a
+          # cache, and no package script failed (scripts are skipped deliberately and
+          # ldconfig runs from the builder; see the Dockerfile).
+          grep -E 'Installing python-3\.13-base' "$log"
+          grep -E '^#[0-9]+ [0-9.]+ \+ ldconfig -r /rootfs' "$log"
+          if grep -F 'script exited with error' "$log"; then
+            echo "::error::a package script failed during the image build"
+            exit 1
+          fi
+          echo "Build log: no 'script exited with error'"
       - name: Smoke test hardened runtime
         run: |
           user="$(docker image inspect --format '{{.Config.User}}' "$IMAGE")"
@@ -198,6 +211,14 @@ jobs:
           cmd="$(docker image inspect --format '{{json .Config.Cmd}}' "$IMAGE")"
           echo "Image Cmd: ${cmd}"
           [[ "$cmd" == '["run"]' ]]
+
+          workdir="$(docker image inspect --format '{{.Config.WorkingDir}}' "$IMAGE")"
+          echo "Image WorkingDir: ${workdir}"
+          [[ "$workdir" == /home/nonroot ]]
+
+          # Runtime contract, checked with the image's own Python (it has no shell).
+          "${hardened[@]}" --volume "$PWD/.github/scripts:/smoke:ro" \
+            --entrypoint /opt/venv/bin/python "$IMAGE" /smoke/check_runtime_image.py
 
           stat_state='import os, stat; s = os.stat("/var/lib/vrm-alert-relay"); print(s.st_uid, s.st_gid, oct(stat.S_IMODE(s.st_mode)))'
           perms="$("${hardened[@]}" --entrypoint /opt/venv/bin/python "$IMAGE" -c "$stat_state")"
@@ -246,6 +267,28 @@ jobs:
           echo "State files: ${files}"
           [[ " $files " == *" relay-state.sqlite3 "* && " $files " == *" relay-state.lock "* ]]
           docker volume rm vrm-smoke-state
+      - name: Smoke test TLS verification
+        run: |
+          # A throwaway CA and server certificates, a test server running from the
+          # image itself, and the relay's own client, all on an internal network with
+          # no route to the internet.
+          pki="$RUNNER_TEMP/tls-pki"
+          .github/scripts/make_tls_smoke_pki.sh "$pki" tls.example.test
+          docker network create --internal vrm-tls-smoke
+          hardened=(docker run --rm --read-only --cap-drop ALL
+                    --security-opt no-new-privileges --network vrm-tls-smoke
+                    --volume "$PWD/.github/scripts:/smoke:ro" --volume "$pki:/certs:ro"
+                    --entrypoint /opt/venv/bin/python)
+          "${hardened[@]}" --detach --name vrm-tls-server \
+            --network-alias tls.example.test --network-alias wrong.example.test \
+            "$IMAGE" /smoke/tls_smoke_server.py
+          status=0
+          "${hardened[@]}" "$IMAGE" /smoke/tls_smoke_client.py || status=$?
+          echo "Server log:"
+          docker logs vrm-tls-server
+          docker rm --force vrm-tls-server
+          docker network rm vrm-tls-smoke
+          exit "$status"
       - name: Generate SBOM
         run: |
           "$RUNNER_TEMP/trivy" image --no-progress --format cyclonedx \

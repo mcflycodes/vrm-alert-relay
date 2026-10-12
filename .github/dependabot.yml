@@ -1,12 +1,15 @@
 version: 2
 
 updates:
-  # Bumps the digest-pinned FROM lines when upstream images are rebuilt.
+  # Bumps the version-tagged uv image. The Wolfi base tracks a mutable tag that Dependabot
+  # cannot follow; the scheduled workflow refreshes its digest instead.
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: "*wolfi-base"
     groups:
       docker-minor-patch:
         update-types: [minor, patch]

@@ -18,9 +18,9 @@ Requirements live in [docs/requirements.md](docs/requirements.md) and decisions 
 
 ## Toolchain
 
-- Python 3.13, set in `.python-version` and `requires-python`. It matches the interpreter in the runtime image, `gcr.io/distroless/python3-debian13` (Debian 13's `python3.13`). Change the target version only together with the runtime image.
+- Python 3.13, set in `.python-version` and `requires-python`. It matches the interpreter in the runtime image, Wolfi's `python-3.13-base` package (ADR 0003). Change the target version only together with the runtime image.
 - Dependencies are managed with [uv](https://docs.astral.sh/uv/). `uv.lock` is committed; CI and the image build use `--locked`, so update the lock in the same change as `pyproject.toml`.
-- The Dockerfile's build and runtime stages use the same distroless release so the virtual environment matches `/usr/bin/python3.13`. Base images, CI actions, and downloaded CI tools are pinned by digest, commit SHA, or SHA-256; update pins together and keep the version comments accurate.
+- The Dockerfile's build stage installs the same Wolfi Python package into its own environment and into the runtime root filesystem, so the virtual environment matches `/usr/bin/python3.13`. Base images, CI actions, and downloaded CI tools are pinned by digest, commit SHA, or SHA-256; update pins together and keep the version comments accurate. Wolfi packages are not version-pinned, so image rebuilds are not byte-identical; the SBOM records exact versions. The weekly scheduled workflow refreshes the Wolfi base digest through a pull request, because Dependabot cannot follow its mutable tag.
 
 ## Verification
 
