@@ -1,0 +1,6 @@
+# Weakened copy for the Compose hardening self-test; it must be rejected.
+# expect: golden services.relay.environment.VRM_ALERT_RELAY_STATE_DIR: expected
+services:
+  relay:
+    environment:
+      VRM_ALERT_RELAY_STATE_DIR: /tmp

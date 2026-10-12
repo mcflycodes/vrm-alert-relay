@@ -133,36 +133,41 @@ jobs:
       - name: Validate Compose example
         run: |
           compose="$RUNNER_TEMP/docker-compose"
-          check=.github/scripts/check_compose_hardening.py
-          "$compose" -f compose.example.yaml config --quiet
-          "$compose" -f compose.example.yaml config --format json | python3 "$check"
+          check=(python3 .github/scripts/check_compose_hardening.py --root "$PWD")
+          expected=.github/compose-hardening.expected.json
 
-          # Self-test: each weakened copy must be rejected, for the expected reason.
-          weak="$RUNNER_TEMP/weakened"
-          mkdir -p "$weak"
-          printf 'services:\n  relay:\n    volumes:\n      - ./extra:/data\n' > "$weak/writable-bind.yaml"
-          printf 'services:\n  relay:\n    cap_add: [NET_ADMIN]\n' > "$weak/cap-add.yaml"
-          printf 'services:\n  relay:\n    ports: ["8080:8080"]\n' > "$weak/published-port.yaml"
-          printf 'services:\n  relay:\n    environment:\n      VOIPMS_API_PASSWORD: x\n' > "$weak/secret-env.yaml"
-          printf 'services:\n  relay:\n    read_only: false\n' > "$weak/writable-root.yaml"
-          declare -A expect=(
-            [writable-bind]='expected exactly one writable mount'
-            [cap-add]='cap_add: must not be set'
-            [published-port]='ports: must not be set'
-            [secret-env]='secrets must be files'
-            [writable-root]='read_only: must be'
-          )
-          for name in "${!expect[@]}"; do
-            if output="$("$compose" -f compose.example.yaml -f "$weak/$name.yaml" config --format json \
-                         | python3 "$check" 2>&1)"; then
-              echo "::error::self-test: the weakened copy '${name}' was accepted"
-              exit 1
+          # The example as shipped must match the expected file exactly, and
+          # keep every invariant.
+          "$compose" -f compose.example.yaml config --quiet
+          "$compose" -f compose.example.yaml config --format json | "${check[@]}" --expected "$expected"
+
+          # Self-test: every weakened copy must be rejected, for the reason its
+          # file names. Where that reason is an invariant, it must still be
+          # rejected after the expected file is carelessly regenerated from it.
+          for case in .github/compose-selftest/*.yaml; do
+            name="$(basename "$case" .yaml)"
+            reason="$(sed -n 's/^# expect: //p' "$case")"
+            [[ -n "$reason" ]] || { echo "::error::self-test ${name} names no expected reason"; exit 1; }
+            rendered="$RUNNER_TEMP/${name}.json"
+            "$compose" -f compose.example.yaml -f "$case" config --format json > "$rendered"
+            modes=(golden)
+            if [[ "$reason" == invariant* ]]; then
+              "${check[@]}" --expected "$RUNNER_TEMP/${name}.expected.json" --update < "$rendered" > /dev/null
+              modes+=(regenerated)
             fi
-            if ! grep -qF -- "${expect[$name]}" <<< "$output"; then
-              echo "::error::self-test: '${name}' was rejected for the wrong reason: ${output}"
-              exit 1
-            fi
-            echo "Self-test '${name}' rejected as expected: $(grep -F -- "${expect[$name]}" <<< "$output")"
+            for mode in "${modes[@]}"; do
+              file="$expected"
+              [[ "$mode" == regenerated ]] && file="$RUNNER_TEMP/${name}.expected.json"
+              if output="$("${check[@]}" --expected "$file" < "$rendered" 2>&1)"; then
+                echo "::error::self-test ${name} (${mode}): the weakened copy was accepted"
+                exit 1
+              fi
+              if ! grep -qF -- "$reason" <<< "$output"; then
+                echo "::error::self-test ${name} (${mode}): rejected for the wrong reason: ${output}"
+                exit 1
+              fi
+              echo "Self-test ${name} (${mode}) rejected as expected: $(grep -F -- "$reason" <<< "$output")"
+            done
           done
       - name: Build image
         run: docker build --pull --tag "$IMAGE" .

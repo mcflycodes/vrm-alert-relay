@@ -1,167 +1,156 @@
-"""Check that the rendered Compose example keeps its hardening (requirement R29).
+"""Check that the Compose example keeps its hardening (requirement R29).
 
-Reads the output of ``docker compose config --format json`` on standard input
-and exits non-zero, listing every problem, if any hardened setting is missing
-or weakened. CI runs it on the example, and on deliberately weakened copies
-that it must reject.
+Reads ``docker compose config --format json`` for the example as shipped, on
+standard input, and applies two layers:
+
+1. **Golden comparison.** The rendered document, normalised, must equal the
+   checked-in expected file exactly. Any change to the example's settings,
+   including ones no rule anticipates, fails until the expected file is
+   updated in the same change, where reviewers see it. Normalisation replaces
+   only what legitimately varies between machines: the image reference, the
+   state volume's name, the project name, and absolute paths under the
+   repository.
+2. **Invariants.** Explicit checks of the critical properties, so a careless
+   update of the expected file still fails on them.
+
+Exits non-zero listing every difference and violation. ``--update`` rewrites
+the expected file from the input instead (review the result before committing).
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
+from pathlib import Path
 from typing import Any
 
-SERVICES = {"relay"}
 USER = "65532:65532"
 STATE_TARGET = "/var/lib/vrm-alert-relay"
-STATE_VOLUME = "state"
-READ_ONLY_TARGETS = {"/etc/vrm-alert-relay/config.yaml"}
-SECRETS = {
-    "vrm_token",
-    "voipms_username",
-    "voipms_api_password",
-    "homeassistant_token",
-    "webhook_token",
-    "homeassistant_ca.pem",
-    "webhook_ca.pem",
-}
-REQUIRED_SECRETS = {"vrm_token"}
-ENVIRONMENT = {
-    "VRM_ALERT_RELAY_CONFIG",
-    "VRM_ALERT_RELAY_STATE_DIR",
-    "VRM_ALERT_RELAY_LOG_LEVEL",
-}
 SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|KEY|CREDENTIAL|AUTH", re.IGNORECASE)
-FORBIDDEN_KEYS = (
-    "cap_add",
-    "cgroup",
-    "device_cgroup_rules",
-    "devices",
-    "env_file",
-    "group_add",
-    "network_mode",
-    "pid",
-    "ports",
-    "privileged",
-    "tmpfs",
-    "userns_mode",
-    "uts",
-    "volumes_from",
-)
+SOCKET = re.compile(r"docker\.sock|podman\.sock|containerd\.sock", re.IGNORECASE)
 
 
-def _mount_problems(mounts: list[dict[str, Any]]) -> list[str]:
-    problems: list[str] = []
-    writable = []
-    for mount in mounts:
-        source = str(mount.get("source", ""))
-        target = mount.get("target")
-        if "docker.sock" in source or "docker.sock" in str(target):
-            problems.append(f"mount {target}: the Docker socket must never be mounted")
-        if mount.get("read_only") is True:
-            if mount.get("type") != "bind" or target not in READ_ONLY_TARGETS:
-                problems.append(f"mount {target}: unexpected read-only mount")
-        else:
-            writable.append(mount)
-    if len(writable) != 1:
-        problems.append(f"expected exactly one writable mount, found {len(writable)}")
-    for mount in writable:
-        expected = (mount.get("type"), mount.get("source"), mount.get("target"))
-        if expected != ("volume", STATE_VOLUME, STATE_TARGET):
-            problems.append(
-                f"mount {mount.get('target')}: the only writable mount must be the "
-                f"'{STATE_VOLUME}' volume at {STATE_TARGET}"
-            )
-    return problems
+def normalise(config: dict[str, Any], root: str) -> dict[str, Any]:
+    """``config`` with only machine-specific values replaced by placeholders."""
+    project = config.get("name")
+    text = json.dumps(config)
+    if root:
+        # JSON-escape the root so it matches inside encoded strings.
+        prefix = json.dumps(root.rstrip("/") + "/")[1:-1]
+        text = text.replace(prefix, "./")
+    data: dict[str, Any] = json.loads(text)
+    data.pop("name", None)
+    relay = data.get("services", {}).get("relay")
+    if isinstance(relay, dict) and "image" in relay:
+        relay["image"] = "<image>"
+    state = data.get("volumes", {}).get("state")
+    if isinstance(state, dict) and "name" in state:
+        state["name"] = "<state-volume>"
+    for section in ("networks", "secrets"):
+        for entry in data.get(section, {}).values():
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if isinstance(name, str) and project and name.startswith(f"{project}_"):
+                entry["name"] = "<project>_" + name[len(project) + 1 :]
+    return data
 
 
-def _secret_problems(relay: dict[str, Any], config: dict[str, Any]) -> list[str]:
-    problems: list[str] = []
-    names = set()
-    for entry in relay.get("secrets", []):
-        name = entry.get("source")
-        names.add(name)
-        if name not in SECRETS:
-            problems.append(f"secret {name}: not an expected secret")
-        if entry.get("target") != f"/run/secrets/{name}":
-            problems.append(f"secret {name}: must be mounted at /run/secrets/{name}")
-        problems.extend(
-            f"secret {name}: '{key}' is not supported without Swarm"
-            for key in ("uid", "gid", "mode")
-            if key in entry
+def differences(expected: object, actual: object, path: str = "") -> list[str]:
+    """Readable differences between two JSON values, one line each."""
+    where = path or "<root>"
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        lines: list[str] = []
+        for key in sorted(expected.keys() | actual.keys()):
+            sub = f"{path}.{key}" if path else key
+            if key not in actual:
+                lines.append(f"{sub}: missing (expected {json.dumps(expected[key])})")
+            elif key not in expected:
+                lines.append(f"{sub}: unexpected (found {json.dumps(actual[key])})")
+            else:
+                lines.extend(differences(expected[key], actual[key], sub))
+        return lines
+    if isinstance(expected, list) and isinstance(actual, list):
+        if len(expected) != len(actual):
+            return [f"{where}: expected {len(expected)} item(s), found {len(actual)}"]
+        lines = []
+        for index, (left, right) in enumerate(zip(expected, actual, strict=True)):
+            lines.extend(differences(left, right, f"{path}[{index}]"))
+        return lines
+    if expected != actual or type(expected) is not type(actual):
+        return [f"{where}: expected {json.dumps(expected)}, found {json.dumps(actual)}"]
+    return []
+
+
+def _mount_violations(relay: dict[str, Any]) -> list[str]:
+    writable = [m for m in relay.get("volumes", []) if m.get("read_only") is not True]
+    state = [
+        m
+        for m in writable
+        if (m.get("type"), m.get("source"), m.get("target")) == ("volume", "state", STATE_TARGET)
+    ]
+    if len(writable) != 1 or len(state) != 1:
+        message = (
+            f"invariant mounts: the only writable mount must be the state volume at "
+            f"{STATE_TARGET} (found {len(writable)} writable)"
         )
-    problems.extend(f"secret {name}: required" for name in sorted(REQUIRED_SECRETS - names))
-    for name, definition in config.get("secrets", {}).items():
-        if set(definition) - {"name", "file"} or "file" not in definition:
-            problems.append(f"secret {name}: must come from a file, and nothing else")
-    return problems
+        return [message]
+    return []
 
 
-def _environment_problems(relay: dict[str, Any]) -> list[str]:
-    problems: list[str] = []
-    for name in relay.get("environment", {}):
-        if SECRET_NAME.search(name):
-            problems.append(f"environment {name}: secrets must be files, not variables")
-        elif name not in ENVIRONMENT:
-            problems.append(f"environment {name}: not an expected variable")
-    return problems
-
-
-def _service_problems(relay: dict[str, Any]) -> list[str]:
-    problems: list[str] = []
-    expected = {
+def invariant_violations(config: dict[str, Any]) -> list[str]:
+    """The critical properties, checked explicitly."""
+    services = config.get("services", {})
+    if set(services) != {"relay"}:
+        return [f"invariant services: expected only 'relay', found {sorted(services)}"]
+    relay = services["relay"]
+    required = {
         "user": USER,
         "read_only": True,
         "cap_drop": ["ALL"],
         "security_opt": ["no-new-privileges:true"],
-        "ipc": "private",
     }
-    for key, value in expected.items():
-        if relay.get(key) != value:
-            problems.append(f"{key}: must be {value!r}, found {relay.get(key)!r}")
-    problems.extend(
-        f"{key}: must not be set"
-        for key in FORBIDDEN_KEYS
-        if key in relay and relay[key] not in (False, None, [], {})
+    violations = [
+        f"invariant {key}: must be {json.dumps(value)}"
+        for key, value in required.items()
+        if relay.get(key) != value
+    ]
+    violations.extend(
+        f"invariant {key}: must not be set"
+        for key in ("privileged", "use_api_socket", "ports", "cap_add", "network_mode", "pid")
+        if relay.get(key) not in (None, False, [], {})
     )
-    options = relay.get("logging", {}).get("options", {})
-    if not {"max-size", "max-file"} <= set(options):
-        problems.append("logging: max-size and max-file must be set")
-    problems.extend(
-        f"{key}: must be set" for key in ("mem_limit", "pids_limit") if not relay.get(key)
+    violations.extend(_mount_violations(relay))
+    if SOCKET.search(json.dumps(config)):
+        violations.append("invariant: no container engine socket may be mounted or referenced")
+    violations.extend(
+        f"invariant environment {name}: secrets must be files, not variables"
+        for name in relay.get("environment", {})
+        if SECRET_NAME.search(name)
     )
-    return problems
-
-
-def problems_in(config: dict[str, Any]) -> list[str]:
-    """Every way ``config`` (rendered Compose JSON) departs from the hardened example."""
-    services = config.get("services", {})
-    if set(services) != SERVICES:
-        return [f"services: expected exactly {sorted(SERVICES)}, found {sorted(services)}"]
-    relay = services["relay"]
-    problems = _service_problems(relay)
-    problems.extend(_mount_problems(relay.get("volumes", [])))
-    problems.extend(_secret_problems(relay, config))
-    problems.extend(_environment_problems(relay))
-    volume = config.get("volumes", {}).get(STATE_VOLUME, {})
-    if (
-        volume.get("driver", "local") != "local"
-        or volume.get("driver_opts")
-        or volume.get("external")
-    ):
-        problems.append("volumes.state: must be a plain local volume")
-    return problems
+    return violations
 
 
 def main() -> None:
-    problems = problems_in(json.load(sys.stdin))
+    parser = argparse.ArgumentParser(description="Check the Compose example's hardening.")
+    parser.add_argument("--expected", type=Path, required=True)
+    parser.add_argument("--root", default="", help="repository root, for relative paths")
+    parser.add_argument("--update", action="store_true", help="rewrite the expected file")
+    args = parser.parse_args()
+
+    actual = normalise(json.load(sys.stdin), args.root)
+    if args.update:
+        args.expected.write_text(json.dumps(actual, indent=2, sort_keys=True) + "\n")
+        sys.stdout.write(f"wrote {args.expected}\n")
+        return
+    expected = json.loads(args.expected.read_text())
+    problems = [f"golden {line}" for line in differences(expected, actual)]
+    problems.extend(invariant_violations(actual))
     if problems:
-        raise SystemExit(
-            "Compose hardening check failed:\n" + "\n".join(f"  - {p}" for p in problems)
-        )
-    sys.stdout.write("Compose hardening check passed\n")
+        details = "".join(f"  - {problem}\n" for problem in problems)
+        sys.stderr.write(f"Compose hardening check failed:\n{details}")
+        raise SystemExit(1)
+    sys.stdout.write("Compose hardening check passed: golden match and invariants hold\n")
 
 
 if __name__ == "__main__":

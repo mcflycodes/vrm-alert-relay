@@ -1,0 +1,11 @@
+# Weakened copy for the Compose hardening self-test; it must be rejected.
+# expect: golden services.relay.volumes[1].bind: unexpected
+services:
+  relay:
+    volumes:
+      - type: bind
+        source: ./config.yaml
+        target: /etc/vrm-alert-relay/config.yaml
+        read_only: true
+        bind:
+          propagation: rshared

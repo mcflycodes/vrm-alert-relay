@@ -1,0 +1,5 @@
+# Weakened copy for the Compose hardening self-test; it must be rejected.
+# expect: invariant read_only: must be true
+services:
+  relay:
+    read_only: false

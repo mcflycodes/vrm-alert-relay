@@ -1,0 +1,8 @@
+# Weakened copy for the Compose hardening self-test; it must be rejected.
+# expect: golden services.relay.post_start: unexpected
+services:
+  relay:
+    post_start:
+      - command: ["/bin/sh", "-c", "id"]
+        user: root
+        privileged: true

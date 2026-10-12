@@ -1,0 +1,5 @@
+# Weakened copy for the Compose hardening self-test; it must be rejected.
+# expect: golden services.relay.mem_limit: expected
+services:
+  relay:
+    mem_limit: 8g

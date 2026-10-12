@@ -21,6 +21,12 @@
 #
 # Once releases are published, use the release image instead, ideally pinned by
 # digest: ghcr.io/OWNER/vrm-alert-relay:VERSION@sha256:DIGEST.
+#
+# CI checks this file as shipped against .github/compose-hardening.expected.json
+# and a set of hardening invariants (.github/scripts/check_compose_hardening.py).
+# Any change to it here must update that expected file in the same change. The
+# check covers the shipped example only: your own copy, with provider secrets
+# or a health check uncommented, is not checked, so review such edits yourself.
 
 name: vrm-alert-relay
 

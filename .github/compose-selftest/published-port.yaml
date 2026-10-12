@@ -1,0 +1,5 @@
+# Weakened copy for the Compose hardening self-test; it must be rejected.
+# expect: invariant ports: must not be set
+services:
+  relay:
+    ports: ["8080:8080"]

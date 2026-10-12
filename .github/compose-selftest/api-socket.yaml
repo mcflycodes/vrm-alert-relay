@@ -1,0 +1,5 @@
+# Weakened copy for the Compose hardening self-test; it must be rejected.
+# expect: invariant use_api_socket: must not be set
+services:
+  relay:
+    use_api_socket: true
