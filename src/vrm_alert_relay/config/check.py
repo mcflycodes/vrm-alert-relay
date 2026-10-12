@@ -13,8 +13,16 @@ from .models import DeliveryMode, ProviderName
 if TYPE_CHECKING:
     import os
 
-__all__ = ["STRUCTURE_ONLY_NOTE", "CheckReport", "check_config"]
+__all__ = [
+    "STRUCTURE_ONLY_NOTE",
+    "SYSTEM_RECIPIENTS_DEFAULT_NOTE",
+    "CheckReport",
+    "check_config",
+]
 
+SYSTEM_RECIPIENTS_DEFAULT_NOTE = (
+    "system_recipients: not set; system notifications go to every recipient used by a rule"
+)
 STRUCTURE_ONLY_NOTE = (
     "structure-only check: secret files were not read, so this configuration "
     "has not been verified as ready to deploy"
@@ -44,6 +52,8 @@ class CheckReport:
     dry_run_providers: tuple[ProviderName, ...] = ()
     live_recipients: tuple[str, ...] = ()
     dry_run_recipients: tuple[str, ...] = ()
+    system_recipients: tuple[str, ...] = ()
+    system_recipients_defaulted: bool = False
 
 
 def check_config(path: str | os.PathLike[str], *, structure_only: bool = False) -> CheckReport:
@@ -69,6 +79,9 @@ def check_config(path: str | os.PathLike[str], *, structure_only: bool = False) 
         _, problems, secret_warnings = _collect_secrets(config, preflight=True)
     shown = {name: display_name(name, position) for position, name in enumerate(config.recipients)}
     modes = config.delivery_modes()
+    defaulted = config.system_recipients is None
+    if defaulted:
+        notes = (*notes, SYSTEM_RECIPIENTS_DEFAULT_NOTE)
     ok = not problems
     return CheckReport(
         ok=ok,
@@ -84,4 +97,6 @@ def check_config(path: str | os.PathLike[str], *, structure_only: bool = False) 
         dry_run_providers=config.dry_run_providers(),
         live_recipients=tuple(shown[n] for n, m in modes.items() if m is DeliveryMode.LIVE),
         dry_run_recipients=tuple(shown[n] for n, m in modes.items() if m is DeliveryMode.DRY_RUN),
+        system_recipients=tuple(shown[n] for n in config.system_recipient_names()),
+        system_recipients_defaulted=defaulted,
     )

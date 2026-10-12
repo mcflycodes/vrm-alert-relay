@@ -18,6 +18,11 @@
 #     lowercase letters, digits, "_" and "-", up to 63 characters.
 #   - Quote phone numbers so YAML reads them as text.
 
+# State: the relay keeps its state (delivery records, send history for the
+# rate limits, rule state) in a state directory set at deployment. That
+# directory must be on a local filesystem: file locking and SQLite's WAL mode
+# are not reliable on NFS or other network filesystems.
+
 # Configuration format version (required). This release supports version 1.
 version: 1
 
@@ -46,10 +51,10 @@ vrm:
       site_id: 123456
 
 # Global caps on outgoing messages, shared by every rule and provider.
-# Retries count against these caps.
+# Retries, summaries, and storage notices count against these caps.
 rate_limits:
-  global_per_hour: 20 # default 20
-  global_per_day: 60 # default 60
+  global_per_hour: 20 # default 20, at most 200
+  global_per_day: 60 # default 60, at most 1000
   retries: 3 # delivery retries per message, with backoff (default 3)
 
 # The recipient allowlist (up to 50). Rules refer to recipients by name;
@@ -171,6 +176,13 @@ rules:
       - owner_phone_app
       - automation_hook
       - audit_log
+
+# Optional: who receives system notifications, such as the "alerts held back
+# by the global rate limit" summary and the "state storage unavailable"
+# warning. Names from the recipients section. When omitted, every recipient
+# used by a rule receives them.
+# system_recipients:
+#   - owner_sms
 
 # Optional informational health endpoint. It reports no secrets or recipient
 # data. Keep it on loopback unless something else needs to reach it.

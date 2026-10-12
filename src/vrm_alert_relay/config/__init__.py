@@ -1,6 +1,12 @@
 """Operator configuration: strict YAML loading, validation, and secret files."""
 
-from .check import STRUCTURE_ONLY_NOTE, CheckReport, check_config
+from ._paths import display_name
+from .check import (
+    STRUCTURE_ONLY_NOTE,
+    SYSTEM_RECIPIENTS_DEFAULT_NOTE,
+    CheckReport,
+    check_config,
+)
 from .errors import ConfigError
 from .fields import PhoneNumber
 from .loader import (
@@ -12,6 +18,8 @@ from .loader import (
     parse_config,
 )
 from .models import (
+    MAX_GLOBAL_PER_DAY,
+    MAX_GLOBAL_PER_HOUR,
     PROVIDER_NAMES,
     SUPPORTED_VERSIONS,
     DeliveryMode,
@@ -45,9 +53,12 @@ from .secret import (
 )
 
 __all__ = [
+    "MAX_GLOBAL_PER_DAY",
+    "MAX_GLOBAL_PER_HOUR",
     "PROVIDER_NAMES",
     "STRUCTURE_ONLY_NOTE",
     "SUPPORTED_VERSIONS",
+    "SYSTEM_RECIPIENTS_DEFAULT_NOTE",
     "CheckReport",
     "ConfigError",
     "DeliveryMode",
@@ -80,6 +91,7 @@ __all__ = [
     "WebhookRecipient",
     "check_config",
     "config_warnings",
+    "display_name",
     "load_config",
     "load_secrets",
     "parse_config",

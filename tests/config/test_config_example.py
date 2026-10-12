@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from vrm_alert_relay.config import (
     STRUCTURE_ONLY_NOTE,
+    SYSTEM_RECIPIENTS_DEFAULT_NOTE,
     DeliveryMode,
     check_config,
     load_config,
@@ -21,7 +22,7 @@ def test_example_is_structurally_valid_in_dry_run(example_path: Path) -> None:
     report = check_config(example_path, structure_only=True)
     assert report.ok is True, report.problems
     assert report.ready is False
-    assert report.notes == (STRUCTURE_ONLY_NOTE,)
+    assert report.notes == (STRUCTURE_ONLY_NOTE, SYSTEM_RECIPIENTS_DEFAULT_NOTE)
     assert report.problems == ()
     assert (report.installations, report.rules, report.recipients) == (1, 2, 4)
     assert report.live_providers == ()

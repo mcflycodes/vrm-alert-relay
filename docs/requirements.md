@@ -38,10 +38,10 @@ Users are technically capable people who self-host one instance for their own in
 ### State and delivery
 - R13. Persistent state (rule levels, episodes, reminder counts, last-sent times, rate-limit counters, pending deliveries) in a local SQLite file survives restart. Re-evaluating an unchanged condition after a restart sends nothing.
 - R14. Each event has a stable identity (rule, episode, level, kind); delivery is tracked per (event, recipient).
-- R15. Delivery fails toward alerting: the relay records a delivery as in-flight before sending; after an ambiguous outcome (timeout, crash), it reconciles with the provider when the provider supports a lookup (VoIP.ms `getSMS`) and otherwise retries. A rare duplicate after a crash is accepted.
-- R16. Rate limits: one global cap (defaults 20/hour, 60/day), per-rule cooldowns (R11), and the critical-reminder cap (R9). Retries count against the global cap. When the cap is hit, held-back events are counted and logged, and one "N alerts suppressed" summary is sent when the window reopens.
+- R15. Delivery fails toward alerting: the relay records a delivery as in-flight before sending (best effort: when storage cannot record it, the message is still sent); after an ambiguous outcome (timeout, crash), it reconciles with the provider when the provider supports a lookup (VoIP.ms `getSMS`) and otherwise retries. A rare duplicate after a crash is accepted.
+- R16. Rate limits: one global cap (defaults 20/hour, 60/day), per-rule cooldowns (R11), and the critical-reminder cap (R9). Retries count against the global cap. When the cap is hit, held-back events are counted and logged, and one "N alerts suppressed" summary is sent when the window reopens; real alerts take free slots first, but the summary waits at most an hour.
 - R17. Bounded retries (default 3) with exponential backoff and jitter.
-- R18. Failures never go silent: VRM fetch/parse failures and stale data produce the degraded notification (R10); a failure to persist state is logged loudly, surfaced in health, and delivery continues with in-memory duplicate suppression, still bounded by the global cap.
+- R18. Failures never go silent: VRM fetch/parse failures and stale data produce the degraded notification (R10); a failure to persist state is logged loudly, surfaced in health, and delivery continues with in-memory duplicate suppression, still bounded by the global cap enforced in memory; provider-side limits are the backstop across restarts during such a failure (ADR 0002).
 
 ### Providers
 - R19. A provider interface; no provider-specific logic in the core. Each provider is an in-tree adapter with its documented default endpoint, which the operator may override in configuration (HTTPS only).
