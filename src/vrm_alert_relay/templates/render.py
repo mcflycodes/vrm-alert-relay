@@ -283,8 +283,8 @@ DEFAULT_TEMPLATES: Final[Mapping[NotificationKind, Template]] = MappingProxyType
             "VRM Alert Relay: {count} alert(s) held back by the global rate limit since {time}"
         ),
         NotificationKind.STORAGE_NOTICE: Template(
-            "VRM Alert Relay: state storage is unavailable; alerts may be held back "
-            "until it is repaired"
+            "VRM Alert Relay: state storage is failing, so alerts continue under limits "
+            "kept in memory only. Check the relay."
         ),
         NotificationKind.MONITORING_DEGRADED: Template(
             "VRM Alert Relay: monitoring of {installation} is degraded since {time}; "

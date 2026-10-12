@@ -106,7 +106,7 @@ def test_held_back_alerts_survive_a_restart_while_sqlite_is_down(tmp_path: Path)
     engine = make_engine(store, clock=clock, config=config, voipms=provider)
     engine.run_due()
     assert summaries(provider) == [
-        "VRM Alert Relay: 3 alerts held back by the global rate limit since 2035-01-01 00:00 UTC."
+        "VRM Alert Relay: 3 alert(s) held back by the global rate limit since 2035-01-01 00:00 UTC"
     ]
     store.close()
     switch.on = False
@@ -464,7 +464,7 @@ def test_a_summary_lost_with_a_corrupt_database_is_opened_again(tmp_path: Path) 
         engine.run_due()
     held_back = [text for text in summaries(provider) if text != STORAGE_NOTICE_TEXT]
     assert held_back[-1] == (
-        "VRM Alert Relay: 2 alerts held back by the global rate limit since 2035-01-01 00:00 UTC."
+        "VRM Alert Relay: 2 alert(s) held back by the global rate limit since 2035-01-01 00:00 UTC"
     )
     assert len(held_back) == 2
     assert engine.health().suppressed_pending == 0
