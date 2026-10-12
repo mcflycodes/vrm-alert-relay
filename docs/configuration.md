@@ -1,6 +1,6 @@
 # Configuration reference
 
-**Updated:** 2026-10-11
+**Updated:** 2026-10-12
 
 VRM Alert Relay is an unofficial, independent project. It is not affiliated with, sponsored by, or endorsed by Victron Energy.
 
@@ -180,6 +180,7 @@ A list of up to 200 rules. Each rule watches one measurement of one installation
 | `reminder_interval_minutes` | integer | `60` | 1 to 10,080 (7 days). |
 | `reminder_max` | integer | `3` | 0 to 20. `0` disables reminders. |
 | `stale_after_minutes` | integer | `35` | 1 to 10,080, and longer than `vrm.poll_interval`. |
+| `display_unit` | `degC` or `degF` | not set | Shows a temperature measured in °C in this unit in messages. See [Display unit](#display-unit). |
 | `recipients` | list of names | required | 1 to 50 configured recipient names, without duplicates. |
 
 **`measurement`** identifies the value in the installation's VRM Diagnostics data ([vrm-credentials.md](vrm-credentials.md#find-measurement-codes) shows how to list the records):
@@ -206,6 +207,31 @@ How the timing settings work:
 - **Hysteresis and clearing:** a level clears only after the value has gone back past `threshold - hysteresis` (rising) or `threshold + hysteresis` (falling) for `clear_after_samples` consecutive samples. With `hysteresis: 0`, a value hovering at a threshold clears and re-triggers repeatedly, held back only by the cooldown, so set a non-zero hysteresis.
 - **Reminders:** while the rule stays at its **highest** level, a reminder goes out every `reminder_interval_minutes`, at most `reminder_max` times per episode.
 - **Stale data:** once a rule has had a sample, it reports stale data when its newest sample is older than `stale_after_minutes`, and "data restored" when samples return. The default of 35 minutes is two default GX log intervals plus margin; [vrm-credentials.md](vrm-credentials.md#how-fresh-is-the-data) explains how to tune it.
+
+### Display unit
+
+`display_unit` changes only how a rule's messages show its value. VRM reports temperatures in degrees Celsius, so `threshold` and `hysteresis` are always written in °C, and the rule is evaluated, cleared and deduplicated exactly as it would be without the setting.
+
+| Value | `{value}` | `{unit}` |
+|---|---|---|
+| `degC` | The value in °C, rounded to one decimal. | `°C` |
+| `degF` | The value converted to °F, rounded to one decimal. | `°F` |
+
+Any other value is rejected when the file is loaded. The relay converts a value only when VRM reported °C (in the record's `formatWithUnit`) with that same reading. A unit from an earlier or later poll is never applied to it, so a reminder or recovery for a value whose unit is not known, such as one restored from saved state after a restart, shows the value as reported. If it reports another unit, or none, the message is still sent, with the value and unit as VRM reports them, and the relay logs a `relay.display_unit_fallback` warning. Without `display_unit`, `{unit}` stays empty and `{value}` shows up to three decimals, as before.
+
+```yaml
+rules:
+  - id: cabin-freezer-warm
+    installation: cabin
+    measurement: {code: tsT, instance: 20}
+    direction: rising
+    display_unit: degF # messages say "25.7°F"; thresholds stay in °C
+    levels:
+      - name: critical
+        threshold: -4.0 # °C
+    hysteresis: 1.0 # °C
+    recipients: [owner_sms]
+```
 
 ### Message templates
 

@@ -13,11 +13,13 @@ from vrm_alert_relay.engine.models import Sample
 from vrm_alert_relay.vrm.diagnostics import (
     MAX_LABEL_LENGTH,
     MAX_RECORDS,
+    MAX_UNIT_LENGTH,
     MeasurementResult,
     ReadingProblem,
     TimestampPolicy,
     parse_diagnostics,
     sanitize_label,
+    unit_from_format,
 )
 from vrm_alert_relay.vrm.errors import FailureKind, VrmResponseError
 
@@ -344,3 +346,54 @@ def test_malicious_labels_remain_inert() -> None:
 def test_label_cannot_select_a_record() -> None:
     payload = diagnostics(record("xx", 7, 99.0, description="bv instance 0 battery"))
     assert only(payload).problem is ReadingProblem.MISSING
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("%.1F °C", "°C"),
+        ("%.2F V", "V"),
+        ("%d W", "W"),
+        ("%.0F %%", "%"),
+        ("  %+08.3f   kWh  ", "kWh"),
+        ("%.1F ℃", "℃"),
+        ("%.1F °C\n\u202e", "°C"),
+        ("%s", None),
+        ("%.1F", None),
+        ("%.1F   ", None),
+        ("°C", None),
+        ("value %.1F °C", None),
+        ("", None),
+        (None, None),
+        (21, None),
+        (["%.1F °C"], None),
+    ],
+)
+def test_unit_from_format(raw: object, expected: str | None) -> None:
+    assert unit_from_format(raw) == expected
+
+
+def test_unit_from_format_is_bounded() -> None:
+    unit = unit_from_format("%.1F " + "x" * 10_000)
+    assert unit == "x" * MAX_UNIT_LENGTH
+    assert unit_from_format("%.1F " + "a" * (MAX_UNIT_LENGTH - 1) + " b") == "a" * (
+        MAX_UNIT_LENGTH - 1
+    )
+
+
+def test_results_carry_the_reported_unit() -> None:
+    reading = record("tsT", 20, -18.2, service_type="temperature")
+    reading["formatWithUnit"] = "%.1F °C"
+    when = datetime.fromtimestamp(NOW_TS, UTC)
+    temperature = measurement("tsT", 20)
+    assert only(diagnostics(reading), temperature) == MeasurementResult(
+        temperature, sample=Sample(-18.2, when), label="Fictitious attribute", unit="°C"
+    )
+    reading["rawValue"] = "warm"
+    assert only(diagnostics(reading), temperature).unit == "°C"
+    reading["rawValue"] = -18.2
+    reading["timestamp"] = "later"
+    assert only(diagnostics(reading), temperature).unit == "°C"
+    del reading["formatWithUnit"]
+    reading["timestamp"] = NOW_TS
+    assert only(diagnostics(reading), temperature).unit is None

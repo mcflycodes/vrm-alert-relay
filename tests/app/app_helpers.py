@@ -83,6 +83,8 @@ class FakeVrm:
     now: Callable[[], datetime]
     values: dict[tuple[int, str, int], object] = field(default_factory=dict)
     labels: dict[tuple[int, str, int], object] = field(default_factory=dict)
+    formats: dict[tuple[int, str, int], object] = field(default_factory=dict)
+    """``formatWithUnit`` per record; records without one carry none."""
     failures: dict[int, int] = field(default_factory=dict)
     extra_records: list[dict[str, object]] = field(default_factory=list)
     requests: list[httpx.Request] = field(default_factory=list)
@@ -134,6 +136,10 @@ class FakeVrm:
             for (s, code, instance), value in self.values.items()
             if s == site
         ]
+        for entry in records:
+            key = (site, str(entry["code"]), int(str(entry["instance"])))
+            if key in self.formats:
+                entry["formatWithUnit"] = self.formats[key]
         records.extend(self.extra_records)
         return respond(request, 200, {"success": True, "records": records})
 

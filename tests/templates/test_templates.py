@@ -13,16 +13,20 @@ from hypothesis import strategies as st
 from vrm_alert_relay.engine import Event, EventKind
 from vrm_alert_relay.templates import (
     DEFAULT_TEMPLATES,
+    DISPLAY_DECIMALS,
     FIELD_LIMITS,
     FIELD_NAMES,
     MAX_RENDERED_LENGTH,
     MAX_TEMPLATE_CHARS,
     MISSING,
+    DisplayUnit,
     NotificationKind,
     Template,
     TemplateFields,
     TemplateSyntaxError,
     fields_for_event,
+    for_display,
+    is_celsius,
     neutralize_links,
     parse_template,
     render_notification,
@@ -433,3 +437,97 @@ def test_lookalike_links_never_survive(parts: list[str]) -> None:
     assert "://" not in folded
     assert LINKY.search(folded) is None
     assert BARE_SCHEME.search(folded) is None
+
+
+@pytest.mark.parametrize("unit", ["°C", " °C ", "° C", "℃"])
+def test_celsius_spellings_are_recognized(unit: str) -> None:
+    assert is_celsius(unit)
+
+
+@pytest.mark.parametrize("unit", [None, "", "C", "°F", "°c", "ºC", "V", "%", "K"])
+def test_other_units_are_not_celsius(unit: str | None) -> None:
+    assert not is_celsius(unit)
+
+
+@pytest.mark.parametrize(
+    ("celsius", "display_unit", "value", "symbol"),
+    [
+        (-3.5, DisplayUnit.DEG_F, 25.7, "°F"),
+        (-40.0, DisplayUnit.DEG_F, -40.0, "°F"),
+        (-18.0, DisplayUnit.DEG_F, -0.4, "°F"),
+        (0.0, DisplayUnit.DEG_F, 32.0, "°F"),
+        (4.44, DisplayUnit.DEG_F, 40.0, "°F"),
+        (37.0, DisplayUnit.DEG_F, 98.6, "°F"),
+        (-3.5, DisplayUnit.DEG_C, -3.5, "°C"),
+        (-3.46, DisplayUnit.DEG_C, -3.5, "°C"),
+        (21.04, DisplayUnit.DEG_C, 21.0, "°C"),
+    ],
+)
+def test_for_display_converts_and_rounds(
+    celsius: float, display_unit: DisplayUnit, value: float, symbol: str
+) -> None:
+    fields = TemplateFields(kind=NotificationKind.ESCALATED, value=celsius, unit=None)
+    shown = for_display(fields, display_unit, reported_unit="°C")
+    assert shown is not None
+    assert shown.value == pytest.approx(value)
+    assert shown.unit == symbol
+    assert shown.kind is fields.kind
+
+
+@pytest.mark.parametrize(
+    ("celsius", "text"),
+    [
+        (-3.5, "25.7°F"),
+        (-17.8, "0°F"),
+        (-17.79, "0°F"),
+        (-18.0, "-0.4°F"),
+        (-23.3, "-9.9°F"),
+        (4.44, "40°F"),
+        (4.5, "40.1°F"),
+    ],
+)
+def test_display_value_renders_with_one_decimal_at_most(celsius: float, text: str) -> None:
+    fields = TemplateFields(kind=NotificationKind.ESCALATED, value=celsius)
+    shown = for_display(fields, DisplayUnit.DEG_F, reported_unit="℃")
+    assert shown is not None
+    assert Template("{value}{unit}").render(shown) == text
+
+
+def test_for_display_rounds_to_the_documented_decimals() -> None:
+    assert DISPLAY_DECIMALS == 1
+    fields = TemplateFields(kind=NotificationKind.ESCALATED, value=1.23456)
+    shown = for_display(fields, DisplayUnit.DEG_C, reported_unit="°C")
+    assert shown is not None
+    assert Template("{value}").render(shown) == "1.2"
+
+
+def test_for_display_keeps_a_missing_value_missing() -> None:
+    fields = TemplateFields(kind=NotificationKind.STALE, rule="freezer", time=WHEN)
+    shown = for_display(fields, DisplayUnit.DEG_F, reported_unit="°C")
+    assert shown == TemplateFields(
+        kind=NotificationKind.STALE, rule="freezer", time=WHEN, unit="°F"
+    )
+
+
+@pytest.mark.parametrize("reported", [None, "", "V", "°F", "%", "°C/h"])
+@pytest.mark.parametrize("display_unit", list(DisplayUnit))
+def test_for_display_refuses_a_unit_that_is_not_celsius(
+    reported: str | None, display_unit: DisplayUnit
+) -> None:
+    assert for_display(FIELDS, display_unit, reported_unit=reported) is None
+
+
+def test_display_fields_are_still_sanitized_and_bounded() -> None:
+    shown = for_display(FIELDS, DisplayUnit.DEG_F, reported_unit="°C")
+    assert shown is not None
+    assert render_notification(shown, level_message="{label} {value}{unit}") == (
+        "Freezer temperature 25.7°F"
+    )
+    assert len(render_notification(shown, max_length=40)) <= 40
+    hostile = for_display(
+        TemplateFields(kind=NotificationKind.ESCALATED, value=1.0, label="see evil.example.test"),
+        DisplayUnit.DEG_F,
+        reported_unit="°C",
+    )
+    assert hostile is not None
+    assert Template("{label} {value}{unit}").render(hostile) == "see evil[.]example[.]test 33.8°F"

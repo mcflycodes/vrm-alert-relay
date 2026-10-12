@@ -127,7 +127,7 @@ def test_one_request_per_installation_with_expected_shape(
     assert home.reading.fetched_at == NOW
     assert cabin.reading is not None
     assert cabin.reading.result_for(PV) == MeasurementResult(
-        PV, sample=Sample(13.0, when), label="PV voltage"
+        PV, sample=Sample(13.0, when), label="PV voltage", unit="V"
     )
     assert cabin.reading.result_for(SOC) is None
     assert cabin.reading.problems == ()

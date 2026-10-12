@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
@@ -37,13 +37,17 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_TEMPLATES",
+    "DISPLAY_DECIMALS",
     "FIELD_LIMITS",
     "MAX_RENDERED_LENGTH",
     "MISSING",
+    "DisplayUnit",
     "NotificationKind",
     "Template",
     "TemplateFields",
     "fields_for_event",
+    "for_display",
+    "is_celsius",
     "neutralize_links",
     "render_notification",
     "sanitize_field",
@@ -91,6 +95,26 @@ class NotificationKind(StrEnum):
     STORAGE_NOTICE = "storage_notice"
     MONITORING_DEGRADED = "monitoring_degraded"
     MONITORING_RESTORED = "monitoring_restored"
+
+
+class DisplayUnit(StrEnum):
+    """The unit a rule's messages show its value in (``display_unit``).
+
+    Only the rendered ``{value}`` and ``{unit}`` change: thresholds,
+    hysteresis and evaluation always use the measurement's own units.
+    """
+
+    DEG_C = "degC"
+    DEG_F = "degF"
+
+
+DISPLAY_DECIMALS: Final = 1
+"""Decimals a value shown in a display unit is rounded to."""
+
+_CELSIUS: Final = "°C"
+_DISPLAY_SYMBOLS: Final[Mapping[DisplayUnit, str]] = MappingProxyType(
+    {DisplayUnit.DEG_C: _CELSIUS, DisplayUnit.DEG_F: "°F"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,3 +377,31 @@ def fields_for_event(
         label=label,
         time=event.sample_time,
     )
+
+
+def is_celsius(unit: str | None) -> bool:
+    """Whether ``unit``, as VRM reports it, is degrees Celsius (``°C`` or ``℃``)."""
+    if unit is None:
+        return False
+    return "".join(unicodedata.normalize("NFKC", unit).split()) == _CELSIUS
+
+
+def for_display(
+    fields: TemplateFields, display_unit: DisplayUnit, *, reported_unit: str | None
+) -> TemplateFields | None:
+    """``fields`` with the value shown in ``display_unit``, or ``None``.
+
+    The value is converted from ``reported_unit`` and rounded to
+    :data:`DISPLAY_DECIMALS`, and ``{unit}`` becomes the display unit's
+    symbol. Only a temperature in degrees Celsius can be converted; for any
+    other or unknown ``reported_unit`` this returns ``None`` and the caller
+    shows the value as reported.
+    """
+    if not is_celsius(reported_unit):
+        return None
+    value = fields.value
+    if value is not None:
+        if display_unit is DisplayUnit.DEG_F:
+            value = value * 9 / 5 + 32
+        value = round(value, DISPLAY_DECIMALS)
+    return replace(fields, value=value, unit=_DISPLAY_SYMBOLS[display_unit])

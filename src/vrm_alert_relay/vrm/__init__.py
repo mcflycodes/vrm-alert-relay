@@ -13,11 +13,13 @@ from vrm_alert_relay.vrm.backoff import Backoff, BackoffPolicy, BackoffState
 from vrm_alert_relay.vrm.diagnostics import (
     MAX_LABEL_LENGTH,
     MAX_RECORDS,
+    MAX_UNIT_LENGTH,
     MeasurementResult,
     ReadingProblem,
     TimestampPolicy,
     parse_diagnostics,
     sanitize_label,
+    unit_from_format,
 )
 from vrm_alert_relay.vrm.errors import (
     TRANSIENT_KINDS,
@@ -36,6 +38,7 @@ __all__ = [
     "DIAGNOSTICS_COUNT",
     "MAX_LABEL_LENGTH",
     "MAX_RECORDS",
+    "MAX_UNIT_LENGTH",
     "TRANSIENT_KINDS",
     "Backoff",
     "BackoffPolicy",
@@ -56,4 +59,5 @@ __all__ = [
     "VrmUnavailableError",
     "parse_diagnostics",
     "sanitize_label",
+    "unit_from_format",
 ]
