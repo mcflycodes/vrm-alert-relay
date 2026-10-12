@@ -1,0 +1,77 @@
+{
+  "networks": {
+    "default": {
+      "ipam": {},
+      "name": "<project>_default"
+    }
+  },
+  "secrets": {
+    "vrm_token": {
+      "file": "./secrets/vrm_token",
+      "name": "<project>_vrm_token"
+    }
+  },
+  "services": {
+    "relay": {
+      "cap_drop": [
+        "ALL"
+      ],
+      "command": null,
+      "cpus": 0.5,
+      "entrypoint": null,
+      "environment": {
+        "VRM_ALERT_RELAY_CONFIG": "/etc/vrm-alert-relay/config.yaml",
+        "VRM_ALERT_RELAY_LOG_LEVEL": "INFO",
+        "VRM_ALERT_RELAY_STATE_DIR": "/var/lib/vrm-alert-relay"
+      },
+      "image": "<image>",
+      "ipc": "private",
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-file": "5",
+          "max-size": "10m"
+        }
+      },
+      "mem_limit": "268435456",
+      "memswap_limit": "268435456",
+      "networks": {
+        "default": null
+      },
+      "pids_limit": 64,
+      "read_only": true,
+      "restart": "unless-stopped",
+      "secrets": [
+        {
+          "source": "vrm_token",
+          "target": "/run/secrets/vrm_token"
+        }
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "1m0s",
+      "stop_signal": "SIGTERM",
+      "user": "65532:65532",
+      "volumes": [
+        {
+          "source": "state",
+          "target": "/var/lib/vrm-alert-relay",
+          "type": "volume",
+          "volume": {}
+        },
+        {
+          "read_only": true,
+          "source": "./config.yaml",
+          "target": "/etc/vrm-alert-relay/config.yaml",
+          "type": "bind"
+        }
+      ]
+    }
+  },
+  "volumes": {
+    "state": {
+      "name": "<state-volume>"
+    }
+  }
+}

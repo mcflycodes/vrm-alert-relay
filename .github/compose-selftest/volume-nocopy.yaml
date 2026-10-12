@@ -1,0 +1,10 @@
+# Weakened copy for the Compose hardening self-test; it must be rejected.
+# expect: golden services.relay.volumes[0].volume.nocopy: unexpected
+services:
+  relay:
+    volumes:
+      - type: volume
+        source: state
+        target: /var/lib/vrm-alert-relay
+        volume:
+          nocopy: true

@@ -5,7 +5,8 @@
 #
 # Every value in this file is fictitious. Copy it, then replace the values with
 # your own. Validate the result with the check-config command before starting
-# the relay.
+# the relay. docs/configuration.md lists every setting with its limits, and
+# docs/deploy-docker.md shows a complete Docker Compose deployment.
 #
 # Format rules:
 #   - Unknown keys are rejected, so a typo is an error rather than a silently
@@ -41,9 +42,10 @@ vrm:
   # "#fragment".
   base_url: https://vrmapi.victronenergy.com/v2
   # File holding a VRM personal access token. Use a dedicated VRM user that is
-  # invited only to the installations below, with the lowest role that works.
+  # invited only to the installations below, with the lowest role that works
+  # (see docs/vrm-credentials.md).
   token_file: /run/secrets/vrm_token
-  # Seconds between polls (default 60, minimum 30). Polls are jittered.
+  # Seconds between polls (default 60, 30 to 3600). Polls are jittered.
   poll_interval: 60
   # Installations to monitor (up to 50). "id" is your own short name, used by
   # rules; "site_id" is the numeric VRM installation id (idSite).
@@ -56,13 +58,14 @@ vrm:
 rate_limits:
   global_per_hour: 20 # default 20, at most 200
   global_per_day: 60 # default 60, at most 1000
-  retries: 3 # delivery retries per message, with backoff (default 3)
+  retries: 3 # delivery retries per message, with backoff (default 3, at most 10)
 
 # The recipient allowlist (up to 50). Rules refer to recipients by name;
 # nothing in VRM data or message templates can add or change a recipient.
 recipients:
-  # SMS through VoIP.ms. Accepts a 10-digit NANP number or +1 E.164 format;
-  # spaces, dashes, dots, and parentheses are ignored.
+  # SMS through VoIP.ms (US and Canadian numbers). Accepts 10 digits, 11 digits
+  # starting with 1, or +1 E.164 format; spaces, dashes, dots, and parentheses
+  # are ignored.
   owner_sms:
     provider: voipms
     phone: "+1 202 555 0142"
@@ -85,7 +88,8 @@ providers:
     enabled: false
     # VoIP.ms REST endpoint. The default is shown.
     base_url: https://voip.ms/api/v1/rest.php
-    # VoIP.ms account email and API password, each in its own file.
+    # VoIP.ms account email and API password (not the account password), each
+    # in its own file (see docs/voipms.md).
     username_file: /run/secrets/voipms_username
     password_file: /run/secrets/voipms_api_password
     # The SMS-enabled VoIP.ms DID that messages are sent from.
@@ -94,7 +98,8 @@ providers:
     enabled: false
     # Your Home Assistant URL. Private-network addresses are allowed.
     base_url: https://homeassistant.example.invalid:8123
-    # Long-lived access token of a dedicated, non-admin Home Assistant user.
+    # Long-lived access token of a dedicated, non-admin Home Assistant user
+    # (see docs/home-assistant.md).
     token_file: /run/secrets/homeassistant_token
     # Optional: a PEM file with the CA (or self-signed) certificate of your
     # Home Assistant, used instead of the bundled trust store. Certificates
@@ -164,7 +169,8 @@ rules:
     reminder_interval_minutes: 60
     reminder_max: 3
     # Report stale data when the newest reading is older than this (default 35,
-    # two default GX log periods plus margin). Tune it to your GX log interval.
+    # two default GX log periods plus margin). Tune it to your GX log interval
+    # (see docs/vrm-credentials.md); it must be longer than vrm.poll_interval.
     stale_after_minutes: 35
     # Recipient names from the recipients section.
     recipients:

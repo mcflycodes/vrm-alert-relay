@@ -1,0 +1,5 @@
+# Weakened copy for the Compose hardening self-test; it must be rejected.
+# expect: golden services.relay.restart: missing
+services:
+  relay:
+    restart: !reset null

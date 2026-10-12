@@ -120,6 +120,55 @@ jobs:
       - uses: ./.github/actions/install-scanners
       - name: Lint Dockerfile
         run: '"$RUNNER_TEMP/hadolint" Dockerfile'
+      - name: Install Docker Compose
+        env:
+          COMPOSE_VERSION: "2.39.4"
+          COMPOSE_SHA256: 7af95166a730b87e172d4fc9aefea8725d3c6c7327d59149267b452114ddb7d4
+        run: |
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$RUNNER_TEMP/docker-compose" \
+            "https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-linux-x86_64"
+          echo "${COMPOSE_SHA256}  $RUNNER_TEMP/docker-compose" | sha256sum --check --strict
+          chmod +x "$RUNNER_TEMP/docker-compose"
+          "$RUNNER_TEMP/docker-compose" version
+      - name: Validate Compose example
+        run: |
+          compose="$RUNNER_TEMP/docker-compose"
+          check=(python3 .github/scripts/check_compose_hardening.py --root "$PWD")
+          expected=.github/compose-hardening.expected.json
+
+          # The example as shipped must match the expected file exactly, and
+          # keep every invariant.
+          "$compose" -f compose.example.yaml config --quiet
+          "$compose" -f compose.example.yaml config --format json | "${check[@]}" --expected "$expected"
+
+          # Self-test: every weakened copy must be rejected, for the reason its
+          # file names. Where that reason is an invariant, it must still be
+          # rejected after the expected file is carelessly regenerated from it.
+          for case in .github/compose-selftest/*.yaml; do
+            name="$(basename "$case" .yaml)"
+            reason="$(sed -n 's/^# expect: //p' "$case")"
+            [[ -n "$reason" ]] || { echo "::error::self-test ${name} names no expected reason"; exit 1; }
+            rendered="$RUNNER_TEMP/${name}.json"
+            "$compose" -f compose.example.yaml -f "$case" config --format json > "$rendered"
+            modes=(golden)
+            if [[ "$reason" == invariant* ]]; then
+              "${check[@]}" --expected "$RUNNER_TEMP/${name}.expected.json" --update < "$rendered" > /dev/null
+              modes+=(regenerated)
+            fi
+            for mode in "${modes[@]}"; do
+              file="$expected"
+              [[ "$mode" == regenerated ]] && file="$RUNNER_TEMP/${name}.expected.json"
+              if output="$("${check[@]}" --expected "$file" < "$rendered" 2>&1)"; then
+                echo "::error::self-test ${name} (${mode}): the weakened copy was accepted"
+                exit 1
+              fi
+              if ! grep -qF -- "$reason" <<< "$output"; then
+                echo "::error::self-test ${name} (${mode}): rejected for the wrong reason: ${output}"
+                exit 1
+              fi
+              echo "Self-test ${name} (${mode}) rejected as expected: $(grep -F -- "$reason" <<< "$output")"
+            done
+          done
       - name: Build image
         run: docker build --pull --tag "$IMAGE" .
       - name: Smoke test hardened runtime

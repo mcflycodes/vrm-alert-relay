@@ -6,6 +6,14 @@ VRM Alert Relay is an unofficial, independent project. It is not affiliated with
 
 This page covers the command line, the poll loop, monitoring notifications and the health endpoint. Requirements R1, R10, R18 and R24–R28 in [requirements.md](requirements.md) set the rules; ADR 0002 covers delivery and state storage.
 
+Related pages:
+
+- [configuration.md](configuration.md): every configuration setting, with defaults and limits.
+- [deploy-docker.md](deploy-docker.md): deploying with Docker Compose, upgrades, backup, rollback and removal.
+- [vrm-credentials.md](vrm-credentials.md): a least-privilege VRM user and token, and tuning for data freshness.
+- [voipms.md](voipms.md) and [home-assistant.md](home-assistant.md): setting up those providers.
+- [notifications.md](notifications.md): message templates and what each provider sends.
+
 ## Command line
 
 ```text
@@ -29,11 +37,9 @@ A flag wins over its environment variable. The container image runs `run` by def
 
 ### The state directory
 
-The state directory must be on a local filesystem, owned by the relay user and writable by nobody else (ADR 0002). The image runs as UID and GID 65532 and ships `/var/lib/vrm-alert-relay` owned by `65532:65532` with mode `0700`.
+The state directory must be on a local filesystem, owned by the relay user and writable by nobody else (ADR 0002). The image runs as UID and GID 65532 and ships `/var/lib/vrm-alert-relay` owned by `65532:65532` with mode `0700`. [deploy-docker.md](deploy-docker.md#5-the-state-volume) explains the named volume and the bind-mount alternative.
 
-- **Named volume (recommended):** mount it at `/var/lib/vrm-alert-relay`. Docker initialises a new named volume from the image, so it starts with the right owner and mode.
-- **Bind mount:** Docker does not change a host directory's ownership. Create it first and give it to UID 65532, for example `install -d -o 65532 -g 65532 -m 0700 /srv/vrm-alert-relay/state`. If you run the container with another `--user`, the directory must belong to that UID instead.
-- A directory the relay cannot write leaves it running and alerting from memory, with `state_persistence.healthy` false and a storage notice to the system recipients. A directory that group or others can write draws a warning in the log.
+A directory the relay cannot write leaves it running and alerting from memory, with `state_persistence.healthy` false and a storage notice to the system recipients. A directory that group or others can write draws a warning in the log.
 
 ### Exit codes
 
@@ -87,7 +93,7 @@ One "degraded" goes out per outage and one "restored" when it ends. Both the out
 
 ## Health endpoint
 
-Enable it with `health.enabled: true`. It listens on `health.bind` (default `127.0.0.1`, loopback) and `health.port` (default 8080). `check-config` warns when the address is not loopback. If the port cannot be bound, the relay logs an error and keeps running without it.
+Enable it with `health.enabled: true`. It listens on `health.bind` (default `127.0.0.1`, loopback) and `health.port` (default 8080). `check-config` warns when the address is not loopback. If the port cannot be bound, the relay logs an error and keeps running without it. In a container, loopback is the container's own: [deploy-docker.md](deploy-docker.md#optional-health-endpoint) shows how to check or reach it.
 
 `GET /health` (or `/`) returns a small JSON document, always with status 200: the endpoint is informational, not a gate. `HEAD` returns the headers only, other paths 404, other methods 501. No CORS headers are sent and requests are not logged. The document holds no secrets, recipient names or addresses, installation or site ids, or message text. It is refreshed after every cycle. Its `status` is `starting` until the first cycle completes, and never `ok` before then.
 

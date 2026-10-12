@@ -1,0 +1,147 @@
+# VRM Alert Relay: hardened Docker Compose example
+#
+# VRM Alert Relay is an unofficial, independent project. It is not affiliated
+# with, sponsored by, or endorsed by Victron Energy.
+#
+# Step-by-step instructions are in docs/deploy-docker.md. In short, next to a
+# copy of this file (saved as compose.yaml) you need:
+#
+#   config.yaml          your configuration (start from examples/config.example.yaml)
+#   secrets/vrm_token    the VRM access token, owned by UID 65532, mode 0400
+#
+# As shipped, this file starts the relay in dry-run mode: the example
+# configuration has sending disabled, so every message is written to the log.
+#
+# Image: no image is published yet. Build one from a checkout of the
+# repository and point VRM_ALERT_RELAY_IMAGE at it, for example in a .env file
+# next to this one:
+#
+#   docker build --tag vrm-alert-relay:local .
+#   echo 'VRM_ALERT_RELAY_IMAGE=vrm-alert-relay:local' > .env
+#
+# Once releases are published, use the release image instead, ideally pinned by
+# digest: ghcr.io/OWNER/vrm-alert-relay:VERSION@sha256:DIGEST.
+#
+# CI checks this file as shipped against .github/compose-hardening.expected.json
+# and a set of hardening invariants (.github/scripts/check_compose_hardening.py).
+# Any change to it here must update that expected file in the same change. The
+# check covers the shipped example only: your own copy, with provider secrets
+# or a health check uncommented, is not checked, so review such edits yourself.
+
+name: vrm-alert-relay
+
+services:
+  relay:
+    image: ${VRM_ALERT_RELAY_IMAGE:-ghcr.io/OWNER/vrm-alert-relay:VERSION}
+    # The image's default command is "run". Override it only for one-off
+    # commands with "docker compose run --rm relay <command>".
+    restart: unless-stopped
+
+    # Hardening (requirement R29). The image already runs as 65532:65532;
+    # stating it here keeps it that way even if the image changes.
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    privileged: false
+    # Private IPC namespace. Host network, PID and IPC namespaces are never
+    # used, and the Docker socket is never mounted.
+    ipc: private
+    # No tmpfs: the relay writes only to its state volume, which also holds
+    # SQLite's temporary files.
+
+    # Shutdown: SIGTERM lets the current poll cycle finish (its HTTP calls are
+    # bounded by timeouts), then state is written and the store closed.
+    stop_signal: SIGTERM
+    stop_grace_period: 60s
+
+    # One small Python process: generous for up to 50 installations.
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+
+    # Logs are one JSON object per line on standard output. Keep at most
+    # 5 x 10 MB per container.
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+    environment:
+      # Non-secret settings only. Secrets are never passed as environment
+      # variables; they are files under /run/secrets.
+      VRM_ALERT_RELAY_CONFIG: /etc/vrm-alert-relay/config.yaml
+      VRM_ALERT_RELAY_STATE_DIR: /var/lib/vrm-alert-relay
+      VRM_ALERT_RELAY_LOG_LEVEL: INFO
+
+    volumes:
+      # The state directory: the only writable path. Docker initialises a new
+      # named volume from the image, owned by 65532:65532 with mode 0700. It
+      # must stay on a local filesystem (no NFS or other network storage).
+      - state:/var/lib/vrm-alert-relay
+      # The configuration file, read-only. It holds no secrets but does hold
+      # recipient phone numbers, so keep it at mode 0640, group 65532.
+      - type: bind
+        source: ./config.yaml
+        target: /etc/vrm-alert-relay/config.yaml
+        read_only: true
+
+    # Each secret is a read-only file at /run/secrets/<name>. Compose (without
+    # Swarm) bind-mounts the host file as it is, so the host file must be
+    # readable by UID 65532: owner 65532, mode 0400 (see docs/deploy-docker.md).
+    # Uncomment a provider's secrets when you enable that provider.
+    secrets:
+      - vrm_token
+      # - voipms_username
+      # - voipms_api_password
+      # - homeassistant_token
+      # - webhook_token
+      # Optional: a private CA certificate for Home Assistant or the webhook
+      # (providers.<name>.ca_file in config.yaml). Not secret, but mounted the
+      # same way; it only needs to be readable by UID 65532.
+      # - homeassistant_ca.pem
+      # - webhook_ca.pem
+
+    # No ports are published. The optional health endpoint (health.enabled in
+    # config.yaml) listens on the container's own loopback interface, which is
+    # reachable only from inside the container, for example by this check.
+    # Enable it together with health.enabled: true. The endpoint always answers
+    # 200, so this checks that the relay is alive, not that monitoring is ok.
+    # To reach it from the host instead, see docs/deploy-docker.md.
+    # healthcheck:
+    #   test:
+    #     - CMD
+    #     - /opt/venv/bin/python
+    #     - -c
+    #     - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)"
+    #   interval: 60s
+    #   timeout: 10s
+    #   retries: 3
+    #   start_period: 30s
+
+volumes:
+  state:
+    # A fixed name, so backups and restores do not depend on the project name.
+    # After a restore, VRM_ALERT_RELAY_STATE_VOLUME in .env names the restored
+    # volume instead (see docs/deploy-docker.md).
+    name: ${VRM_ALERT_RELAY_STATE_VOLUME:-vrm-alert-relay-state}
+
+secrets:
+  vrm_token:
+    file: ./secrets/vrm_token
+  # voipms_username:
+  #   file: ./secrets/voipms_username
+  # voipms_api_password:
+  #   file: ./secrets/voipms_api_password
+  # homeassistant_token:
+  #   file: ./secrets/homeassistant_token
+  # webhook_token:
+  #   file: ./secrets/webhook_token
+  # homeassistant_ca.pem:
+  #   file: ./homeassistant-ca.pem
+  # webhook_ca.pem:
+  #   file: ./webhook-ca.pem

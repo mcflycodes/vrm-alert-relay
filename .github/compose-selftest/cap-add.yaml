@@ -1,0 +1,5 @@
+# Weakened copy for the Compose hardening self-test; it must be rejected.
+# expect: invariant cap_add: must not be set
+services:
+  relay:
+    cap_add: [NET_ADMIN]

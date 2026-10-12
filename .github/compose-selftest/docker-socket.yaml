@@ -1,0 +1,6 @@
+# Weakened copy for the Compose hardening self-test; it must be rejected.
+# expect: invariant: no container engine socket
+services:
+  relay:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro

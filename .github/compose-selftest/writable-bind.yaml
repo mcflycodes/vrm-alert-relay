@@ -1,0 +1,6 @@
+# Weakened copy for the Compose hardening self-test; it must be rejected.
+# expect: invariant mounts: the only writable mount
+services:
+  relay:
+    volumes:
+      - ./extra:/data
