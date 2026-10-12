@@ -107,6 +107,7 @@ class Relay:
         self._targets = poll_targets(config)
         self._monitoring = MonitoringTracker(inst.id for inst in config.vrm.installations)
         self._labels: dict[str, str] = {}
+        self._units: dict[str, str] = {}
         self._status = RelayStatus(
             started_at=clock.wall(), installations=len(config.vrm.installations)
         )
@@ -185,6 +186,8 @@ class Relay:
         sample = result.sample if result is not None else None
         if result is not None and result.label is not None:
             self._labels[rule_id] = result.label
+        if result is not None and result.unit is not None:
+            self._units[rule_id] = result.unit
         state = self._delivery.rule_state(rule_id)
         observed = _observed(state)
         if sample is None and not observed:
@@ -229,7 +232,7 @@ class Relay:
     def _render(self, binding: RuleBinding, event: Event) -> str:
         label = self._labels.get(binding.rule.id)
         try:
-            return binding.render(event, label)
+            return binding.render(event, label, self._units.get(binding.rule.id))
         except Exception:
             logger.exception(
                 "rendering a level message failed; sending the default text",

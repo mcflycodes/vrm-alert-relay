@@ -6,7 +6,7 @@ import copy
 import re
 from collections.abc import Callable
 from types import MappingProxyType
-from typing import Any
+from typing import Any, get_args
 
 import pydantic
 import pytest
@@ -16,9 +16,11 @@ from vrm_alert_relay.config import (
     HomeAssistantRecipient,
     PhoneNumber,
     RelayConfig,
+    Rule,
     VoipmsRecipient,
 )
 from vrm_alert_relay.config.fields import _check_host
+from vrm_alert_relay.templates import DisplayUnit
 
 Data = dict[str, Any]
 Parse = Callable[[Any], RelayConfig]
@@ -385,6 +387,41 @@ def test_unknown_direction_is_rejected(config_data: Data, problems: Problems) ->
     config_data["rules"][2]["direction"] = "up"
     (problem,) = problems(config_data)
     assert problem.startswith("rules[2].direction: ")
+
+
+def test_display_unit_is_absent_by_default(config_data: Data, parse: Parse) -> None:
+    assert [rule.display_unit for rule in parse(config_data).rules] == [None, None, None]
+
+
+@pytest.mark.parametrize("unit", ["degC", "degF"])
+def test_display_unit_accepts_supported_units(config_data: Data, parse: Parse, unit: str) -> None:
+    config_data["rules"][0]["display_unit"] = unit
+    assert parse(config_data).rules[0].display_unit == unit
+
+
+def test_display_units_match_the_renderer() -> None:
+    annotation = Rule.model_fields["display_unit"].annotation
+    (literal, _none) = get_args(annotation)
+    assert set(get_args(literal)) == {unit.value for unit in DisplayUnit}
+
+
+def test_null_display_unit_means_absent(config_data: Data, parse: Parse) -> None:
+    config_data["rules"][0]["display_unit"] = None
+    assert parse(config_data).rules[0].display_unit is None
+
+
+@pytest.mark.parametrize(
+    "unit",
+    ["degK", "DEGF", "°F", "fahrenheit", "F", "", "degF ", "kelvin-2025550142", 1, True, ["degF"]],
+)
+def test_unknown_display_unit_is_rejected_with_fixed_text(
+    config_data: Data, problems: Problems, unit: object
+) -> None:
+    config_data["rules"][1]["display_unit"] = unit
+    (problem,) = problems(config_data)
+    assert problem.startswith("rules[1].display_unit: ")
+    if isinstance(unit, str):
+        assert problem == "rules[1].display_unit: must be one of 'degC' or 'degF'"
 
 
 def test_unknown_rule_references(config_data: Data, problems: Problems) -> None:

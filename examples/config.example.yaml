@@ -172,6 +172,10 @@ rules:
     # two default GX log periods plus margin). Tune it to your GX log interval
     # (see docs/vrm-credentials.md); it must be longer than vrm.poll_interval.
     stale_after_minutes: 35
+    # Optional: show the value in messages in "degF" or "degC" (rounded to one
+    # decimal). Only the message text changes; thresholds and hysteresis stay
+    # in the units VRM reports (°C for temperatures). Not set by default.
+    display_unit: degF
     # Recipient names from the recipients section.
     recipients:
       - owner_sms

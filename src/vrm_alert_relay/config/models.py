@@ -272,6 +272,8 @@ class Rule(_Model):
     reminder_interval_minutes: int = Field(default=60, ge=1, le=10_080)
     reminder_max: int = Field(default=3, ge=0, le=20)
     stale_after_minutes: int = Field(default=35, ge=1, le=10_080)
+    display_unit: Literal["degC", "degF"] | None = None
+    """Shows message values in this unit; evaluation keeps the measurement's units."""
     recipients: Annotated[
         tuple[Name, ...],
         BeforeValidator(_as_tuple),

@@ -3,8 +3,9 @@
 A Diagnostics response is ``{"success": true, "records": [...]}``. Each record
 describes one value the GX device last logged, with ``code`` (the attribute
 code), ``instance`` (the device instance), ``dbusServiceType``, ``dbusPath``,
-``rawValue``, ``formattedValue``, ``timestamp`` (epoch seconds) and a
-``description`` label. VRM's OpenAPI schema calls ``records`` an object, but
+``rawValue``, ``formattedValue``, ``formatWithUnit`` (a printf-style format
+followed by the unit, such as ``%.1F °C``), ``timestamp`` (epoch seconds) and
+a ``description`` label. VRM's OpenAPI schema calls ``records`` an object, but
 real responses carry a list; only a list is accepted.
 
 A configured measurement is identified by attribute code and device instance,
@@ -12,15 +13,16 @@ plus ``dbusServiceType`` when the operator sets one. Record position and the
 numeric attribute id are never used. When more than one record matches, the
 result is :attr:`ReadingProblem.AMBIGUOUS` rather than a guess.
 
-Everything taken from the response is bounded. Labels are untrusted and only
-for display: control, format and separator characters become spaces,
-whitespace is collapsed and the result is truncated. Labels are never used to
-match, route or address anything.
+Everything taken from the response is bounded. Labels and units are untrusted
+and only for display: control, format and separator characters become spaces,
+whitespace is collapsed and the result is truncated. Labels and units are
+never used to match, route or address anything, nor in rule evaluation.
 """
 
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -38,8 +40,11 @@ MAX_RECORDS: Final = 1000
 """Records accepted in one response; matches the ``count`` the adapter requests."""
 
 MAX_LABEL_LENGTH: Final = 80
+MAX_UNIT_LENGTH: Final = 16
 _LABEL_SCAN_LIMIT: Final = MAX_LABEL_LENGTH * 4
 _REPLACED_CATEGORIES: Final = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
+# One printf conversion (``%.1F``, ``%d``) and then the unit.
+_FORMAT_WITH_UNIT: Final = re.compile(r"\s*%[-+ #0]*\d*(?:\.\d+)?[A-Za-z](?P<unit>.*)", re.DOTALL)
 
 
 class ReadingProblem(StrEnum):
@@ -85,6 +90,8 @@ class MeasurementResult:
     sample: Sample | None = None
     problem: ReadingProblem | None = None
     label: str | None = None
+    unit: str | None = None
+    """The unit VRM reports for the value, such as ``°C``; display only."""
 
     def __post_init__(self) -> None:
         if (self.sample is None) == (self.problem is None):
@@ -105,6 +112,22 @@ def sanitize_label(value: object) -> str | None:
     )
     label = " ".join("".join(chars).split())[:MAX_LABEL_LENGTH].rstrip()
     return label or None
+
+
+def unit_from_format(value: object) -> str | None:
+    """The unit in a ``formatWithUnit`` such as ``%.1F °C``, or ``None``.
+
+    Only a format that starts with one printf conversion is understood; the
+    rest, with ``%%`` read as ``%``, is the unit, sanitized like a label and cut
+    to :data:`MAX_UNIT_LENGTH` characters.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _FORMAT_WITH_UNIT.fullmatch(value[:_LABEL_SCAN_LIMIT])
+    if match is None:
+        return None
+    unit = sanitize_label(match.group("unit").replace("%%", "%"))
+    return unit[:MAX_UNIT_LENGTH].rstrip() if unit is not None else None
 
 
 def parse_diagnostics(
@@ -171,13 +194,14 @@ def _result(
         return MeasurementResult(measurement, problem=ReadingProblem.AMBIGUOUS)
     record = candidates[0]
     label = sanitize_label(record.get("description"))
+    unit = unit_from_format(record.get("formatWithUnit"))
     value = _value(record.get("rawValue"))
     if isinstance(value, ReadingProblem):
-        return MeasurementResult(measurement, problem=value, label=label)
+        return MeasurementResult(measurement, problem=value, label=label, unit=unit)
     timestamp = _timestamp(record.get("timestamp"), now, policy)
     if isinstance(timestamp, ReadingProblem):
-        return MeasurementResult(measurement, problem=timestamp, label=label)
-    return MeasurementResult(measurement, sample=Sample(value, timestamp), label=label)
+        return MeasurementResult(measurement, problem=timestamp, label=label, unit=unit)
+    return MeasurementResult(measurement, sample=Sample(value, timestamp), label=label, unit=unit)
 
 
 def _number(raw: object) -> float | None:

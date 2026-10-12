@@ -1,6 +1,6 @@
 # Notifications: message templates and providers
 
-**Updated:** 2026-10-11
+**Updated:** 2026-10-12
 
 VRM Alert Relay is an unofficial, independent project. It is not affiliated with, sponsored by, or endorsed by Victron Energy.
 
@@ -20,8 +20,8 @@ The configuration is rejected at load time, and by `check-config`, if a template
 |---|---|
 | `{rule}` | The rule id. |
 | `{level}` | The level name. |
-| `{value}` | The measured value, up to three decimals (`-3.5`, `12`). |
-| `{unit}` | The unit, when known; otherwise empty. |
+| `{value}` | The measured value, up to three decimals (`-3.5`, `12`). With the rule's `display_unit`, the value in that unit, rounded to one decimal (`25.7`, `32`). |
+| `{unit}` | Empty, unless the rule sets `display_unit`: then the display unit (`°C` or `°F`), or the unit VRM reports when the value cannot be converted. |
 | `{installation}` | The installation id from `vrm.installations`. |
 | `{measurement}` | The measurement code, such as `tsT`. |
 | `{label}` | The display label VRM reports for the measurement, or the measurement code when there is none. |
@@ -30,6 +30,18 @@ The configuration is rejected at load time, and by `check-config`, if a template
 | `{count}` | For a rate-limit summary, how many alerts were held back. |
 
 A field the notification does not carry is shown as `n/a` (`{unit}` is left empty).
+
+### Display unit
+
+A rule's optional `display_unit` (`degC` or `degF`, see [configuration.md](configuration.md#display-unit)) converts `{value}` and sets `{unit}` when the text is rendered, for escalations, reminders, recoveries and "data restored" messages, including a level's own `message`. Nothing else changes: thresholds, hysteresis, evaluation, event ids and delivery use the measurement's own units.
+
+With `display_unit: degF`, a freezer at -3.5 °C produces:
+
+```text
+critical: cabin-freezer-warm at cabin: Freezer temperature is 25.7°F (2026-01-15 12:30 UTC)
+```
+
+A display unit never stops a message. When VRM does not report the measurement in °C, the message shows the value and unit as reported (for example `12.6V`); if rendering fails for any other reason, the default text is sent with the value as reported. The unit VRM reports is untrusted, so it is sanitized and its links neutralized like `{label}`.
 
 ### Safety of rendered text
 
