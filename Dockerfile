@@ -24,7 +24,6 @@ RUN set -eux; \
     cp -a /etc/apk/keys /etc/apk/repositories /rootfs/etc/apk/; \
     apk add --no-cache --no-scripts --root /rootfs --initdb \
         wolfi-baselayout ca-certificates-bundle tzdata python-3.13-base; \
-    tar -tf /rootfs/lib/apk/db/scripts.tar || true; \
     ldconfig -r /rootfs; \
     test -s /rootfs/etc/ld.so.cache; \
     rm -rf /rootfs/etc/apk/keys /rootfs/etc/apk/repositories /rootfs/var/cache/apk; \
