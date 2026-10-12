@@ -28,7 +28,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
-from vrm_alert_relay.engine.models import Sample
+from vrm_alert_relay.engine.models import FUTURE_TOLERANCE, Sample
 from vrm_alert_relay.vrm.errors import VrmResponseError
 
 if TYPE_CHECKING:
@@ -59,12 +59,15 @@ class TimestampPolicy:
     """Bounds on record timestamps relative to the poll's wall-clock time.
 
     ``max_future_skew`` tolerates clock differences between the GX device, VRM
-    and this host. ``max_age`` rejects only implausibly old values; ordinary
+    and this host. It defaults to the rules engine's
+    :data:`~vrm_alert_relay.engine.models.FUTURE_TOLERANCE`, so a reading the
+    engine would refuse is reported here as a future timestamp instead of
+    being passed on and silently ignored. ``max_age`` rejects only implausibly old values; ordinary
     staleness is left to the rules engine, which receives those samples and
     raises its stale-data event.
     """
 
-    max_future_skew: timedelta = timedelta(minutes=5)
+    max_future_skew: timedelta = FUTURE_TOLERANCE
     max_age: timedelta = timedelta(days=30)
 
     def __post_init__(self) -> None:

@@ -8,6 +8,12 @@ problems are reported by the installation's monitor instead. Once a rule has
 had a sample (``newest_sample_time`` in its stored state), it is evaluated
 every cycle and stale data is reported as the rules engine defines it.
 
+A sample the rules engine cannot use (one it refuses, or one older than the
+rule's newest sample), and a rule that cannot be evaluated at all, are
+reported to the installation's monitor as a measurement problem, so they
+count toward "monitoring degraded" and show in health: no sample is ever
+dropped silently.
+
 A failure in one stage is contained so the rest of the cycle still alerts:
 an exception from the poll counts as a failed poll of every installation,
 and an exception while evaluating or rendering one rule is retried with
@@ -21,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 from vrm_alert_relay.delivery import Notification
-from vrm_alert_relay.engine import RuleState, evaluate
+from vrm_alert_relay.engine import RuleState, evaluate, sample_is_usable
 from vrm_alert_relay.templates import fields_for_event, render_notification
 
 from .monitoring import MonitoringTracker, PollHealth, assess, monitor_id, streak_id
@@ -33,7 +39,7 @@ if TYPE_CHECKING:
 
     from vrm_alert_relay.config import Installation, Measurement, RelayConfig
     from vrm_alert_relay.delivery import Clock, DeliveryEngine, RunReport
-    from vrm_alert_relay.engine import Event
+    from vrm_alert_relay.engine import Event, Sample
     from vrm_alert_relay.vrm import InstallationOutcome, PollResult
 
 __all__ = ["CycleReport", "Poller", "Relay", "RelayStatus"]
@@ -79,6 +85,8 @@ class _CycleState:
     rule_states: dict[str, RuleState] = field(default_factory=dict)
     notifications: list[Notification] = field(default_factory=list)
     events: int = 0
+    problems: dict[str, str] = field(default_factory=dict)
+    """Installations whose samples the rules could not use, with a fixed reason."""
 
 
 class Relay:
@@ -181,6 +189,10 @@ class Relay:
         observed = _observed(state)
         if sample is None and not observed:
             return
+        if sample is not None:
+            rejected = _rejection(sample, state, now)
+            if rejected is not None:
+                self._report_problem(binding, rejected, cycle)
         try:
             new_state, events = evaluate(binding.spec, state, sample, now)
         except Exception:
@@ -196,6 +208,7 @@ class Relay:
                     "rule evaluation failed again; skipping the rule this cycle",
                     extra={"event": "relay.evaluation_error", "rule_id": rule_id},
                 )
+                self._report_problem(binding, "evaluation_error", cycle)
                 return
         if not observed and not _observed(new_state):
             return  # The sample was unusable; the rule is still unobserved.
@@ -204,6 +217,14 @@ class Relay:
             text = self._render(binding, event)
             cycle.notifications.append(Notification.for_event(event, text))
             cycle.events += 1
+
+    @staticmethod
+    def _report_problem(binding: RuleBinding, reason: str, cycle: _CycleState) -> None:
+        logger.warning(
+            "a rule could not use this cycle's sample; reporting it to the monitor",
+            extra={"event": "relay.sample_rejected", "rule_id": binding.rule.id, "reason": reason},
+        )
+        cycle.problems.setdefault(binding.rule.installation, reason)
 
     def _render(self, binding: RuleBinding, event: Event) -> str:
         label = self._labels.get(binding.rule.id)
@@ -229,7 +250,13 @@ class Relay:
         cycle: _CycleState,
     ) -> None:
         names = self._monitoring.installations
-        health: dict[str, PollHealth] = {name: assess(outcomes.get(name)) for name in names}
+        health: dict[str, PollHealth] = {}
+        for name in names:
+            poll = assess(outcomes.get(name))
+            reason = cycle.problems.get(name)
+            if not poll.failed and reason is not None:
+                poll = PollHealth(failed=True, reason=f"measurement_{reason}")
+            health[name] = poll
         result = self._monitoring.observe(
             health,
             {name: self._delivery.rule_state(monitor_id(name)) for name in names},
@@ -241,6 +268,20 @@ class Relay:
             cycle.rule_states[streak_id(name)] = result.streaks[name]
         cycle.notifications.extend(result.notifications)
         cycle.events += len(result.notifications)
+
+
+def _rejection(sample: Sample, state: RuleState, now: datetime) -> str | None:
+    """Why the engine would not use ``sample`` for this rule, or ``None``.
+
+    A sample with the same time as the rule's newest one is the same reading
+    again (the GX device has not logged a new value), which is normal.
+    """
+    if not sample_is_usable(sample, now):
+        return "unusable"
+    newest = state.newest_sample_time
+    if newest is not None and sample.timestamp < newest:
+        return "out_of_order"
+    return None
 
 
 def _observed(state: RuleState) -> bool:

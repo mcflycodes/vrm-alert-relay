@@ -74,6 +74,8 @@ Each installation has a monitor. Its notifications go to `system_recipients` (or
 
 A poll of an installation **fails** when its Diagnostics could not be fetched (authentication, rate limiting, unavailability, a bad or rejected response), including cycles in which the request is skipped because the installation is still backing off, or when any configured measurement of it produced no usable sample (missing, ambiguous, non-numeric, or with an unusable timestamp). Measurement problems count because a measurement that silently stops reporting is exactly what monitoring must surface.
 
+One bound decides whether a sample is usable: a reading stamped more than 60 seconds after the relay's clock is reported as a future timestamp by the VRM parser, the same limit the rules engine applies, so a skewed GX or host clock shows up as "monitoring degraded" instead of silently suppressing alerts. As a second line of defence, any sample the rules engine still cannot use, a reading older than the rule's newest one (a device clock that jumped back), and a rule that cannot be evaluated at all also count as a failed poll of its installation. Seeing the same reading again, because the device has not logged a new value yet, is normal and does not count.
+
 An installation becomes **degraded**:
 
 - after **2 consecutive failed polls**, so a single failed request does not page anyone;

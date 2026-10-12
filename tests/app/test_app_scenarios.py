@@ -6,6 +6,7 @@ engine, state store and VoIP.ms provider through the service's poll cycle.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -16,12 +17,14 @@ from app_helpers import (
     CABIN_SITE,
     OWNER_PHONE,
     SECRETS,
+    START,
     VOIPMS_HOST,
     freezer_rule,
 )
 
 from vrm_alert_relay.delivery import STORAGE_NOTICE_TEXT
-from vrm_alert_relay.engine import RuleState
+from vrm_alert_relay.engine import FUTURE_TOLERANCE, RuleState
+from vrm_alert_relay.vrm import TimestampPolicy
 
 if TYPE_CHECKING:
     import httpx
@@ -536,3 +539,94 @@ def test_an_unusable_sample_leaves_a_rule_unobserved(harness: Harness) -> None:
 
     assert harness.voipms.texts() == []
     assert state == RuleState()
+
+
+# Sample usability: one bound, and no silent path -----------------------------------
+
+
+def test_future_skewed_samples_degrade_monitoring_instead_of_vanishing(
+    harness: Harness,
+) -> None:
+    harness.write_config()
+    harness.vrm.skew = timedelta(minutes=3)
+    harness.vrm.set("tsT", 20, -2)  # would be critical
+    with harness.service() as service:
+        harness.cycle(service, 3)
+        service.publish_health()
+        document = json.loads(service.health_state.body())
+
+    assert harness.voipms.texts() == [
+        (
+            "VRM Alert Relay: monitoring of cabin is degraded since 2035-01-01 00:00 UTC; "
+            "alerts may be delayed or missed"
+        )
+    ]
+    assert document["status"] == "degraded"
+    assert document["monitoring"]["degraded_installations"] == 1
+
+
+def test_a_sample_the_engine_refuses_is_reported_to_the_monitor(
+    harness: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness.write_config()
+    harness.vrm.skew = timedelta(minutes=3)
+    harness.vrm.set("tsT", 20, -2)
+    with harness.service() as service, caplog.at_level(logging.WARNING):
+        # Defence in depth: a parser that let the reading through anyway.
+        service.adapter._timestamps = TimestampPolicy(max_future_skew=timedelta(minutes=10))
+        harness.cycle(service, 2)
+        service.publish_health()
+        document = json.loads(service.health_state.body())
+
+    assert monitoring_texts(harness) == [
+        (
+            "VRM Alert Relay: monitoring of cabin is degraded since 2035-01-01 00:00 UTC; "
+            "alerts may be delayed or missed"
+        )
+    ]
+    assert len(harness.voipms.texts()) == 1
+    assert document["status"] == "degraded"
+    rejected = [r for r in caplog.records if getattr(r, "event", None) == "relay.sample_rejected"]
+    assert [r.__dict__["reason"] for r in rejected] == ["unusable", "unusable"]
+    degraded = [r for r in caplog.records if getattr(r, "event", None) == "monitoring.degraded"]
+    assert degraded[0].__dict__["reason"] == "measurement_unusable"
+
+
+def test_a_sample_older_than_the_newest_is_reported_to_the_monitor(harness: Harness) -> None:
+    harness.write_config()
+    harness.vrm.set("tsT", 20, -20)
+    with harness.service() as service:
+        harness.cycle(service, 2)
+        harness.vrm.skew = timedelta(minutes=-10)  # the device's clock jumped back
+        harness.cycle(service, 2)
+
+    assert monitoring_texts(harness) == [
+        (
+            "VRM Alert Relay: monitoring of cabin is degraded since 2035-01-01 00:02 UTC; "
+            "alerts may be delayed or missed"
+        )
+    ]
+
+
+def test_the_same_reading_again_is_not_a_problem(harness: Harness) -> None:
+    harness.write_config()
+    harness.vrm.set("tsT", 20, -20)
+    harness.vrm.now = lambda: START  # the GX device logged nothing new
+    with harness.service() as service:
+        harness.cycle(service, 5)
+        assert service.relay.status.failing == 0
+
+    assert harness.voipms.texts() == []
+
+
+def test_a_sample_within_the_tolerance_is_evaluated_normally(harness: Harness) -> None:
+    harness.write_config()
+    harness.vrm.skew = FUTURE_TOLERANCE
+    harness.vrm.set("tsT", 20, -2)
+    with harness.service() as service:
+        harness.cycle(service, 3)
+        assert service.relay.status.failing == 0
+
+    assert harness.voipms.texts() == [
+        "critical: freezer at cabin: Fictitious tsT is -2 (2035-01-01 00:01 UTC)"
+    ]

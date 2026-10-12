@@ -14,6 +14,12 @@ MAX_TEXT_LENGTH: Final = 256
 MAX_COUNTER: Final = 2**63 - 1
 MAX_TIMESTAMP_LENGTH: Final = 64
 STATE_VERSION: Final = 3
+FUTURE_TOLERANCE: Final = timedelta(seconds=60)
+"""How far ahead of the evaluation time a sample may be stamped and still be used.
+
+The one sample-usability bound: the VRM parser flags a reading stamped later
+than this as a future timestamp, so a sample it passes on is one the engine uses.
+"""
 
 type LevelTime = tuple[str, datetime]
 

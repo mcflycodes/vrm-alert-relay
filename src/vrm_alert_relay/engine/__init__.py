@@ -1,7 +1,8 @@
 """Pure alert rules engine public API."""
 
-from .evaluator import evaluate
+from .evaluator import evaluate, sample_is_usable
 from .models import (
+    FUTURE_TOLERANCE,
     Direction,
     Event,
     EventKind,
@@ -13,6 +14,7 @@ from .models import (
 )
 
 __all__ = [
+    "FUTURE_TOLERANCE",
     "Direction",
     "Event",
     "EventKind",
@@ -22,4 +24,5 @@ __all__ = [
     "RuleState",
     "Sample",
     "evaluate",
+    "sample_is_usable",
 ]
