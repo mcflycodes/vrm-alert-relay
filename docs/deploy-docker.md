@@ -35,7 +35,7 @@ Once release images are published, use `ghcr.io/mcflycodes/vrm-alert-relay:VERSI
 
 ## Verifying a release image
 
-Release images are published to `ghcr.io/mcflycodes/vrm-alert-relay` for `linux/amd64` and `linux/arm64`, tagged with the version without its `v` (tag `v0.1.0-rc.1` is image `0.1.0-rc.1`). `latest` follows the newest release that is not a pre-release. Each release lists the image's digest in its notes.
+Release images are published to `ghcr.io/mcflycodes/vrm-alert-relay` for `linux/amd64` and `linux/arm64`, tagged with the version without its `v` (tag `v0.1.0-rc.1` is image `0.1.0-rc.1`). `latest` points to the highest stable (not pre-release) version. Each release lists the image's digest in its notes.
 
 The release workflow signs every image with [Sigstore cosign](https://docs.sigstore.dev/) keyless signing: the signing certificate is issued to this repository's release workflow, running for a version tag, through GitHub Actions OIDC. No signing key exists to leak. It also attaches each platform's CycloneDX SBOM to that platform's image as a signed attestation, and to the GitHub Release.
 

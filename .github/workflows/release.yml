@@ -1,16 +1,26 @@
 name: Release
 
 # Publishes a signed multi-platform image and a GitHub Release when a version
-# tag is pushed. RELEASING.md describes the procedure; docs/deploy-docker.md
-# describes how to verify the result.
+# tag is pushed. RELEASING.md describes the procedure and what each failure
+# leaves behind; docs/deploy-docker.md describes how to verify the result.
+#
+# The image is built once, into an OCI layout. The scans, SBOMs and smoke tests
+# use that layout, and exactly those objects are published, first by digest
+# only. Tags are applied only once the digest is signed and its SBOMs attested,
+# and "latest" moves last.
 on:
   push:
     tags: ["v*.*.*"]
 
 permissions: {}
 
+# One release at a time across the repository, so two releases cannot race on
+# "latest". A run waits for the one in progress. GitHub keeps only one waiting
+# run per group, so a third tag pushed meanwhile cancels the waiting run before
+# it starts (RELEASING.md). "queue: max" would keep them all, but actionlint
+# does not accept that key yet.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 defaults:
@@ -78,19 +88,19 @@ jobs:
             echo "prerelease=${prerelease}"
           } >> "$GITHUB_OUTPUT"
 
+  # Builds every platform once into an OCI layout and tests and scans that
+  # layout. Nothing leaves the runner except as workflow artifacts.
   build:
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: read
-      packages: write # push the version tag to GHCR
     outputs:
-      digest: ${{ steps.verify.outputs.digest }}
-      amd64-digest: ${{ steps.verify.outputs.amd64-digest }}
-      arm64-digest: ${{ steps.verify.outputs.arm64-digest }}
+      digest: ${{ steps.layout.outputs.digest }}
+      amd64-digest: ${{ steps.layout.outputs.amd64-digest }}
+      arm64-digest: ${{ steps.layout.outputs.arm64-digest }}
     env:
-      IMAGE_TAG: ${{ needs.prepare.outputs.image-tag }}
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -107,32 +117,100 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
-      # The image is built once per platform for scanning, then again for all
-      # platforms to push. The commit time fixes every timestamp, so the second
-      # build comes from the build cache and must produce the same image
-      # configuration; the verify step below checks that it did.
-      - name: Build each platform
+      - name: Build all platforms into an OCI layout
         run: |
-          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
-          export SOURCE_DATE_EPOCH
-          echo "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}" >> "$GITHUB_ENV"
+          log="$RUNNER_TEMP/build.log"
+          docker buildx build --pull --progress=plain --platform "$PLATFORMS" \
+            --provenance=false --sbom=false \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --output "type=oci,dest=${RUNNER_TEMP}/image.oci.tar" . 2>&1 | tee "$log"
+
+          # As in CI: each platform's runtime root filesystem was installed in this
+          # build, and no package script failed (see the Dockerfile).
+          IFS=, read -ra platforms <<< "$PLATFORMS"
+          installs="$(grep -cE 'Installing python-3\.13-base' "$log" || true)"
+          ldconfigs="$(grep -cE '^#[0-9]+ [0-9.]+ \+ ldconfig -r /rootfs' "$log" || true)"
+          echo "python-3.13-base installs: ${installs}; ldconfig runs: ${ldconfigs}"
+          if (( installs < 2 * ${#platforms[@]} || ldconfigs < ${#platforms[@]} )); then
+            echo "::error::the build log does not show every platform's root filesystem being installed"
+            exit 1
+          fi
+          if grep -F 'script exited with error' "$log"; then
+            echo "::error::a package script failed during the image build"
+            exit 1
+          fi
+      - name: Read the layout
+        id: layout
+        run: |
+          layout="$RUNNER_TEMP/oci/layout"
+          mkdir -p "$layout"
+          tar -xf "$RUNNER_TEMP/image.oci.tar" -C "$layout"
+          digest="$(jq -r 'if (.manifests | length) == 1 and .manifests[0].mediaType == "application/vnd.oci.image.index.v1+json" then .manifests[0].digest else empty end' "$layout/index.json")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::the layout does not hold exactly one image index"; exit 1; }
+          index="$layout/blobs/sha256/${digest#sha256:}"
+          echo "${digest#sha256:}  ${index}" | sha256sum --check --strict
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "Image index: ${digest}"
+
+          IFS=, read -ra platforms <<< "$PLATFORMS"
+          if [[ "$(jq '.manifests | length' "$index")" != "${#platforms[@]}" ]]; then
+            echo "::error::the image index does not hold exactly one manifest per platform"
+            exit 1
+          fi
+          # A one-image view of the layout per platform, sharing its blobs, for the
+          # smoke tests, scans and SBOMs.
+          for platform in "${platforms[@]}"; do
+            arch="${platform#linux/}"
+            descriptor="$(jq -c --arg arch "$arch" \
+              '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)] | if length == 1 then .[0] else empty end' \
+              "$index")"
+            [[ -n "$descriptor" ]] || { echo "::error::no single ${platform} manifest in the image index"; exit 1; }
+            manifest="$(jq -r .digest <<< "$descriptor")"
+            echo "${manifest#sha256:}  ${layout}/blobs/sha256/${manifest#sha256:}" | sha256sum --check --strict
+            view="$RUNNER_TEMP/oci/view-${arch}"
+            mkdir -p "$view"
+            cp "$layout/oci-layout" "$view/"
+            ln -s ../layout/blobs "$view/blobs"
+            jq -n --argjson d "$descriptor" \
+              '{schemaVersion: 2, mediaType: "application/vnd.oci.image.index.v1+json", manifests: [$d]}' \
+              > "$view/index.json"
+            echo "${arch}-digest=${manifest}" >> "$GITHUB_OUTPUT"
+            echo "${platform}: ${manifest}"
+          done
+      - name: Load each platform into Docker
+        run: |
           IFS=, read -ra platforms <<< "$PLATFORMS"
           for platform in "${platforms[@]}"; do
             arch="${platform#linux/}"
-            docker buildx build --pull --platform "$platform" \
-              --provenance=false --sbom=false \
-              --label "org.opencontainers.image.version=${VERSION}" \
-              --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
-              --load --tag "vrm-alert-relay:release-${arch}" .
-            docker image inspect --format '{{.Id}}' "vrm-alert-relay:release-${arch}" \
-              > "$RUNNER_TEMP/config-${arch}.txt"
-            echo "${platform} image configuration: $(cat "$RUNNER_TEMP/config-${arch}.txt")"
+            view="$RUNNER_TEMP/oci/view-${arch}"
+            manifest="$(jq -r '.manifests[0].digest' "$view/index.json")"
+            config="$(jq -r .config.digest "$view/blobs/sha256/${manifest#sha256:}")"
+            # Docker's classic image store loads only docker-archive tarballs, so
+            # the view gets a manifest.json naming the same blobs.
+            jq -n --arg arch "$arch" --slurpfile m "$view/blobs/sha256/${manifest#sha256:}" \
+              '[{Config: ("blobs/sha256/" + ($m[0].config.digest | ltrimstr("sha256:"))),
+                 RepoTags: ["vrm-alert-relay:release-\($arch)"],
+                 Layers: [$m[0].layers[].digest | "blobs/sha256/" + ltrimstr("sha256:")]}]' \
+              > "$RUNNER_TEMP/oci/manifest-${arch}.json"
+            tar -chf "$RUNNER_TEMP/oci/${arch}.tar" -C "$view" oci-layout index.json blobs \
+              --transform "s|^manifest-${arch}.json|manifest.json|" -C "$RUNNER_TEMP/oci" "manifest-${arch}.json"
+            docker load --input "$RUNNER_TEMP/oci/${arch}.tar"
+            # Docker's image ID is the configuration digest, so this is the image
+            # from the layout.
+            loaded="$(docker image inspect --format '{{.Id}}' "vrm-alert-relay:release-${arch}")"
+            if [[ "$loaded" != "$config" ]]; then
+              echo "::error::${platform}: Docker loaded ${loaded}, the layout holds ${config}"
+              exit 1
+            fi
+            echo "${platform}: loaded configuration ${config}"
           done
       - name: Smoke test each platform
         run: |
           IFS=, read -ra platforms <<< "$PLATFORMS"
           for platform in "${platforms[@]}"; do
             image="vrm-alert-relay:release-${platform#linux/}"
+            echo "::group::${platform}"
             user="$(docker image inspect --format '{{.Config.User}}' "$image")"
             uid="${user%%:*}"
             case "$uid" in
@@ -141,88 +219,149 @@ jobs:
                 exit 1
                 ;;
             esac
-            output="$(docker run --rm --platform "$platform" --read-only --cap-drop ALL \
-              --security-opt no-new-privileges --network none "$image" --version)"
-            echo "${platform}: ${output} (user ${user})"
+            cmd="$(docker image inspect --format '{{json .Config.Cmd}}' "$image")"
+            workdir="$(docker image inspect --format '{{.Config.WorkingDir}}' "$image")"
+            echo "User ${user}, Cmd ${cmd}, WorkingDir ${workdir}"
+            [[ "$cmd" == '["run"]' && "$workdir" == /home/nonroot ]]
+
+            hardened=(docker run --rm --platform "$platform" --read-only --cap-drop ALL
+                      --security-opt no-new-privileges --network none)
+            output="$("${hardened[@]}" "$image" --version)"
+            echo "Version output: ${output}"
             if [[ "$output" != "vrm-alert-relay ${VERSION}" ]]; then
               echo "::error::${platform} image reports '${output}', expected 'vrm-alert-relay ${VERSION}'"
               exit 1
             fi
+            "${hardened[@]}" --volume "$PWD/.github/scripts:/smoke:ro" \
+              --entrypoint /opt/venv/bin/python "$image" /smoke/check_runtime_image.py
+            perms="$("${hardened[@]}" --entrypoint /opt/venv/bin/python "$image" -c \
+              'import os, stat; s = os.stat("/var/lib/vrm-alert-relay"); print(s.st_uid, s.st_gid, oct(stat.S_IMODE(s.st_mode)))')"
+            echo "State directory: ${perms}"
+            [[ "$perms" == "65532 65532 0o700" ]]
+            echo "::endgroup::"
           done
+      - name: Smoke test TLS verification on each platform
+        run: |
+          pki="$RUNNER_TEMP/tls-pki"
+          .github/scripts/make_tls_smoke_pki.sh "$pki" tls.example.test
+          docker network create --internal vrm-tls-smoke
+          IFS=, read -ra platforms <<< "$PLATFORMS"
+          for platform in "${platforms[@]}"; do
+            image="vrm-alert-relay:release-${platform#linux/}"
+            echo "::group::${platform}"
+            hardened=(docker run --rm --platform "$platform" --read-only --cap-drop ALL
+                      --security-opt no-new-privileges --network vrm-tls-smoke
+                      --volume "$PWD/.github/scripts:/smoke:ro" --volume "$pki:/certs:ro"
+                      --entrypoint /opt/venv/bin/python)
+            "${hardened[@]}" --detach --name vrm-tls-server \
+              --network-alias tls.example.test --network-alias wrong.example.test \
+              "$image" /smoke/tls_smoke_server.py
+            status=0
+            "${hardened[@]}" "$image" /smoke/tls_smoke_client.py || status=$?
+            echo "Server log:"
+            docker logs vrm-tls-server
+            docker rm --force vrm-tls-server
+            echo "::endgroup::"
+            (( status == 0 )) || { echo "::error::TLS smoke test failed on ${platform}"; exit "$status"; }
+          done
+          docker network rm vrm-tls-smoke
       - uses: ./.github/actions/scan-image
         with:
-          image: vrm-alert-relay:release-amd64
+          input: ${{ runner.temp }}/oci/view-amd64
       - uses: ./.github/actions/scan-image
         with:
-          image: vrm-alert-relay:release-arm64
+          input: ${{ runner.temp }}/oci/view-arm64
       - name: Generate SBOMs
         run: |
           IFS=, read -ra platforms <<< "$PLATFORMS"
           for platform in "${platforms[@]}"; do
             arch="${platform#linux/}"
             "$RUNNER_TEMP/trivy" image --no-progress --format cyclonedx \
-              --output "sbom-linux-${arch}.cdx.json" "vrm-alert-relay:release-${arch}"
+              --output "sbom-linux-${arch}.cdx.json" --input "$RUNNER_TEMP/oci/view-${arch}"
           done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom-cyclonedx
           path: sbom-linux-*.cdx.json
           if-no-files-found: error
-      - name: Log in to GitHub Container Registry
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-      # Only the exact version tag is pushed here; "latest" moves after signing.
-      - name: Push image
-        run: |
-          docker buildx build --platform "$PLATFORMS" \
-            --provenance=false --sbom=false \
-            --label "org.opencontainers.image.version=${VERSION}" \
-            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
-            --metadata-file "$RUNNER_TEMP/push.json" \
-            --push --tag "${REPOSITORY}:${IMAGE_TAG}" .
-      - name: Verify the pushed image is the scanned image
-        id: verify
-        run: |
-          digest="$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/push.json")"
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest in the build metadata"; exit 1; }
-          index="$(docker buildx imagetools inspect --raw "${REPOSITORY}@${digest}")"
-          count="$(jq '.manifests | length' <<< "$index")"
-          IFS=, read -ra platforms <<< "$PLATFORMS"
-          if [[ "$count" != "${#platforms[@]}" ]]; then
-            echo "::error::the pushed index has ${count} manifests, expected ${#platforms[@]}"
-            exit 1
-          fi
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-          echo "${REPOSITORY}:${IMAGE_TAG} is ${digest}"
-          for platform in "${platforms[@]}"; do
-            arch="${platform#linux/}"
-            manifest="$(jq -r --arg arch "$arch" \
-              '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)] | if length == 1 then .[0].digest else empty end' \
-              <<< "$index")"
-            [[ -n "$manifest" ]] || { echo "::error::no single ${platform} manifest in the pushed index"; exit 1; }
-            pushed="$(docker buildx imagetools inspect --raw "${REPOSITORY}@${manifest}" | jq -r '.config.digest')"
-            scanned="$(cat "$RUNNER_TEMP/config-${arch}.txt")"
-            echo "${platform}: manifest ${manifest}, pushed configuration ${pushed}, scanned ${scanned}"
-            if [[ "$pushed" != "$scanned" ]]; then
-              echo "::error::the pushed ${platform} image differs from the scanned one; it will not be signed"
-              exit 1
-            fi
-            echo "${arch}-digest=${manifest}" >> "$GITHUB_OUTPUT"
-          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oci-image
+          path: ${{ runner.temp }}/image.oci.tar
+          if-no-files-found: error
+          retention-days: 7
 
-  sign:
-    needs: [prepare, build]
+  # Pushes the layout's objects by digest. No tag is created, so nothing points
+  # at the image until it has been signed.
+  publish:
+    needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
-      packages: write # store signatures and attestations, move latest
+      contents: read
+      packages: write # push the image by digest
+    env:
+      DIGEST: ${{ needs.build.outputs.digest }}
+      AMD64_DIGEST: ${{ needs.build.outputs.amd64-digest }}
+      ARM64_DIGEST: ${{ needs.build.outputs.arm64-digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install-oras
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: oci-image
+          path: ${{ runner.temp }}/artifact
+      - name: Unpack and check the layout
+        run: |
+          layout="$RUNNER_TEMP/layout"
+          mkdir -p "$layout"
+          tar -xf "$RUNNER_TEMP/artifact/image.oci.tar" -C "$layout"
+          [[ "$(jq -r '.manifests[0].digest' "$layout/index.json")" == "$DIGEST" ]]
+          for digest in "$DIGEST" "$AMD64_DIGEST" "$ARM64_DIGEST"; do
+            echo "${digest#sha256:}  ${layout}/blobs/sha256/${digest#sha256:}" | sha256sum --check --strict
+          done
+      - name: Log in to GitHub Container Registry
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GITHUB_TOKEN" | "$RUNNER_TEMP/oras" login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Push by digest
+        run: '"$RUNNER_TEMP/oras" cp --from-oci-layout "${RUNNER_TEMP}/layout@${DIGEST}" "$REPOSITORY"'
+      - name: Verify the pushed objects are the built ones
+        run: |
+          layout="$RUNNER_TEMP/layout"
+          remote="$RUNNER_TEMP/remote"
+          mkdir -p "$remote"
+          for digest in "$DIGEST" "$AMD64_DIGEST" "$ARM64_DIGEST"; do
+            "$RUNNER_TEMP/oras" manifest fetch --output "$remote/${digest#sha256:}" "${REPOSITORY}@${digest}"
+            if ! cmp "$remote/${digest#sha256:}" "$layout/blobs/sha256/${digest#sha256:}"; then
+              echo "::error::${REPOSITORY}@${digest} differs from the built manifest"
+              exit 1
+            fi
+            pushed="sha256:$(sha256sum "$remote/${digest#sha256:}" | cut -d' ' -f1)"
+            [[ "$pushed" == "$digest" ]]
+            echo "${REPOSITORY}@${digest}: identical to the built manifest"
+          done
+          for arch in amd64 arm64; do
+            expected="${arch^^}_DIGEST"
+            listed="$(jq -r --arg arch "$arch" '.manifests[] | select(.platform.architecture == $arch) | .digest' \
+              "$remote/${DIGEST#sha256:}")"
+            [[ "$listed" == "${!expected}" ]] || { echo "::error::the pushed index lists ${listed} for ${arch}"; exit 1; }
+          done
+
+  # Signs and attests the digest, then verifies both, before anything is tagged.
+  sign:
+    needs: [build, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      packages: write # store signatures and attestations
       id-token: write # keyless signing with the job's OIDC token
     env:
       DIGEST: ${{ needs.build.outputs.digest }}
       AMD64_DIGEST: ${{ needs.build.outputs.amd64-digest }}
       ARM64_DIGEST: ${{ needs.build.outputs.arm64-digest }}
-      PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
       OIDC_ISSUER: https://token.actions.githubusercontent.com
     steps:
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -238,7 +377,7 @@ jobs:
         run: printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
       # Keyless: the certificate binds the signature to this workflow at this
       # tag through the job's GitHub OIDC token. No key is stored anywhere.
-      - name: Sign the image
+      - name: Sign the image index and each platform image
         run: cosign sign --yes --recursive "${REPOSITORY}@${DIGEST}"
       - name: Attest each platform's SBOM
         run: |
@@ -246,45 +385,93 @@ jobs:
             "${REPOSITORY}@${AMD64_DIGEST}"
           cosign attest --yes --type cyclonedx --predicate sbom/sbom-linux-arm64.cdx.json \
             "${REPOSITORY}@${ARM64_DIGEST}"
-      - name: Verify the signature and attestations
+      - name: Verify the signatures and attestations
         run: |
           identity="https://github.com/${GITHUB_WORKFLOW_REF}"
           echo "Expected signer: ${identity}"
           verify=(--certificate-identity "$identity" --certificate-oidc-issuer "$OIDC_ISSUER")
           for ref in "$DIGEST" "$AMD64_DIGEST" "$ARM64_DIGEST"; do
             cosign verify "${verify[@]}" "${REPOSITORY}@${ref}" > /dev/null
+            echo "Signature verified: ${REPOSITORY}@${ref}"
           done
           for ref in "$AMD64_DIGEST" "$ARM64_DIGEST"; do
             cosign verify-attestation --type cyclonedx "${verify[@]}" "${REPOSITORY}@${ref}" > /dev/null
+            echo "SBOM attestation verified: ${REPOSITORY}@${ref}"
           done
-          echo "Signature and SBOM attestations verified"
-      - name: Tag latest
-        if: env.PRERELEASE == 'false'
-        run: |
-          docker buildx imagetools create --tag "${REPOSITORY}:latest" "${REPOSITORY}@${DIGEST}"
-          latest="sha256:$(docker buildx imagetools inspect --raw "${REPOSITORY}:latest" | sha256sum | cut -d' ' -f1)"
-          if [[ "$latest" != "$DIGEST" ]]; then
-            echo "::error::${REPOSITORY}:latest is ${latest}, expected ${DIGEST}"
-            exit 1
-          fi
-          echo "${REPOSITORY}:latest is ${DIGEST}"
 
-  release:
+  tag:
     needs: [prepare, build, sign]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
+      contents: read
+      packages: write # apply the version tag
+    env:
+      IMAGE_TAG: ${{ needs.prepare.outputs.image-tag }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install-oras
+      - name: Log in to GitHub Container Registry
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GITHUB_TOKEN" | "$RUNNER_TEMP/oras" login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Tag the version
+        run: |
+          oras="$RUNNER_TEMP/oras"
+          # A version tag is never moved to a different image.
+          if existing="$("$oras" resolve "${REPOSITORY}:${IMAGE_TAG}" 2> /dev/null)" && [[ "$existing" != "$DIGEST" ]]; then
+            echo "::error::${REPOSITORY}:${IMAGE_TAG} already points to ${existing}"
+            exit 1
+          fi
+          "$oras" tag "${REPOSITORY}@${DIGEST}" "$IMAGE_TAG"
+          resolved="$("$oras" resolve "${REPOSITORY}:${IMAGE_TAG}")"
+          [[ "$resolved" == "$DIGEST" ]] || { echo "::error::${REPOSITORY}:${IMAGE_TAG} is ${resolved}"; exit 1; }
+          echo "${REPOSITORY}:${IMAGE_TAG} is ${DIGEST}"
+
+  release:
+    needs: [prepare, build, tag]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
       contents: write # create the GitHub Release
+    outputs:
+      promote-latest: ${{ steps.latest.outputs.promote }}
     env:
       TAG: ${{ needs.prepare.outputs.tag }}
       IMAGE_TAG: ${{ needs.prepare.outputs.image-tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
       PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
       DIGEST: ${{ needs.build.outputs.digest }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: sbom-cyclonedx
           path: sbom
+      # "latest" only ever moves forward: an older line's patch release, made
+      # after a newer stable release, is published without becoming latest.
+      - name: Decide whether this release becomes latest
+        id: latest
+        run: |
+          promote=false
+          if [[ "$PRERELEASE" == false ]]; then
+            highest="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+                --limit 1000 --json tagName --jq '.[].tagName' |
+              { grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || true; } |
+              sed 's/^v//' | sort -V | tail -n 1)"
+            echo "Highest released stable version: ${highest:-none}"
+            if [[ -z "$highest" ]] ||
+               [[ "$highest" != "$VERSION" && "$(printf '%s\n' "$highest" "$VERSION" | sort -V | tail -n 1)" == "$VERSION" ]]; then
+              promote=true
+            else
+              echo "::notice::${VERSION} is not newer than ${highest}; latest is left unchanged"
+            fi
+          fi
+          echo "Promote to latest: ${promote}"
+          echo "promote=${promote}" >> "$GITHUB_OUTPUT"
       - name: Write release notes
         run: |
           docs="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${TAG}/docs/deploy-docker.md#verifying-a-release-image"
@@ -319,10 +506,38 @@ jobs:
           cat "$RUNNER_TEMP/notes.md"
       - name: Create the GitHub Release
         env:
-          GH_TOKEN: ${{ github.token }}
+          PROMOTE: ${{ steps.latest.outputs.promote }}
         run: |
-          flags=(--latest)
-          [[ "$PRERELEASE" == true ]] && flags=(--prerelease --latest=false)
+          flags=(--latest=false)
+          [[ "$PRERELEASE" == true ]] && flags+=(--prerelease)
+          [[ "$PROMOTE" == true ]] && flags=(--latest)
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes "${flags[@]}" \
             sbom/sbom-linux-amd64.cdx.json sbom/sbom-linux-arm64.cdx.json
+
+  latest:
+    needs: [build, release]
+    if: needs.release.outputs.promote-latest == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write # move the latest tag
+    env:
+      DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install-oras
+      - name: Log in to GitHub Container Registry
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GITHUB_TOKEN" | "$RUNNER_TEMP/oras" login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Tag latest
+        run: |
+          oras="$RUNNER_TEMP/oras"
+          "$oras" tag "${REPOSITORY}@${DIGEST}" latest
+          resolved="$("$oras" resolve "${REPOSITORY}:latest")"
+          [[ "$resolved" == "$DIGEST" ]] || { echo "::error::${REPOSITORY}:latest is ${resolved}"; exit 1; }
+          echo "${REPOSITORY}:latest is ${DIGEST}"
