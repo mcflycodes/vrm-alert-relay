@@ -34,6 +34,7 @@ from vrm_alert_relay.providers import ProviderSetupError, build_providers
 from vrm_alert_relay.state import DeliveryStatus, StateLockedError, StateStore
 from vrm_alert_relay.vrm import VrmAdapter
 
+from ._quiet import log_info
 from .health import HealthServer, HealthState, health_document
 from .relay import Relay
 from .rules import config_fingerprint, log_loaded_rules
@@ -253,10 +254,15 @@ class Service:
         clock: Callable[[], float] | None = None,
         rng: Callable[[], float] | None = None,
     ) -> int:
-        """Run cycles until ``stop`` is set (or ``max_cycles``); returns cycles run."""
-        logger.info(
+        """Run cycles until ``stop`` is set (or ``max_cycles``); returns cycles run.
+
+        The startup and stop records are informative only: a failure to log
+        them never keeps the relay from running.
+        """
+        log_info(
+            logger,
             "relay started",
-            extra={
+            {
                 "event": "service.started",
                 "version": __version__,
                 "dry_run": self.dry_run,
@@ -281,7 +287,7 @@ class Service:
             **scheduler_options,
         )
         cycles = scheduler.run(max_cycles=max_cycles)
-        logger.info("relay stopping", extra={"event": "service.stopping", "cycles": cycles})
+        log_info(logger, "relay stopping", {"event": "service.stopping", "cycles": cycles})
         return cycles
 
     def close(self) -> None:
@@ -294,7 +300,7 @@ class Service:
                 self._http.close()
             finally:
                 self.runtime.close()
-        logger.info("relay stopped", extra={"event": "service.stopped"})
+        log_info(logger, "relay stopped", {"event": "service.stopped"})
 
 
 @dataclass(frozen=True, slots=True)

@@ -22,6 +22,7 @@ fresh state or the default template rather than dropping the rule.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
@@ -30,6 +31,7 @@ from vrm_alert_relay.delivery import Notification
 from vrm_alert_relay.engine import EventKind, RuleState, evaluate, sample_is_usable
 from vrm_alert_relay.templates import fields_for_event, render_notification
 
+from ._quiet import log_info
 from .monitoring import MonitoringTracker, PollHealth, assess, monitor_id, streak_id
 from .rules import RuleBinding, bind_rules, poll_targets
 
@@ -143,9 +145,10 @@ class Relay:
             degraded=len(self._monitoring.degraded),
             events_total=self._status.events_total + cycle.events,
         )
-        logger.info(
+        log_info(
+            logger,
             "poll cycle finished",
-            extra={
+            {
                 "event": "relay.cycle",
                 "fetched": fetched,
                 "failed": failed,
@@ -222,11 +225,13 @@ class Relay:
         if not observed and not _observed(new_state):
             return  # The sample was unusable; the rule is still unobserved.
         cycle.rule_states[rule_id] = new_state
-        _report_hold(binding, state, new_state, events, cycle)
         for event in events:
             text = self._render(binding, event)
             cycle.notifications.append(Notification.for_event(event, text))
             cycle.events += 1
+        # Only after the rule's notifications are queued: reporting must never delay them.
+        with contextlib.suppress(Exception):
+            _report_hold(binding, state, new_state, events, cycle)
 
     @staticmethod
     def _report_problem(binding: RuleBinding, reason: str, cycle: _CycleState) -> None:
@@ -316,9 +321,10 @@ def _report_hold(
         ):
             last_sent = dict(after.level_notification_times).get(held)
             expires = None if last_sent is None else last_sent + binding.spec.cooldown
-            logger.info(
+            log_info(
+                logger,
                 "an escalation is held back by the rule's cooldown",
-                extra={
+                {
                     "event": "relay.escalation_held",
                     "rule_id": rule_id,
                     "level": held,
@@ -329,9 +335,10 @@ def _report_hold(
     if before.pending_escalation is None:
         return
     sent = next((e for e in events if e.kind is EventKind.ESCALATED), None)
-    logger.info(
+    log_info(
+        logger,
         "a held escalation was released",
-        extra={
+        {
             "event": "relay.escalation_released",
             "rule_id": rule_id,
             "level": before.pending_escalation if sent is None else sent.level,
