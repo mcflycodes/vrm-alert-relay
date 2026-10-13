@@ -6,10 +6,11 @@ thread, and binds to loopback unless the operator configures otherwise.
 Other paths answer 404 and other methods 501; no CORS headers are sent.
 The status code is always 200: the document informs, it does not gate.
 
-The document holds counts, timestamps and flags only: no secrets, no
-recipient names or addresses, no installation ids or site ids, and no
-message text. The service publishes a fresh document after each cycle; the
-server thread only ever reads the latest published bytes.
+The document holds counts, timestamps, flags and the configuration
+fingerprint only: no secrets, no recipient names or addresses, no
+installation ids or site ids, and no message text. The service publishes a
+fresh document after each cycle; the server thread only ever reads the
+latest published bytes.
 """
 
 from __future__ import annotations
@@ -43,13 +44,14 @@ def _time(value: datetime | None) -> str | None:
     return None if value is None else value.isoformat()
 
 
-def health_document(
+def health_document(  # noqa: PLR0913  # the document's inputs are explicit, not bundled
     *,
     version: str,
     dry_run: bool,
     status: RelayStatus,
     delivery: DeliveryHealth,
     cycle_failed: bool = False,
+    config_fingerprint: str | None = None,
 ) -> dict[str, object]:
     """The health document; see docs/operations.md for the schema.
 
@@ -70,6 +72,7 @@ def health_document(
         "status": overall,
         "version": version,
         "dry_run": dry_run,
+        "config_fingerprint": config_fingerprint,
         "started_at": _time(status.started_at),
         "monitoring": {
             "status": "ok" if monitoring_ok else "degraded",

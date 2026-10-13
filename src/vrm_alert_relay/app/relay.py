@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 from vrm_alert_relay.delivery import Notification
-from vrm_alert_relay.engine import RuleState, evaluate, sample_is_usable
+from vrm_alert_relay.engine import EventKind, RuleState, evaluate, sample_is_usable
 from vrm_alert_relay.templates import fields_for_event, render_notification
 
 from .monitoring import MonitoringTracker, PollHealth, assess, monitor_id, streak_id
@@ -63,6 +63,8 @@ class CycleReport:
     events: int
     queued: int
     delivery: RunReport
+    held: int = 0
+    """Rules whose escalation the cooldown is holding back after this cycle."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +87,7 @@ class _CycleState:
     rule_states: dict[str, RuleState] = field(default_factory=dict)
     notifications: list[Notification] = field(default_factory=list)
     events: int = 0
+    held: int = 0
     problems: dict[str, str] = field(default_factory=dict)
     """Installations whose samples the rules could not use, with a fixed reason."""
 
@@ -147,6 +150,7 @@ class Relay:
                 "fetched": fetched,
                 "failed": failed,
                 "events": cycle.events,
+                "held": cycle.held,
                 "queued": queued,
                 "sent": report.sent,
                 "dry_run_sent": report.dry_run_sent,
@@ -160,6 +164,7 @@ class Relay:
             events=cycle.events,
             queued=queued,
             delivery=report,
+            held=cycle.held,
         )
 
     def _poll(self) -> dict[str, InstallationOutcome | None]:
@@ -217,6 +222,7 @@ class Relay:
         if not observed and not _observed(new_state):
             return  # The sample was unusable; the rule is still unobserved.
         cycle.rule_states[rule_id] = new_state
+        _report_hold(binding, state, new_state, events, cycle)
         for event in events:
             text = self._render(binding, event)
             cycle.notifications.append(Notification.for_event(event, text))
@@ -284,6 +290,54 @@ class Relay:
             cycle.rule_states[streak_id(name)] = result.streaks[name]
         cycle.notifications.extend(result.notifications)
         cycle.events += len(result.notifications)
+
+
+def _report_hold(
+    binding: RuleBinding,
+    before: RuleState,
+    after: RuleState,
+    events: Sequence[Event],
+    cycle: _CycleState,
+) -> None:
+    """Count and log an escalation the rule's cooldown holds back, and its release.
+
+    A held escalation produces no event, so without this a cycle that holds
+    one would look idle. It is logged when it starts (or moves to another
+    level) and when it is released, whether by being sent or by ending
+    without a notification, such as on recovery.
+    """
+    rule_id = binding.rule.id
+    held = after.pending_escalation
+    if held is not None:
+        cycle.held += 1
+        if (
+            held != before.pending_escalation
+            or after.suppressed_escalations != before.suppressed_escalations
+        ):
+            last_sent = dict(after.level_notification_times).get(held)
+            expires = None if last_sent is None else last_sent + binding.spec.cooldown
+            logger.info(
+                "an escalation is held back by the rule's cooldown",
+                extra={
+                    "event": "relay.escalation_held",
+                    "rule_id": rule_id,
+                    "level": held,
+                    "cooldown_expires_at": None if expires is None else expires.isoformat(),
+                },
+            )
+        return
+    if before.pending_escalation is None:
+        return
+    sent = next((e for e in events if e.kind is EventKind.ESCALATED), None)
+    logger.info(
+        "a held escalation was released",
+        extra={
+            "event": "relay.escalation_released",
+            "rule_id": rule_id,
+            "level": before.pending_escalation if sent is None else sent.level,
+            "notified": sent is not None,
+        },
+    )
 
 
 def _rejection(sample: Sample, state: RuleState, now: datetime) -> str | None:

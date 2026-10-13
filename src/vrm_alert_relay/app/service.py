@@ -36,6 +36,7 @@ from vrm_alert_relay.vrm import VrmAdapter
 
 from .health import HealthServer, HealthState, health_document
 from .relay import Relay
+from .rules import config_fingerprint, log_loaded_rules
 from .scheduler import Scheduler
 
 if TYPE_CHECKING:
@@ -201,6 +202,7 @@ class Service:
         self.health_state = HealthState()
         self.health_server: HealthServer | None = None
         self.dry_run = not self.config.live_providers()
+        self.config_fingerprint = config_fingerprint(self.config)
         self._cycle_failed = False
 
     def run_cycle(self) -> None:
@@ -217,6 +219,7 @@ class Service:
             health_document(
                 version=__version__,
                 dry_run=self.dry_run,
+                config_fingerprint=self.config_fingerprint,
                 status=self.relay.status,
                 delivery=self.runtime.delivery.health(),
                 cycle_failed=self._cycle_failed,
@@ -261,8 +264,10 @@ class Service:
                 "installations": len(self.config.vrm.installations),
                 "rules": len(self.config.rules),
                 "poll_interval": self.config.vrm.poll_interval,
+                "config_fingerprint": self.config_fingerprint,
             },
         )
+        log_loaded_rules(self.config)
         scheduler_options: dict[str, Callable[[], float]] = {}
         if clock is not None:
             scheduler_options["clock"] = clock

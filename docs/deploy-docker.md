@@ -157,7 +157,7 @@ docker compose up -d
 docker compose ps
 ```
 
-Leave it in dry-run mode for a while, ideally several days, and read what it would have sent before enabling real sending. Keep VRM's own alarms enabled throughout: the relay supplements them (see [vrm-credentials.md](vrm-credentials.md#keep-native-vrm-alarms-enabled)).
+Leave it in dry-run mode for a while, ideally several days, and read what it would have sent before enabling real sending. How quickly an alert follows a real change is bounded by how often the GX device uploads to VRM (its log interval), not by the relay; [vrm-credentials.md](vrm-credentials.md#how-fresh-is-the-data) explains how to shorten it on the GX device. Keep VRM's own alarms enabled throughout: the relay supplements them (see [vrm-credentials.md](vrm-credentials.md#keep-native-vrm-alarms-enabled)).
 
 ## 8. Read the logs
 
@@ -181,9 +181,11 @@ Records worth knowing:
 
 | `event` | Meaning |
 |---|---|
-| `service.started` | Startup. `dry_run` is `true` while no provider is live. |
+| `service.started` | Startup. `dry_run` is `true` while no provider is live; `config_fingerprint` identifies the loaded configuration. |
+| `relay.rule_loaded` | One per rule at startup: its direction, level names and thresholds, hysteresis and `display_unit`. |
 | `config.warning` | A non-fatal configuration finding, such as a readable secret file. |
-| `relay.cycle` | One poll cycle completed. |
+| `relay.cycle` | One poll cycle completed. `held` counts escalations the rule's cooldown is holding back. |
+| `relay.escalation_held`, `relay.escalation_released` | An escalation was held back by the rule's cooldown (with `cooldown_expires_at`), or was later released: sent (`notified: true`) or ended without a message, such as on recovery. |
 | `provider.dry_run` | A message that was logged instead of sent. |
 | `monitoring.degraded`, `monitoring.restored` | An installation's polling failed repeatedly, or recovered. |
 | `provider.delivered`, `provider.failed`, `provider.ambiguous` | The outcome of a real provider call, with a `reason`. |
@@ -208,7 +210,18 @@ docker compose run --rm --no-deps relay check-config
 docker compose up -d --force-recreate
 ```
 
-`check-config` should now list the provider under `live providers`. The relay reads its configuration only at startup, so restart it after every change to `config.yaml`. To return to dry-run mode, set `sending.enabled: false` and restart.
+`check-config` should now list the provider under `live providers`. To return to dry-run mode, set `sending.enabled: false` and apply the change the same way.
+
+### Applying a configuration change
+
+The relay reads its configuration only at startup. After every change to `config.yaml`, check it and apply it with:
+
+```sh
+docker compose run --rm --no-deps relay check-config
+docker compose up -d --force-recreate
+```
+
+A plain `docker compose restart` is not enough: it can keep serving the old file. `config.yaml` is bind-mounted as a single file, and such a mount follows the file's original inode. Most editors, `sudoedit` and `sed -i` save by writing a new file and renaming it over the old one, so the running container still sees the previous version until it is recreated. To confirm which configuration is loaded, compare the `config_fingerprint` in the new `service.started` record (and in the health document) with the one before the change: it changes whenever a rule's alerting settings, its recipient names or the enabled providers change.
 
 ## 10. Send a test notification
 
