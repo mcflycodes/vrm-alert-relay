@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from datetime import UTC, datetime, timedelta, timezone
@@ -504,10 +505,47 @@ def test_for_display_rounds_to_the_documented_decimals() -> None:
     assert Template("{value}").render(shown) == "1.2"
 
 
-@pytest.mark.parametrize(("value", "text"), [(21.0, "21.0"), (-0.04, "0.0"), (1e7, "1e+07")])
-def test_fixed_decimals_apply_to_plain_numbers_only(value: float, text: str) -> None:
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [
+        (21.0, "21.0"),
+        (-0.04, "0.0"),
+        (-0.0, "0.0"),
+        (0.0, "0.0"),
+        (999_999.96, "1000000.0"),
+        (1e7, "10000000.0"),
+        (-2.5e6, "-2500000.0"),
+        (1e15, "1000000000000000.0"),
+        (-1e15, "-1000000000000000.0"),
+    ],
+)
+def test_fixed_decimals_are_fixed_point_for_every_finite_value(value: float, text: str) -> None:
     fields = TemplateFields(kind=NotificationKind.ESCALATED, value=value, decimals=1)
     assert Template("{value}").render(fields) == text
+
+
+@pytest.mark.parametrize("value", [math.inf, -math.inf, math.nan])
+def test_fixed_decimals_keep_non_finite_values_missing(value: float) -> None:
+    fields = TemplateFields(kind=NotificationKind.ESCALATED, value=value, decimals=1)
+    assert Template("{value}").render(fields) == MISSING
+
+
+def test_values_without_fixed_decimals_still_use_exponents_when_large() -> None:
+    fields = TemplateFields(kind=NotificationKind.ESCALATED, value=1e7)
+    assert Template("{value}").render(fields) == "1e+07"
+
+
+@pytest.mark.parametrize(
+    ("celsius", "text"),
+    [(1e7, "18000032.0°F"), (-1e7, "-17999968.0°F"), (-0.0, "32.0°F"), (-17.7778, "0.0°F")],
+)
+def test_display_unit_is_fixed_point_for_large_and_negative_values(
+    celsius: float, text: str
+) -> None:
+    fields = TemplateFields(kind=NotificationKind.ESCALATED, value=celsius)
+    shown = for_display(fields, DisplayUnit.DEG_F, reported_unit="°C")
+    assert shown is not None
+    assert Template("{value}{unit}").render(shown) == text
 
 
 def test_for_display_keeps_a_missing_value_missing() -> None:

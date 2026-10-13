@@ -134,7 +134,8 @@ class TemplateFields:
     time: datetime | None = None
     count: int | None = None
     decimals: int | None = None
-    """Shows ``value`` with exactly this many decimals; ``None`` trims trailing zeros."""
+    """Shows ``value`` in fixed point with exactly this many decimals, however
+    large; ``None`` trims trailing zeros and uses exponents for large values."""
 
 
 def sanitize_field(text: str, limit: int) -> str:
@@ -210,10 +211,10 @@ _UNTRUSTED_FIELDS: Final = frozenset({"label", "unit"})
 def _format_value(value: float, decimals: int | None = None) -> str:
     if isinstance(value, bool) or not math.isfinite(value):
         return MISSING
+    if decimals is not None:
+        text = f"{value:.{decimals}f}"
+        return text[1:] if text.startswith("-") and float(text) == 0 else text
     if abs(value) < _PLAIN_NUMBER_LIMIT:
-        if decimals is not None:
-            text = f"{value:.{decimals}f}"
-            return text[1:] if text.startswith("-") and float(text) == 0 else text
         text = f"{value:.3f}".rstrip("0").rstrip(".")
         return "0" if text in ("-0", "") else text
     return f"{value:.6g}"
