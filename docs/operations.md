@@ -1,6 +1,6 @@
 # Running VRM Alert Relay
 
-**Updated:** 2026-10-11
+**Updated:** 2026-10-12
 
 VRM Alert Relay is an unofficial, independent project. It is not affiliated with, sponsored by, or endorsed by Victron Energy.
 
@@ -31,7 +31,13 @@ vrm-alert-relay --version
 
 A flag wins over its environment variable. The container image runs `run` by default.
 
-- **`run`** starts the relay. It logs one JSON object per line to standard output, starting with a `service.started` record whose `dry_run` field is `true` unless some provider is live. `--once` runs a single poll cycle and exits, which is useful for a first test of a new configuration.
+- **`run`** starts the relay. It logs one JSON object per line to standard output, starting with a `service.started` record whose `dry_run` field is `true` unless some provider is live, followed by one `relay.rule_loaded` record per rule (its direction, level names and thresholds, hysteresis and `display_unit`, without recipients). `--once` runs a single poll cycle and exits, which is useful for a first test of a new configuration.
+
+### Applying a configuration change
+
+The relay reads its configuration only at startup, so restart it after every change. With Docker Compose, apply the change with `docker compose up -d --force-recreate`, not `docker compose restart`: a single-file bind mount of `config.yaml` follows the file's original inode, and editors, `sudoedit` and `sed -i` replace the file with a new one, so a restarted container can keep reading the old version ([deploy-docker.md](deploy-docker.md#applying-a-configuration-change)).
+
+`service.started` and the health document carry a `config_fingerprint`: the first 16 hex characters of a SHA-256 over every rule's alerting settings (installation, measurement, direction, levels and thresholds, hysteresis, `clear_after_samples`, `recovery_notify`, cooldown, reminders, `stale_after_minutes`, `display_unit` and recipient names) and which providers and sending are enabled. A recipient name with five or more digits counts only by its position (`[#3]`), as `check-config` shows it. Compare the fingerprint before and after a change to confirm the relay loaded the new file. It is derived from no phone number, DID, URL, secret or secret file. If it cannot be computed it reads `unavailable`; like every visibility record, it never stops the relay, and a log record that fails to write is dropped rather than delaying a cycle.
 - **`check-config`** validates the configuration and the secret files it references, without contacting any service, and prints a report. Recipient names that look like phone numbers (five or more digits) are shown by position, such as `[#3]`, everywhere the relay prints or logs a recipient name. `--structure-only` skips the secret files; its result is never "ready".
 - **`test-notification --recipient NAME`** sends one test message to one configured recipient and prints the outcome. It sends only when you run it, goes through the delivery engine like any alert (so the global cap, dry-run routing, attempt records and reconciliation all apply), and sends nothing else that is waiting. While sending is disabled for the recipient's provider, the message is only written to the log. It needs the state directory, so stop the relay first: a running relay holds the directory's lock.
 
@@ -62,6 +68,10 @@ Each cycle:
 3. evaluates each installation's monitor (below);
 4. renders each event's text from its template and hands the cycle's rule states and notifications to the delivery engine in one transaction;
 5. delivers whatever is due.
+
+Each cycle ends with a `relay.cycle` record counting installations fetched and failed, events, queued and sent messages, and `held`: rules whose escalation the cooldown is holding back. A held escalation sends nothing yet, so it is also logged on its own: `relay.escalation_held` names the rule, the level and when the cooldown expires (`cooldown_expires_at`), and `relay.escalation_released` follows when it is sent (`notified: true`) or ends without a message, for example because the value recovered first (`notified: false`).
+
+**Alert latency** is bounded by the GX device's VRM log interval, not by the relay: the relay can only evaluate samples VRM already has, so a change on site can take up to one log interval (15 minutes by default) plus one poll interval to reach a rule. Shorten the log interval on the GX device (**Settings → VRM online portal → Log interval**) for faster alerts; [vrm-credentials.md](vrm-credentials.md#how-fresh-is-the-data) covers the trade-offs and the matching `stale_after_minutes`.
 
 Cycles start the configured `vrm.poll_interval` apart, plus up to 10% random jitter, so never more often than the interval. A long cycle is followed by the next one at once. VRM backoff (on errors, 429 `Retry-After`, and the hourly retry after a 401 or 403) is per site and enforced by the VRM adapter: while a site backs off, cycles skip its request but still check staleness, monitoring and pending deliveries.
 
@@ -103,6 +113,7 @@ Enable it with `health.enabled: true`. It listens on `health.bind` (default `127
   "status": "ok",
   "version": "0.1.0",
   "dry_run": true,
+  "config_fingerprint": "3f9a1c0b7d2e4a58",
   "started_at": "2026-01-15T12:00:00+00:00",
   "monitoring": {
     "status": "ok",
@@ -138,6 +149,7 @@ Enable it with `health.enabled: true`. It listens on `health.bind` (default `127
 | `monitoring.cycles` | Cycles completed since the relay started. |
 | `monitoring.last_cycle_failed` | Whether the latest cycle stopped with an unexpected error. |
 | `dry_run` | `true` when no provider is live. |
+| `config_fingerprint` | Identifies the loaded configuration; see [Applying a configuration change](#applying-a-configuration-change). |
 | `monitoring.last_successful_poll_at` | The last cycle in which every installation was fetched (measurement problems aside). |
 | `monitoring.failing_installations` | Installations whose last poll failed. |
 | `monitoring.degraded_installations` | Installations with an open outage. |

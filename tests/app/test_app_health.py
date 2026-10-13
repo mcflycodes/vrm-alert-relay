@@ -132,6 +132,8 @@ def test_service_health_binds_loopback_and_holds_no_secrets_or_recipients(
     document = json.loads(body)
     assert document["status"] == "ok"
     assert document["dry_run"] is False
+    assert document["config_fingerprint"] == service.config_fingerprint
+    assert len(document["config_fingerprint"]) == 16
     assert document["monitoring"] == {
         "status": "ok",
         "cycles": 2,

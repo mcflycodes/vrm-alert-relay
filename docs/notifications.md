@@ -20,7 +20,7 @@ The configuration is rejected at load time, and by `check-config`, if a template
 |---|---|
 | `{rule}` | The rule id. |
 | `{level}` | The level name. |
-| `{value}` | The measured value, up to three decimals (`-3.5`, `12`). With the rule's `display_unit`, the value in that unit, rounded to one decimal (`25.7`, `32`). |
+| `{value}` | The measured value, up to three decimals (`-3.5`, `12`). With the rule's `display_unit`, the value in that unit, always with one decimal (`25.7`, `32.0`). |
 | `{unit}` | Empty, unless the rule sets `display_unit`: then the display unit (`°C` or `°F`), or the unit VRM reports when the value cannot be converted. |
 | `{installation}` | The installation id from `vrm.installations`. |
 | `{measurement}` | The measurement code, such as `tsT`. |

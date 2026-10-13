@@ -214,8 +214,8 @@ How the timing settings work:
 
 | Value | `{value}` | `{unit}` |
 |---|---|---|
-| `degC` | The value in °C, rounded to one decimal. | `°C` |
-| `degF` | The value converted to °F, rounded to one decimal. | `°F` |
+| `degC` | The value in °C, rounded to and always shown with one decimal (`21.0`). | `°C` |
+| `degF` | The value converted to °F, rounded to and always shown with one decimal (`36.0`). | `°F` |
 
 Any other value is rejected when the file is loaded. The relay converts a value only when VRM reported °C (in the record's `formatWithUnit`) with that same reading. A unit from an earlier or later poll is never applied to it, so a reminder or recovery for a value whose unit is not known, such as one restored from saved state after a restart, shows the value as reported. If it reports another unit, or none, the message is still sent, with the value and unit as VRM reports them, and the relay logs a `relay.display_unit_fallback` warning. Without `display_unit`, `{unit}` stays empty and `{value}` shows up to three decimals, as before.
 

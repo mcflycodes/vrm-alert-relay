@@ -34,8 +34,10 @@ from vrm_alert_relay.providers import ProviderSetupError, build_providers
 from vrm_alert_relay.state import DeliveryStatus, StateLockedError, StateStore
 from vrm_alert_relay.vrm import VrmAdapter
 
+from ._quiet import log_info
 from .health import HealthServer, HealthState, health_document
 from .relay import Relay
+from .rules import config_fingerprint, log_loaded_rules
 from .scheduler import Scheduler
 
 if TYPE_CHECKING:
@@ -201,6 +203,7 @@ class Service:
         self.health_state = HealthState()
         self.health_server: HealthServer | None = None
         self.dry_run = not self.config.live_providers()
+        self.config_fingerprint = config_fingerprint(self.config)
         self._cycle_failed = False
 
     def run_cycle(self) -> None:
@@ -217,6 +220,7 @@ class Service:
             health_document(
                 version=__version__,
                 dry_run=self.dry_run,
+                config_fingerprint=self.config_fingerprint,
                 status=self.relay.status,
                 delivery=self.runtime.delivery.health(),
                 cycle_failed=self._cycle_failed,
@@ -250,10 +254,15 @@ class Service:
         clock: Callable[[], float] | None = None,
         rng: Callable[[], float] | None = None,
     ) -> int:
-        """Run cycles until ``stop`` is set (or ``max_cycles``); returns cycles run."""
-        logger.info(
+        """Run cycles until ``stop`` is set (or ``max_cycles``); returns cycles run.
+
+        The startup and stop records are informative only: a failure to log
+        them never keeps the relay from running.
+        """
+        log_info(
+            logger,
             "relay started",
-            extra={
+            {
                 "event": "service.started",
                 "version": __version__,
                 "dry_run": self.dry_run,
@@ -261,8 +270,10 @@ class Service:
                 "installations": len(self.config.vrm.installations),
                 "rules": len(self.config.rules),
                 "poll_interval": self.config.vrm.poll_interval,
+                "config_fingerprint": self.config_fingerprint,
             },
         )
+        log_loaded_rules(self.config)
         scheduler_options: dict[str, Callable[[], float]] = {}
         if clock is not None:
             scheduler_options["clock"] = clock
@@ -276,7 +287,7 @@ class Service:
             **scheduler_options,
         )
         cycles = scheduler.run(max_cycles=max_cycles)
-        logger.info("relay stopping", extra={"event": "service.stopping", "cycles": cycles})
+        log_info(logger, "relay stopping", {"event": "service.stopping", "cycles": cycles})
         return cycles
 
     def close(self) -> None:
@@ -289,7 +300,7 @@ class Service:
                 self._http.close()
             finally:
                 self.runtime.close()
-        logger.info("relay stopped", extra={"event": "service.stopped"})
+        log_info(logger, "relay stopped", {"event": "service.stopped"})
 
 
 @dataclass(frozen=True, slots=True)
