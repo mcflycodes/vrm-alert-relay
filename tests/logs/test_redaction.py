@@ -3,7 +3,10 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
+import sys
 import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, quote_plus
 
@@ -26,9 +29,11 @@ from vrm_alert_relay.logs import (
     redact_value,
     register_derived_secret,
 )
+from vrm_alert_relay.logs import lattice as lattice_module
 from vrm_alert_relay.logs import redaction as redaction_module
 from vrm_alert_relay.logs.lattice import Lattice, escape_edges
 from vrm_alert_relay.logs.redaction import (
+    DEFAULT_MAX_FIELD_LENGTH,
     MAX_AMBIGUOUS_CHARACTERS,
     MAX_DEPTH,
     MAX_ITEMS,
@@ -40,7 +45,7 @@ from vrm_alert_relay.logs.redaction import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterator, Sequence
 
 CANARY = "fictitious-api-password-0001"
 CANARY_2 = "fictitious-token-value-0002"
@@ -606,22 +611,121 @@ def test_escape_expansion_still_bounded() -> None:
     assert len(result) == 2048
 
 
-def test_huge_input_is_fast_and_bounded(registry: SecretRegistry) -> None:
+# Cost bounds. These count the work redaction does (how much text each regular
+# expression and each secret scan is given), not how long it takes, so they hold
+# on a loaded host.
+
+
+@dataclass
+class _Meter:
+    """How many characters each regular expression call and lattice scan was given."""
+
+    windows: list[int] = field(default_factory=list)
+    scans: list[int] = field(default_factory=list)
+    widths: list[int] = field(default_factory=list)
+
+
+class _MeteredPattern:
+    """A compiled pattern that records the text window of every call."""
+
+    def __init__(self, pattern: re.Pattern[str], meter: _Meter) -> None:
+        self._pattern = pattern
+        self._meter = meter
+
+    def _record(self, text: str, pos: int, endpos: int) -> None:
+        self._meter.windows.append(min(endpos, len(text)) - pos)
+
+    def search(self, text: str, pos: int = 0, endpos: int = sys.maxsize) -> re.Match[str] | None:
+        self._record(text, pos, endpos)
+        return self._pattern.search(text, pos, endpos)
+
+    def fullmatch(self, text: str, pos: int = 0, endpos: int = sys.maxsize) -> re.Match[str] | None:
+        self._record(text, pos, endpos)
+        return self._pattern.fullmatch(text, pos, endpos)
+
+    def finditer(
+        self, text: str, pos: int = 0, endpos: int = sys.maxsize
+    ) -> Iterator[re.Match[str]]:
+        self._record(text, pos, endpos)
+        return self._pattern.finditer(text, pos, endpos)
+
+    def sub(self, replacement: Any, text: str) -> str:
+        self._record(text, 0, len(text))
+        return self._pattern.sub(replacement, text)
+
+    def match(self, text: str, pos: int = 0, endpos: int = sys.maxsize) -> re.Match[str] | None:
+        """An anchored match examines what it consumes; a failed one, its whole window."""
+        found = self._pattern.match(text, pos, endpos)
+        if found is None:
+            self._record(text, pos, endpos)
+        else:
+            self._meter.windows.append(found.end() - pos)
+        return found
+
+
+@pytest.fixture
+def meter(monkeypatch: pytest.MonkeyPatch) -> _Meter:
+    """Meter every regular expression in the redaction modules and every lattice scan."""
+    recorded = _Meter()
+    for module in (redaction_module, lattice_module):
+        for name, value in list(vars(module).items()):
+            if isinstance(value, re.Pattern):
+                monkeypatch.setattr(module, name, _MeteredPattern(value, recorded))
+    monkeypatch.setattr(
+        redaction_module,
+        "_CUT_PATTERNS",
+        tuple(_MeteredPattern(pattern, recorded) for pattern in redaction_module._CUT_PATTERNS),
+    )
+    scan = Lattice._scan
+
+    def metered_scan(self: Lattice, text: str, **options: Any) -> list[int]:
+        recorded.scans.append(len(text))
+        recorded.widths.append(self._all.bit_length())
+        return scan(self, text, **options)
+
+    monkeypatch.setattr(Lattice, "_scan", metered_scan)
+    return recorded
+
+
+def test_huge_input_work_is_bounded_by_the_field_limit(
+    registry: SecretRegistry, meter: _Meter
+) -> None:
     hostile = (
         "token=" + "a" * 50 + " +1 202 555 0143 https://example.com/?q=" + "b" * 100
     ) * 20_000
-    start = time.perf_counter()
     result = redact_text(hostile + CANARY, registry=registry)
-    assert time.perf_counter() - start < 2.0
-    assert len(result) <= 2048
+    assert len(result) <= DEFAULT_MAX_FIELD_LENGTH
     assert "0143 " not in result.replace("***0143", "")
+    # A 3.6-million-character input: no expression and no scan sees more than the field limit.
+    assert len(hostile) > 1000 * DEFAULT_MAX_FIELD_LENGTH
+    assert meter.windows
+    assert max(meter.windows) <= DEFAULT_MAX_FIELD_LENGTH
+    assert max(meter.scans) <= DEFAULT_MAX_FIELD_LENGTH
+    assert len(meter.windows) + len(meter.scans) < 50
 
 
-def test_regex_heavy_input_is_fast() -> None:
-    hostile = "tokentokentoken" * 5000 + "1" * 5000 + "+1 " * 5000 + "password='" + "\\" * 5000
-    start = time.perf_counter()
+def _redaction_cpu_seconds(repeat: int) -> float:
+    hostile = (
+        "tokentokentoken" * repeat + "1" * repeat + "+1 " * repeat + "password='" + "\\" * repeat
+    )
+    started = time.process_time()
     redact_text(hostile, registry=SecretRegistry(), max_length=100_000)
-    assert time.perf_counter() - start < 2.0
+    return time.process_time() - started
+
+
+def test_regex_heavy_input_costs_linear_time() -> None:
+    """Four times the input costs about four times as much, not sixteen.
+
+    Each size is measured in CPU time (not wall time), interleaved and the
+    best of three kept, so a busy host slows both sizes alike and the ratio
+    holds. Quadratic backtracking would make it about 16.
+    """
+    small: list[float] = []
+    large: list[float] = []
+    for _ in range(3):
+        small.append(_redaction_cpu_seconds(1000))
+        large.append(_redaction_cpu_seconds(4000))
+    assert min(large) < 8 * max(min(small), 0.001)
 
 
 def test_cut_never_exposes_partial_secret(registry: SecretRegistry) -> None:
@@ -796,13 +900,19 @@ def test_tail_start_withholds_after_too_many_moves(
     assert kept(text, text.index("Zq") + 3) == ""
 
 
-def test_tail_truncation_inside_long_values_is_fast() -> None:
+def test_tail_truncation_inside_long_values_does_bounded_work(meter: _Meter) -> None:
     hostile = ('token="' + "\\" * 3 + "Zq " * 30 + "\n") * 2000
-    start = time.perf_counter()
-    for keep_from in range(0, len(hostile), len(hostile) // 50):
+    starts = range(0, len(hostile), len(hostile) // 50)
+    for keep_from in starts:
         kept(hostile, keep_from)
     redact_text(hostile, registry=SecretRegistry(), keep="tail")
-    assert time.perf_counter() - start < 2.0
+    window = redaction_module._MAX_LINE_SCAN + redaction_module._CUT_CONTEXT
+    assert meter.windows
+    assert max(meter.windows) <= window
+    # Each step of a tail start runs every cut pattern and a few lookups, at most
+    # _MAX_TAIL_STEPS times per start; redact_text adds one start and its passes.
+    per_start = redaction_module._MAX_TAIL_STEPS * (len(redaction_module._CUT_PATTERNS) + 8)
+    assert len(meter.windows) <= (len(starts) + 2) * per_start
 
 
 class _Sample:
@@ -846,7 +956,7 @@ def test_detection_finds_every_regex_match() -> None:
         )
 
 
-def test_matching_cost_is_bounded_with_full_registry() -> None:
+def test_matching_cost_is_bounded_with_full_registry(meter: _Meter) -> None:
     registry = SecretRegistry()
     stems = "bcdefghijklmnopqrstuvwxyz0123456"
     for stem in stems[:MAX_SECRETS]:
@@ -855,12 +965,15 @@ def test_matching_cost_is_bounded_with_full_registry() -> None:
     hostile = (near * 70)[:65536]
     formatter = JsonFormatter(registry=registry)
     record = logging.LogRecord("relay", logging.INFO, __file__, 1, "%s", (hostile,), None)
-    started = time.perf_counter()
     line = formatter.format(record)
-    elapsed = time.perf_counter() - started
-    print(f"near-prefix record with full registry formatted in {elapsed:.3f} s")  # noqa: T201  # timing shown under pytest -s
-    assert elapsed < 0.25
     assert json.loads(line)["msg"].endswith(TRUNCATED)
+    # The lattice's cost is (characters scanned) x (state width): both are capped,
+    # by the field limit and by the registry limits, however long the record is.
+    assert meter.scans
+    assert max(meter.scans) <= DEFAULT_MAX_FIELD_LENGTH
+    assert max(meter.widths) <= MAX_SECRETS * MAX_SECRET_LENGTH
+    assert len(meter.scans) <= 8
+    assert max(meter.windows) <= DEFAULT_MAX_FIELD_LENGTH
 
 
 # Structured values
