@@ -9,12 +9,20 @@ import json
 import logging
 import re
 from typing import TYPE_CHECKING, Any
+from unittest.mock import Mock
 
 import pytest
 from app_helpers import DID, OWNER_PHONE, PARTNER_PHONE, SECRETS, FakeStop, freezer_rule
 
 from vrm_alert_relay.app import relay as relay_module
-from vrm_alert_relay.app.rules import FINGERPRINT_LENGTH, bind_rules, config_fingerprint
+from vrm_alert_relay.app import rules as rules_module
+from vrm_alert_relay.app import service as service_module
+from vrm_alert_relay.app.rules import (
+    FINGERPRINT_LENGTH,
+    FINGERPRINT_UNAVAILABLE,
+    bind_rules,
+    config_fingerprint,
+)
 from vrm_alert_relay.config import load_config
 from vrm_alert_relay.engine import RuleState
 
@@ -113,6 +121,126 @@ def test_fingerprint_derives_from_no_recipient_destination_or_secret(harness: Ha
         harness.secret(name, f"fake-different-{name}-0000")
 
     assert fingerprint_of(path) == before
+
+
+PHONE_NAMED = {
+    "2025550142": {"provider": "voipms", "phone": "+1 202 555 0142"},
+    "audit": {"provider": "log"},
+}
+
+
+def rename_recipient(old: str, new: str) -> Any:
+    """Rename a recipient in place, keeping its position, and every reference to it."""
+
+    def change(data: dict[str, Any]) -> None:
+        data["recipients"] = {
+            (new if name == old else name): value for name, value in data["recipients"].items()
+        }
+        for names in (data["system_recipients"], *(rule["recipients"] for rule in data["rules"])):
+            names[:] = [new if name == old else name for name in names]
+
+    return change
+
+
+def test_a_phone_shaped_recipient_name_feeds_only_its_placeholder(harness: Harness) -> None:
+    path = harness.write_config(
+        recipients=PHONE_NAMED,
+        rules=[freezer_rule(recipients=["2025550142", "audit"])],
+        system=["2025550142"],
+    )
+    before = fingerprint_of(path)
+
+    rewrite(path, rename_recipient("2025550142", "2025550177"))
+
+    assert fingerprint_of(path) == before
+
+
+def test_renaming_a_displayable_recipient_changes_the_fingerprint(harness: Harness) -> None:
+    path = harness.write_config(
+        recipients=PHONE_NAMED,
+        rules=[freezer_rule(recipients=["2025550142", "audit"])],
+        system=["2025550142"],
+    )
+    before = fingerprint_of(path)
+
+    rewrite(path, rename_recipient("audit", "audit_log"))
+
+    assert fingerprint_of(path) != before
+
+
+def test_a_fingerprint_that_cannot_be_computed_does_not_stop_startup(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*_args: object) -> dict[str, object]:
+        raise RuntimeError
+
+    monkeypatch.setattr(rules_module, "_rule_settings", broken)
+    harness.write_config(health={"enabled": True})
+    with harness.service() as service:
+        assert service.run(FakeStop(limit=1), max_cycles=1) == 1
+        service.publish_health()
+        document = json.loads(service.health_state.body())
+
+    assert service.config_fingerprint == FINGERPRINT_UNAVAILABLE
+    assert document["config_fingerprint"] == FINGERPRINT_UNAVAILABLE
+
+
+def raising_loggers(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    """Make every INFO record of the service, relay and rule modules raise."""
+    raising = Mock(side_effect=RuntimeError("log handler failed"))
+    for module in (service_module, relay_module, rules_module):
+        monkeypatch.setattr(module.logger, "info", raising)
+    return raising
+
+
+def test_startup_and_cycles_proceed_when_logging_raises(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness.write_config()
+    harness.vrm.set("tsT", 20, -10)
+    raising = raising_loggers(monkeypatch)
+    with harness.service() as service:
+        assert service.run(FakeStop(limit=2), max_cycles=2) == 2
+
+    assert raising.call_count > 0
+    assert harness.voipms.texts() == [
+        "warning: freezer at cabin: Fictitious tsT is -10 (2035-01-01 00:00 UTC)"
+    ]
+
+
+def test_a_released_escalation_is_delivered_in_its_cycle_when_logging_raises(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness.write_config()
+    with harness.service() as service:
+        for value in (-10, -30, -10):
+            harness.vrm.set("tsT", 20, value)
+            harness.cycle(service)
+        harness.cycle(service, 12)
+        assert len(harness.voipms.texts()) == 2  # the warning and its recovery
+        raising = raising_loggers(monkeypatch)
+        report = service.relay.run_cycle()
+
+    assert raising.call_count > 0
+    assert report.events == 1
+    assert len(harness.voipms.texts()) == 3
+    assert harness.voipms.texts()[-1].startswith("warning: freezer at cabin")
+
+
+def test_a_held_escalation_is_counted_when_logging_raises(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness.write_config()
+    with harness.service() as service:
+        for value in (-10, -30):
+            harness.vrm.set("tsT", 20, value)
+            harness.cycle(service)
+        raising_loggers(monkeypatch)
+        harness.vrm.set("tsT", 20, -10)
+        report = service.relay.run_cycle()
+
+    assert report.held == 1
+    assert report.events == 0
 
 
 def test_startup_logs_the_fingerprint_and_every_rule_without_destinations(
