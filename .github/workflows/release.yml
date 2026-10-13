@@ -510,7 +510,7 @@ jobs:
             echo "${REPOSITORY}@${DIGEST}"
             echo '```'
             echo
-            echo "The image is signed with Sigstore cosign (keyless, GitHub Actions OIDC), and each platform's CycloneDX SBOM is attached to the image as a signed attestation and to this release. To verify the signature:"
+            echo "The image is signed with Sigstore cosign (keyless, GitHub Actions OIDC), and each platform's CycloneDX SBOM is attached to the image as a signed attestation and to this release. To verify the signature (cosign 3 or newer is required: releases are signed with cosign 3, and cosign 2 reports no signatures):"
             echo
             echo '```sh'
             echo "cosign verify \\"
