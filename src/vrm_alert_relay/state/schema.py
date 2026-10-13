@@ -54,6 +54,8 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
         "CREATE INDEX send_attempt_at ON send_attempt (at)",
         "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT",
     ),
+    # 2 (0.1.1): what a delivery reports; null for records written before.
+    ("ALTER TABLE delivery ADD COLUMN origin TEXT",),
 )
 
 SCHEMA_VERSION: Final = len(MIGRATIONS)

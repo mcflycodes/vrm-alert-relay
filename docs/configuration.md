@@ -207,7 +207,7 @@ How the timing settings work:
 - **Escalation:** one notification per escalation into a level. Jumping several levels in one poll sends one notification, for the highest level reached.
 - **Hysteresis and clearing:** a level clears only after the value has gone back past `threshold - hysteresis` (rising) or `threshold + hysteresis` (falling) for `clear_after_samples` consecutive samples. With `hysteresis: 0`, a value hovering at a threshold clears and re-triggers repeatedly, held back only by the cooldown, so set a non-zero hysteresis.
 - **Reminders:** while the rule stays at its **highest** level, a reminder goes out every `reminder_interval_minutes`, at most `reminder_max` times per episode.
-- **Stale data:** once a rule has had a sample, it reports stale data when its newest sample is older than `stale_after_minutes`, and "data restored" when samples return. The default of 35 minutes is two default GX log intervals plus margin; [vrm-credentials.md](vrm-credentials.md#how-fresh-is-the-data) explains how to tune it. With `stale_notify: false` both are still detected and logged, but not sent.
+- **Stale data:** once a rule has had a sample, it reports stale data when its newest sample is older than `stale_after_minutes`, and "data restored" when samples return. The default of 35 minutes is two default GX log intervals plus margin; [vrm-credentials.md](vrm-credentials.md#how-fresh-is-the-data) explains how to tune it. With `stale_notify: false` both are still detected and logged, but not sent, including any queued before a restart.
 
 ### Display unit
 
@@ -248,7 +248,7 @@ Who receives system notifications: the rate-limit summary, the storage notice, a
 
 When it is not set, system notifications go to every recipient used by any rule, in order of first appearance, and `check-config` adds a note saying so. With no rules and no `system_recipients`, `check-config` warns that system notifications have nowhere to go.
 
-An empty list (`system_recipients: []`) sends system notifications to nobody: they are only logged (`monitoring.degraded`, `monitoring.restored`, `delivery.suppressed`, `delivery.storage_degraded`) and shown in [health](operations.md#health-endpoint). `check-config` warns that system problems will only be logged. Held-back alerts are still counted, but no summary is sent.
+An empty list (`system_recipients: []`) sends system notifications to nobody: they are only logged (`monitoring.degraded`, `monitoring.restored`, `delivery.suppressed`, `delivery.storage_degraded`) and shown in [health](operations.md#health-endpoint). `check-config` warns that system problems will only be logged. Held-back alerts are still counted, but no summary is sent. System messages that were queued before a restart and are still waiting are logged instead of sent ([operations.md](operations.md#the-poll-loop)).
 
 Storage notices try the system recipients in order, live ones first, and stop at the first that may have received it (ADR 0002, decision 11), so put your most reliable channel first.
 

@@ -10,6 +10,7 @@ import pytest
 from vrm_alert_relay.state import (
     AttemptMark,
     DeliveryKind,
+    DeliveryOrigin,
     DeliveryRecord,
     DeliveryStatus,
     InvalidRecordError,
@@ -64,6 +65,7 @@ def test_valid_record_has_a_key() -> None:
         ("covers", -1),
         ("recovered", 1),
         ("covers", True),
+        ("origin", "stale"),
     ],
 )
 def test_invalid_records_are_rejected(field: str, value: Any) -> None:
@@ -111,6 +113,25 @@ def test_progress_orders_versions_of_one_record() -> None:
 def test_records_round_trip_through_json() -> None:
     original = DeliveryRecord(**{**VALID, "rule_id": "freezer", "last_attempt_at": BASE})
     assert DeliveryRecord.from_json(original.to_json()) == original
+
+
+def test_origin_round_trips_through_json() -> None:
+    original = DeliveryRecord(**{**VALID, "rule_id": "freezer", "origin": DeliveryOrigin.STALE})
+    data = original.to_json()
+    assert data["origin"] == "stale"
+    assert DeliveryRecord.from_json(data) == original
+
+
+def test_a_journal_line_written_before_origin_existed_is_read() -> None:
+    data = DeliveryRecord(**VALID).to_json()
+    del data["origin"]
+    assert DeliveryRecord.from_json(data).origin is None
+
+
+@pytest.mark.parametrize("raw", ["nonsense", 3, ["stale"]])
+def test_an_unknown_origin_is_read_as_unknown_and_is_still_sent(raw: object) -> None:
+    data = {**DeliveryRecord(**VALID).to_json(), "origin": raw}
+    assert DeliveryRecord.from_json(data).origin is None
 
 
 @pytest.mark.parametrize(

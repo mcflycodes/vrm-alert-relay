@@ -54,6 +54,8 @@ from vrm_alert_relay.engine import (
 from vrm_alert_relay.templates import NotificationKind, TemplateFields, render_notification
 from vrm_alert_relay.vrm import FailureKind
 
+from ._quiet import log_error, log_warning
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
     from datetime import datetime
@@ -142,9 +144,10 @@ class Streak:
         if value is None and monitor.generation is None:
             return cls()  # Nothing stored yet: a fresh installation.
         if value is None or not value.is_integer() or not 0 <= value <= MAX_STREAK:
-            logger.warning(
+            log_warning(
+                logger,
                 "stored monitoring streak is unreadable; counting one failure as seen",
-                extra={"event": "monitoring.streak_unreadable"},
+                {"event": "monitoring.streak_unreadable"},
             )
             return cls(1, now)
         count = int(value)
@@ -269,21 +272,19 @@ class MonitoringTracker:
                 installation=name,
                 time=since,
             )
-            logger.error(
+            log_error(
+                logger,
                 "monitoring is degraded",
-                extra={
-                    "event": "monitoring.degraded",
-                    "installation": name,
-                    "reason": poll.reason,
-                },
+                {"event": "monitoring.degraded", "installation": name, "reason": poll.reason},
             )
         elif kind is EventKind.RECOVERED:
             fields = TemplateFields(
                 kind=NotificationKind.MONITORING_RESTORED, installation=name, time=now
             )
-            logger.warning(
+            log_warning(
+                logger,
                 "monitoring is restored",
-                extra={"event": "monitoring.restored", "installation": name},
+                {"event": "monitoring.restored", "installation": name},
             )
         else:
             # A monitor has no reminders and is never stale; nothing else is sent.

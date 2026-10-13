@@ -61,6 +61,7 @@ rules:
     measurement: {{code: tsT, instance: 20}}
     direction: rising
     levels: [{{name: warning, threshold: -12}}, {{name: critical, threshold: -4.5}}]
+    stale_notify: {stale_notify}
     recipients: [owner_sms]
   - id: battery
     installation: cabin
@@ -86,8 +87,12 @@ def make_config(  # every knob is a keyword with a default
     per_day: int = 60,
     retries: int = 3,
     system: tuple[str, ...] | None = ("owner_sms",),
+    stale_notify: bool = True,
 ) -> RelayConfig:
-    """Configuration for tests; system notifications go to ``owner_sms`` by default."""
+    """Configuration for tests; system notifications go to ``owner_sms`` by default.
+
+    ``stale_notify`` applies to the ``freezer`` rule.
+    """
     return parse_config(
         CONFIG_TEMPLATE.format(
             sending=str(sending).lower(),
@@ -95,6 +100,7 @@ def make_config(  # every knob is a keyword with a default
             per_hour=per_hour,
             per_day=per_day,
             retries=retries,
+            stale_notify=str(stale_notify).lower(),
             system="" if system is None else f"system_recipients: [{', '.join(system)}]",
         )
     )

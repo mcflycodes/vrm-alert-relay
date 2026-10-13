@@ -67,6 +67,7 @@ from .models import (
     is_counter,
     is_identifier,
     is_message_id,
+    origin_or_none,
 )
 from .paths import (
     SIDECAR_SUFFIXES,
@@ -176,6 +177,7 @@ _DELIVERY_COLUMNS: Final = (
     ("provider_message_id", MAX_PROVIDER_MESSAGE_ID_LENGTH),
     ("covers", None),
     ("recovered", None),
+    ("origin", MAX_ENUM_LENGTH),
 )
 _DELIVERY_NAMES: Final = ", ".join(name for name, _ in _DELIVERY_COLUMNS)
 _DELIVERY_SELECT: Final = _bounded_select(_DELIVERY_COLUMNS)
@@ -251,6 +253,7 @@ def _decode_delivery(row: tuple[object, ...]) -> DeliveryRecord:
         provider_message_id,
         covers,
         recovered,
+        origin,
     ) = row
     if recovered not in (0, 1):
         raise InvalidRecordError("recovered must be 0 or 1")  # noqa: TRY003  # per-check validation message
@@ -269,6 +272,7 @@ def _decode_delivery(row: tuple[object, ...]) -> DeliveryRecord:
         provider_message_id=provider_message_id,  # type: ignore[arg-type]  # validated by DeliveryRecord
         covers=covers,  # type: ignore[arg-type]  # validated by DeliveryRecord
         recovered=recovered == 1,
+        origin=origin_or_none(origin),
     )
 
 
@@ -288,6 +292,7 @@ def _encode_delivery(record: DeliveryRecord) -> tuple[object, ...]:
         record.provider_message_id,
         record.covers,
         int(record.recovered),
+        None if record.origin is None else record.origin.value,
     )
 
 
@@ -737,6 +742,7 @@ class StateStore:
                 ),
                 covers=covers if isinstance(covers, int) and is_counter(covers) else 0,
                 recovered=not finished,
+                origin=origin_or_none(columns[14]),
             )
             loaded.deliveries[record.key] = record
             loaded.repaired.append(record)

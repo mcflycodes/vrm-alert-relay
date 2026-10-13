@@ -223,7 +223,7 @@ class Service:
                 config_fingerprint=self.config_fingerprint,
                 status=self.relay.status,
                 delivery=self.runtime.delivery.health(),
-                cycle_failed=self._cycle_failed,
+                cycle_failed=self._cycle_failed or self.relay.status.monitoring_failed,
             )
         )
 

@@ -47,6 +47,8 @@ The state directory must be on a local filesystem, owned by the relay user and w
 
 A directory the relay cannot write leaves it running and alerting from memory, with `state_persistence.healthy` false and a storage notice to the system recipients. A directory that group or others can write draws a warning in the log.
 
+Release 0.1.1 upgrades the state database's format (schema version 2) the first time it starts; 0.1.0 cannot read the upgraded database. Take a backup before upgrading so that a [rollback](deploy-docker.md#rollback) is possible.
+
 ### Exit codes
 
 | Code | Meaning |
@@ -75,11 +77,13 @@ Each cycle ends with a `relay.cycle` record counting installations fetched and f
 
 Cycles start the configured `vrm.poll_interval` apart, plus up to 10% random jitter, so never more often than the interval. A long cycle is followed by the next one at once. VRM backoff (on errors, 429 `Retry-After`, and the hourly retry after a 401 or 403) is per site and enforced by the VRM adapter: while a site backs off, cycles skip its request but still check staleness, monitoring and pending deliveries.
 
-A failure inside a cycle never stops the relay. An unexpected error from the poll counts as a failed poll of every installation; an error evaluating one rule is retried from fresh rule state (which may repeat an active alert, never lose one); an error rendering a level message falls back to the default text.
+A failure inside a cycle never stops the relay. An unexpected error from the poll counts as a failed poll of every installation; an error evaluating one rule is retried from fresh rule state (which may repeat an active alert, never lose one); an error rendering a level message falls back to the default text; an error evaluating the installations' monitors skips them for that cycle, logs `relay.monitoring_error`, and shows as `monitoring.last_cycle_failed` in health, while the rules' alerts from the same cycle are still queued and sent. A log handler that fails never stops a cycle either: monitoring and other operator-visibility records that cannot be written are dropped.
 
 A rule that has never had a usable sample reports neither stale data nor its restoration: until its first sample it is not evaluated without one, and acquisition problems are reported by the installation's monitor instead. A fresh installation with VRM unreachable therefore sends only "monitoring degraded". From its first sample on (remembered in the rule's stored state, so across restarts too), a rule reports stale data when its newest sample is older than `stale_after_minutes`, and "data restored" when samples return.
 
 A rule with `stale_notify: false` still detects both, with the same event IDs and stored state, so its escalations, reminders and recoveries are unchanged, but nothing is sent: stale data is logged as a `relay.stale_suppressed` warning and its restoration as `relay.restored_suppressed` at INFO, each with the rule, installation and event ID. Both still count in the `relay.cycle` events, and the health document's `monitoring.stale_rules` counts the rule while its data is stale.
+
+Both opt-outs (`stale_notify: false` and `system_recipients: []`) also apply to messages queued before a restart. Each queued message is stored with what it reports (alarm, reminder, recovery, stale, restored or system). When it is due, a stale or restored message for a rule that now has `stale_notify: false`, or that is no longer configured, and a system message while `system_recipients` is empty, are logged as `delivery.suppressed_by_config` (with the event ID, recipient and what it reports) and not sent. Alarms, reminders and recoveries are never dropped this way, and neither are messages queued by 0.1.0, which did not store what they report.
 
 **Shutdown:** SIGTERM or SIGINT lets the cycle in progress finish (its HTTP calls are bounded by timeouts), then the relay stops the health endpoint, writes pending state and closes the state store.
 
@@ -113,7 +117,7 @@ Enable it with `health.enabled: true`. It listens on `health.bind` (default `127
 {
   "schema": 1,
   "status": "ok",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "dry_run": true,
   "config_fingerprint": "3f9a1c0b7d2e4a58",
   "started_at": "2026-01-15T12:00:00+00:00",
@@ -150,7 +154,7 @@ Enable it with `health.enabled: true`. It listens on `health.bind` (default `127
 |---|---|
 | `status` | `degraded` when the latest cycle failed, any installation is degraded, or state persistence is not healthy and durable; otherwise `starting` until the first cycle completes, then `ok`. |
 | `monitoring.cycles` | Cycles completed since the relay started. |
-| `monitoring.last_cycle_failed` | Whether the latest cycle stopped with an unexpected error. |
+| `monitoring.last_cycle_failed` | Whether the latest cycle stopped with an unexpected error, or could not evaluate the installations' monitors. |
 | `dry_run` | `true` when no provider is live. |
 | `config_fingerprint` | Identifies the loaded configuration; see [Applying a configuration change](#applying-a-configuration-change). |
 | `monitoring.last_successful_poll_at` | The last cycle in which every installation was fetched (measurement problems aside). |

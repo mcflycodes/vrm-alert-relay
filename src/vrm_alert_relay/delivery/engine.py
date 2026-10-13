@@ -55,6 +55,7 @@ from vrm_alert_relay.state import (
     AttemptMark,
     Changes,
     DeliveryKind,
+    DeliveryOrigin,
     DeliveryRecord,
     DeliveryStatus,
     JournalEntry,
@@ -77,7 +78,7 @@ from .protocol import (
     delivery_id,
     sanitize_text,
 )
-from .routing import Notification, Route, Routing, RuleTarget, UnknownTargetError
+from .routing import Notification, Route, Routing, RuleTarget, SystemTarget, UnknownTargetError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -530,6 +531,9 @@ class DeliveryEngine:
             text = sanitize_text(notification.text)
             target = notification.target
             rule_id = target.rule_id if isinstance(target, RuleTarget) else None
+            origin = (
+                DeliveryOrigin.SYSTEM if isinstance(target, SystemTarget) else notification.origin
+            )
             for route in routes:
                 key = (notification.event_id, route.name)
                 if key in self._records:
@@ -551,6 +555,7 @@ class DeliveryEngine:
                     created_at=wall,
                     updated_at=wall,
                     next_attempt_at=None if status.terminal else wall,
+                    origin=origin,
                 )
                 self._put(record, mono)
                 if status is DeliveryStatus.SUPPRESSED:
@@ -678,6 +683,19 @@ class DeliveryEngine:
     def _process(  # one decision ladder per delivery
         self, record: DeliveryRecord, report: RunReport
     ) -> None:
+        if self._routing.opted_out(record.origin, record.rule_id):
+            # Queued before a restart under a configuration that sent it.
+            self._finish(record, DeliveryStatus.FAILED)
+            logger.info(
+                "not sending a delivery that the configuration now only logs",
+                extra={
+                    "event": "delivery.suppressed_by_config",
+                    "origin": None if record.origin is None else record.origin.value,
+                    "rule_id": record.rule_id,
+                    **self._log_ids(record),
+                },
+            )
+            return
         route = self._routing.route(record.recipient)
         if route is None:
             self._finish(record, DeliveryStatus.FAILED)
@@ -810,6 +828,7 @@ class DeliveryEngine:
                 attempts=0,
                 created_at=wall,
                 updated_at=wall,
+                origin=DeliveryOrigin.SYSTEM,
             )
             if not episode.started:
                 episode.started = True
@@ -1017,6 +1036,7 @@ class DeliveryEngine:
                     updated_at=wall,
                     next_attempt_at=wall,
                     covers=state.count,
+                    origin=DeliveryOrigin.SYSTEM,
                 ),
                 mono,
             )

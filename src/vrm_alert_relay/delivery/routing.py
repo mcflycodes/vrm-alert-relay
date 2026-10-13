@@ -7,6 +7,10 @@ recipient, or the configured system recipients; the destination a provider
 receives is always the configured :class:`~vrm_alert_relay.config.Recipient`
 object, looked up by name. Nothing in an event, label, template, delivery
 record, or provider response can add a recipient or change where one points.
+
+:meth:`Routing.opted_out` applies the configuration's opt-outs
+(``stale_notify: false``, ``system_recipients: []``) to a delivery by its
+stored origin, so they hold for deliveries queued before a restart too.
 """
 
 from __future__ import annotations
@@ -16,6 +20,8 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from vrm_alert_relay.config import display_name
+from vrm_alert_relay.engine import EventKind
+from vrm_alert_relay.state import DeliveryOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -68,11 +74,30 @@ class Notification:
     event_id: str
     text: str
     target: Target
+    origin: DeliveryOrigin | None = None
+    """What it reports. A system target always counts as ``SYSTEM``."""
 
     @classmethod
     def for_event(cls, event: Event, text: str) -> Notification:
         """Route an engine event to the recipients of the rule that produced it."""
-        return cls(event_id=event.event_id, text=text, target=RuleTarget(event.rule_id))
+        return cls(
+            event_id=event.event_id,
+            text=text,
+            target=RuleTarget(event.rule_id),
+            origin=_EVENT_ORIGINS[event.kind],
+        )
+
+
+_EVENT_ORIGINS = MappingProxyType(
+    {
+        EventKind.ESCALATED: DeliveryOrigin.ALARM,
+        EventKind.REMINDER: DeliveryOrigin.REMINDER,
+        EventKind.RECOVERED: DeliveryOrigin.RECOVERY,
+        EventKind.STALE: DeliveryOrigin.STALE,
+        EventKind.RESTORED: DeliveryOrigin.RESTORED,
+    }
+)
+_STALE_ORIGINS = frozenset({DeliveryOrigin.STALE, DeliveryOrigin.RESTORED})
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,18 +112,23 @@ class Route:
 class Routing:
     """An immutable name-to-recipient mapping built from operator configuration."""
 
-    __slots__ = ("_display", "_routes", "_rules", "_system")
+    __slots__ = ("_display", "_quiet_stale", "_routes", "_rules", "_system", "_system_log_only")
 
     _routes: Mapping[str, Route]
     _rules: Mapping[str, tuple[str, ...]]
     _system: tuple[str, ...]
     _display: Mapping[str, str]
+    _quiet_stale: frozenset[str]
+    _system_log_only: bool
 
     def __init__(
         self,
         routes: Mapping[str, Route],
         rules: Mapping[str, tuple[str, ...]],
         system: tuple[str, ...] = (),
+        *,
+        quiet_stale: frozenset[str] = frozenset(),
+        system_log_only: bool = False,
     ) -> None:
         frozen_routes = dict(routes)
         for name, route in frozen_routes.items():
@@ -111,6 +141,8 @@ class Routing:
         object.__setattr__(self, "_routes", MappingProxyType(frozen_routes))
         object.__setattr__(self, "_rules", MappingProxyType(frozen_rules))
         object.__setattr__(self, "_system", tuple(system))
+        object.__setattr__(self, "_quiet_stale", frozenset(quiet_stale))
+        object.__setattr__(self, "_system_log_only", system_log_only)
         object.__setattr__(
             self,
             "_display",
@@ -132,7 +164,13 @@ class Routing:
             for name, recipient in config.recipients.items()
         }
         rules = {rule.id: tuple(rule.recipients) for rule in config.rules}
-        return cls(routes, rules, config.system_recipient_names())
+        return cls(
+            routes,
+            rules,
+            config.system_recipient_names(),
+            quiet_stale=frozenset(rule.id for rule in config.rules if not rule.stale_notify),
+            system_log_only=config.system_recipients == (),
+        )
 
     @property
     def routes(self) -> Mapping[str, Route]:
@@ -141,6 +179,18 @@ class Routing:
     @property
     def system_routes(self) -> tuple[Route, ...]:
         return tuple(self._routes[name] for name in self._system)
+
+    def opted_out(self, origin: DeliveryOrigin | None, rule_id: str | None) -> bool:
+        """Whether the configuration says a delivery of this origin is only logged.
+
+        Stale data and its restoration are opted out for a rule with
+        ``stale_notify: false`` or one no longer configured; system
+        notifications when ``system_recipients`` is empty. Alarms, reminders,
+        recoveries and deliveries of unknown origin never are.
+        """
+        if origin in _STALE_ORIGINS:
+            return rule_id not in self._rules or rule_id in self._quiet_stale
+        return origin is DeliveryOrigin.SYSTEM and self._system_log_only
 
     def route(self, name: str) -> Route | None:
         return self._routes.get(name)
