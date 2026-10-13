@@ -22,7 +22,7 @@ The project is intended for use cases where a single threshold notification is n
 
 ## Status
 
-VRM Alert Relay is pre-release. The v1 features are implemented and tested, but there are no releases or published container images yet, and it has not yet completed a long-running trial on real installations. Run it in dry-run mode first, and keep VRM's own alarms enabled: it supplements them and is not a safety device.
+VRM Alert Relay v0.1.0 is the first stable release, with the v1 features implemented and tested. Signed container images are published to `ghcr.io/mcflycodes/vrm-alert-relay` (see [docs/deploy-docker.md](docs/deploy-docker.md)). It has not yet completed a long-running trial on real installations. Run it in dry-run mode first, and keep VRM's own alarms enabled: it supplements them and is not a safety device.
 
 ## Quick start
 
