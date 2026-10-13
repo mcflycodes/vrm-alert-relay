@@ -213,6 +213,8 @@ def format_report(report: CheckReport) -> str:
         system = _names(report.system_recipients)
         if report.system_recipients_defaulted:
             system += " (default: every recipient used by a rule)"
+        elif not report.system_recipients:
+            system += " (system notifications are only logged)"
         lines.extend(
             [
                 f"installations: {report.installations}",

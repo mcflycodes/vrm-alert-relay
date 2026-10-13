@@ -161,6 +161,7 @@ def _rule_settings(rule: Rule, positions: Mapping[str, int]) -> dict[str, object
         "reminder_interval_minutes": rule.reminder_interval_minutes,
         "reminder_max": rule.reminder_max,
         "stale_after_minutes": rule.stale_after_minutes,
+        "stale_notify": rule.stale_notify,
         "display_unit": rule.display_unit,
         "recipients": [display_name(name, positions[name]) for name in rule.recipients],
     }

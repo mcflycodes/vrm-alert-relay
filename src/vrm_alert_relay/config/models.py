@@ -272,6 +272,8 @@ class Rule(_Model):
     reminder_interval_minutes: int = Field(default=60, ge=1, le=10_080)
     reminder_max: int = Field(default=3, ge=0, le=20)
     stale_after_minutes: int = Field(default=35, ge=1, le=10_080)
+    stale_notify: bool = True
+    """Send stale-data and data-restored notifications; when false they are only logged."""
     display_unit: Literal["degC", "degF"] | None = None
     """Shows message values in this unit; evaluation keeps the measurement's units."""
     recipients: Annotated[
@@ -309,10 +311,11 @@ class RelayConfig(_Model):
         Annotated[
             tuple[Name, ...],
             BeforeValidator(_as_tuple),
-            Field(min_length=1, max_length=MAX_RECIPIENTS),
+            Field(max_length=MAX_RECIPIENTS),
         ]
         | None
     ) = None
+    """``None`` defaults to every rule recipient; an empty list means log only."""
     health: HealthConfig = Field(default_factory=HealthConfig)
 
     @field_serializer("recipients", mode="wrap")
@@ -350,8 +353,9 @@ class RelayConfig(_Model):
     def system_recipient_names(self) -> tuple[str, ...]:
         """Recipients of system notifications such as rate-limit summaries.
 
-        ``system_recipients`` when set; otherwise every recipient that any rule
-        names, in order of first appearance.
+        ``system_recipients`` when set, even to an empty list (system
+        notifications are then only logged); otherwise every recipient that
+        any rule names, in order of first appearance.
         """
         if self.system_recipients is not None:
             return self.system_recipients

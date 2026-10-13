@@ -12,7 +12,7 @@ The project is intended for use cases where a single threshold notification is n
 - **Hysteresis and recovery:** a level clears only after the value moves back past its threshold by a configurable margin, optionally for several consecutive samples, and a recovery notification follows when the rule returns to normal.
 - **Several installations:** up to 50 installations and 200 rules, each measurement identified by its VRM attribute code and device instance.
 - **Reminders:** bounded, configurable reminders while a rule stays at its highest level.
-- **Stale data:** a notification when a measurement stops reporting, and another when it returns.
+- **Stale data:** a notification when a measurement stops reporting, and another when it returns, or a log record only, per rule.
 - **Monitoring degraded:** a notification when an installation cannot be polled, and another when polling recovers.
 - **Rate limits:** a global cap on outgoing messages (20 per hour and 60 per day by default), per-rule cooldowns, and a summary of anything held back.
 - **Persistent state:** a restart does not repeat notifications already sent. Ambiguous SMS sends are looked up with the provider before any retry.

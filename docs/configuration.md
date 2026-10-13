@@ -47,7 +47,7 @@ Every URL setting must:
 | `recipients` | mapping | empty | The recipient allowlist. |
 | `providers` | mapping | external providers disabled | Notification provider settings. The `log` provider is always available. |
 | `rules` | list | empty | Alert rules. With none, `check-config` warns that nothing is monitored. |
-| `system_recipients` | list | not set | Who receives system notifications. |
+| `system_recipients` | list | not set | Who receives system notifications. `[]` logs them only. |
 | `health` | mapping | disabled | The optional health endpoint. |
 
 ## `sending` and dry-run mode
@@ -180,6 +180,7 @@ A list of up to 200 rules. Each rule watches one measurement of one installation
 | `reminder_interval_minutes` | integer | `60` | 1 to 10,080 (7 days). |
 | `reminder_max` | integer | `3` | 0 to 20. `0` disables reminders. |
 | `stale_after_minutes` | integer | `35` | 1 to 10,080, and longer than `vrm.poll_interval`. |
+| `stale_notify` | boolean | `true` | Send "stale data" and "data restored". With `false` they are only logged. See [Alarms only](#alarms-only). |
 | `display_unit` | `degC` or `degF` | not set | Shows a temperature measured in °C in this unit in messages. See [Display unit](#display-unit). |
 | `recipients` | list of names | required | 1 to 50 configured recipient names, without duplicates. |
 
@@ -206,7 +207,7 @@ How the timing settings work:
 - **Escalation:** one notification per escalation into a level. Jumping several levels in one poll sends one notification, for the highest level reached.
 - **Hysteresis and clearing:** a level clears only after the value has gone back past `threshold - hysteresis` (rising) or `threshold + hysteresis` (falling) for `clear_after_samples` consecutive samples. With `hysteresis: 0`, a value hovering at a threshold clears and re-triggers repeatedly, held back only by the cooldown, so set a non-zero hysteresis.
 - **Reminders:** while the rule stays at its **highest** level, a reminder goes out every `reminder_interval_minutes`, at most `reminder_max` times per episode.
-- **Stale data:** once a rule has had a sample, it reports stale data when its newest sample is older than `stale_after_minutes`, and "data restored" when samples return. The default of 35 minutes is two default GX log intervals plus margin; [vrm-credentials.md](vrm-credentials.md#how-fresh-is-the-data) explains how to tune it.
+- **Stale data:** once a rule has had a sample, it reports stale data when its newest sample is older than `stale_after_minutes`, and "data restored" when samples return. The default of 35 minutes is two default GX log intervals plus margin; [vrm-credentials.md](vrm-credentials.md#how-fresh-is-the-data) explains how to tune it. With `stale_notify: false` both are still detected and logged, but not sent.
 
 ### Display unit
 
@@ -243,11 +244,34 @@ A level's `message` is a non-empty, single-line template of at most 320 characte
 |---|---|---|
 | `system_recipients` | list of names | not set |
 
-Who receives system notifications: the rate-limit summary, the storage notice, and the "monitoring degraded" and "monitoring restored" notices. If set, it holds 1 to 50 configured recipient names without duplicates (an empty list is rejected; omit the key instead).
+Who receives system notifications: the rate-limit summary, the storage notice, and the "monitoring degraded" and "monitoring restored" notices. If set, it holds up to 50 configured recipient names without duplicates.
 
 When it is not set, system notifications go to every recipient used by any rule, in order of first appearance, and `check-config` adds a note saying so. With no rules and no `system_recipients`, `check-config` warns that system notifications have nowhere to go.
 
+An empty list (`system_recipients: []`) sends system notifications to nobody: they are only logged (`monitoring.degraded`, `monitoring.restored`, `delivery.suppressed`, `delivery.storage_degraded`) and shown in [health](operations.md#health-endpoint). `check-config` warns that system problems will only be logged. Held-back alerts are still counted, but no summary is sent.
+
 Storage notices try the system recipients in order, live ones first, and stop at the first that may have received it (ADR 0002, decision 11), so put your most reliable channel first.
+
+### Alarms only
+
+To be messaged only for real alarms (escalations, reminders and recoveries), set `stale_notify: false` on every rule and `system_recipients: []`:
+
+```yaml
+rules:
+  - id: cabin-freezer-warm
+    installation: cabin
+    measurement: {code: tsT, instance: 20}
+    direction: rising
+    levels:
+      - name: critical
+        threshold: -4.0
+    stale_notify: false # stale data and data restored go to the log only
+    recipients: [owner_sms]
+
+system_recipients: [] # monitoring, rate-limit and storage notices go to the log only
+```
+
+The trade-off: with both off, a GX device that stops uploading, or a VRM outage, sends **no message at all**. It shows only in the logs and in the health endpoint, and during it the relay cannot see the values it is meant to alarm on. Use this only if something else watches the logs or health, or if missing an outage is acceptable. A middle ground is to keep `system_recipients` (one "monitoring degraded" per installation per outage) and turn off only `stale_notify` (one "stale data" per rule).
 
 ## `health`
 

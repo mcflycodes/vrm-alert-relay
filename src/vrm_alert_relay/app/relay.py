@@ -14,6 +14,11 @@ reported to the installation's monitor as a measurement problem, so they
 count toward "monitoring degraded" and show in health: no sample is ever
 dropped silently.
 
+A rule with ``stale_notify: false`` still raises stale-data and data-restored
+events, with the same IDs and stored state, but they are logged
+(``relay.stale_suppressed`` and ``relay.restored_suppressed``) instead of being
+queued for delivery.
+
 A failure in one stage is contained so the rest of the cycle still alerts:
 an exception from the poll counts as a failed poll of every installation,
 and an exception while evaluating or rendering one rule is retried with
@@ -31,7 +36,7 @@ from vrm_alert_relay.delivery import Notification
 from vrm_alert_relay.engine import EventKind, RuleState, evaluate, sample_is_usable
 from vrm_alert_relay.templates import fields_for_event, render_notification
 
-from ._quiet import log_info
+from ._quiet import log_info, log_warning
 from .monitoring import MonitoringTracker, PollHealth, assess, monitor_id, streak_id
 from .rules import RuleBinding, bind_rules, poll_targets
 
@@ -47,6 +52,8 @@ if TYPE_CHECKING:
 __all__ = ["CycleReport", "Poller", "Relay", "RelayStatus"]
 
 logger = logging.getLogger(__name__)
+
+_STALE_KINDS = frozenset({EventKind.STALE, EventKind.RESTORED})
 
 
 class Poller(Protocol):
@@ -81,6 +88,8 @@ class RelayStatus:
     installations: int = 0
     failing: int = 0
     degraded: int = 0
+    stale_rules: int = 0
+    """Rules whose data is stale, whether or not the rule sends stale notices."""
     events_total: int = 0
 
 
@@ -143,6 +152,9 @@ class Relay:
             installations=len(self._targets),
             failing=len(self._monitoring.failing),
             degraded=len(self._monitoring.degraded),
+            stale_rules=sum(
+                self._delivery.rule_state(binding.rule.id).stale for binding in self._bindings
+            ),
             events_total=self._status.events_total + cycle.events,
         )
         log_info(
@@ -225,13 +237,20 @@ class Relay:
         if not observed and not _observed(new_state):
             return  # The sample was unusable; the rule is still unobserved.
         cycle.rule_states[rule_id] = new_state
-        for event in events:
-            text = self._render(binding, event)
-            cycle.notifications.append(Notification.for_event(event, text))
-            cycle.events += 1
+        self._queue(binding, events, cycle)
         # Only after the rule's notifications are queued: reporting must never delay them.
         with contextlib.suppress(Exception):
             _report_hold(binding, state, new_state, events, cycle)
+
+    def _queue(self, binding: RuleBinding, events: Sequence[Event], cycle: _CycleState) -> None:
+        """Render and queue the rule's events; stale ones only if the rule sends them."""
+        for event in events:
+            cycle.events += 1
+            if event.kind in _STALE_KINDS and not binding.rule.stale_notify:
+                _log_stale_only(binding, event)
+                continue
+            text = self._render(binding, event)
+            cycle.notifications.append(Notification.for_event(event, text))
 
     @staticmethod
     def _report_problem(binding: RuleBinding, reason: str, cycle: _CycleState) -> None:
@@ -345,6 +364,28 @@ def _report_hold(
             "notified": sent is not None,
         },
     )
+
+
+def _log_stale_only(binding: RuleBinding, event: Event) -> None:
+    """Log a stale-data or data-restored event that the rule does not send."""
+    extra = {
+        "rule_id": binding.rule.id,
+        "installation": binding.rule.installation,
+        "event_id": event.event_id,
+        "sample_time": None if event.sample_time is None else event.sample_time.isoformat(),
+    }
+    if event.kind is EventKind.STALE:
+        log_warning(
+            logger,
+            "stale data; not sent because the rule's stale_notify is false",
+            {"event": "relay.stale_suppressed", **extra},
+        )
+    else:
+        log_info(
+            logger,
+            "data restored; not sent because the rule's stale_notify is false",
+            {"event": "relay.restored_suppressed", **extra},
+        )
 
 
 def _rejection(sample: Sample, state: RuleState, now: datetime) -> str | None:

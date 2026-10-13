@@ -1,9 +1,11 @@
 """Logging that can never stop the relay.
 
 Operator-visibility records (startup details, held escalations, cycle
-summaries) are informative only. A logging handler that raises must not
+summaries, notifications an operator chose to log only) are informative
+only. A logging handler that raises must not
 stop startup or a cycle, or delay an alert, so these records go through
-:func:`log_info`, which drops a record whose logging fails.
+:func:`log_info` or :func:`log_warning`, which drop a record whose logging
+fails.
 """
 
 from __future__ import annotations
@@ -15,10 +17,16 @@ if TYPE_CHECKING:
     import logging
     from collections.abc import Mapping
 
-__all__ = ["log_info"]
+__all__ = ["log_info", "log_warning"]
 
 
 def log_info(log: logging.Logger, message: str, extra: Mapping[str, object]) -> None:
     """Log ``message`` at INFO with ``extra``; a failure to log is swallowed."""
     with contextlib.suppress(Exception):
         log.info(message, extra=dict(extra))
+
+
+def log_warning(log: logging.Logger, message: str, extra: Mapping[str, object]) -> None:
+    """Log ``message`` at WARNING with ``extra``; a failure to log is swallowed."""
+    with contextlib.suppress(Exception):
+        log.warning(message, extra=dict(extra))

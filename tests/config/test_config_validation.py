@@ -89,6 +89,7 @@ def test_defaults_match_requirements(secrets_dir: Any, parse: Parse) -> None:
     assert rule.hysteresis == 0.0
     assert rule.clear_after_samples == 1
     assert rule.recovery_notify is True
+    assert rule.stale_notify is True
     assert rule.measurement.service_type is None
     assert rule.levels[0].message is None
     health = config.health
@@ -185,6 +186,7 @@ def test_unknown_keys_are_reported_by_parent_and_line(
         ),
         (lambda d: d["rules"][0].update(recipients="audit"), "rules[0].recipients"),
         (lambda d: d["rules"][0].update(recovery_notify=1), "rules[0].recovery_notify"),
+        (lambda d: d["rules"][0].update(stale_notify="no"), "rules[0].stale_notify"),
         (lambda d: d["health"].update(port="8080"), "health.port"),
         (lambda d: d.update(providers={"log": None}), "providers.log"),
     ],

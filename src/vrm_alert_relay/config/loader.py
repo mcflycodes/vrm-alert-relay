@@ -301,7 +301,12 @@ def config_warnings(config: RelayConfig) -> list[str]:
             warnings.append(describe(loc, "not used by any rule", positions))
     if not config.rules:
         warnings.append("rules: no rules are configured; nothing will be monitored")
-    if not config.system_recipient_names():
+    if config.system_recipients == ():
+        warnings.append(
+            "system_recipients: empty; system problems (monitoring degraded or "
+            "restored, rate-limit summaries, storage notices) will only be logged"
+        )
+    elif not config.system_recipient_names():
         warnings.append(
             "system_recipients: no system recipients; rate-limit summaries and "
             "storage warnings will not be sent"

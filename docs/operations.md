@@ -37,7 +37,7 @@ A flag wins over its environment variable. The container image runs `run` by def
 
 The relay reads its configuration only at startup, so restart it after every change. With Docker Compose, apply the change with `docker compose up -d --force-recreate`, not `docker compose restart`: a single-file bind mount of `config.yaml` follows the file's original inode, and editors, `sudoedit` and `sed -i` replace the file with a new one, so a restarted container can keep reading the old version ([deploy-docker.md](deploy-docker.md#applying-a-configuration-change)).
 
-`service.started` and the health document carry a `config_fingerprint`: the first 16 hex characters of a SHA-256 over every rule's alerting settings (installation, measurement, direction, levels and thresholds, hysteresis, `clear_after_samples`, `recovery_notify`, cooldown, reminders, `stale_after_minutes`, `display_unit` and recipient names) and which providers and sending are enabled. A recipient name with five or more digits counts only by its position (`[#3]`), as `check-config` shows it. Compare the fingerprint before and after a change to confirm the relay loaded the new file. It is derived from no phone number, DID, URL, secret or secret file. If it cannot be computed it reads `unavailable`; like every visibility record, it never stops the relay, and a log record that fails to write is dropped rather than delaying a cycle.
+`service.started` and the health document carry a `config_fingerprint`: the first 16 hex characters of a SHA-256 over every rule's alerting settings (installation, measurement, direction, levels and thresholds, hysteresis, `clear_after_samples`, `recovery_notify`, cooldown, reminders, `stale_after_minutes`, `stale_notify`, `display_unit` and recipient names) and which providers and sending are enabled. A recipient name with five or more digits counts only by its position (`[#3]`), as `check-config` shows it. Compare the fingerprint before and after a change to confirm the relay loaded the new file. It is derived from no phone number, DID, URL, secret or secret file. If it cannot be computed it reads `unavailable`; like every visibility record, it never stops the relay, and a log record that fails to write is dropped rather than delaying a cycle.
 - **`check-config`** validates the configuration and the secret files it references, without contacting any service, and prints a report. Recipient names that look like phone numbers (five or more digits) are shown by position, such as `[#3]`, everywhere the relay prints or logs a recipient name. `--structure-only` skips the secret files; its result is never "ready".
 - **`test-notification --recipient NAME`** sends one test message to one configured recipient and prints the outcome. It sends only when you run it, goes through the delivery engine like any alert (so the global cap, dry-run routing, attempt records and reconciliation all apply), and sends nothing else that is waiting. While sending is disabled for the recipient's provider, the message is only written to the log. It needs the state directory, so stop the relay first: a running relay holds the directory's lock.
 
@@ -79,11 +79,13 @@ A failure inside a cycle never stops the relay. An unexpected error from the pol
 
 A rule that has never had a usable sample reports neither stale data nor its restoration: until its first sample it is not evaluated without one, and acquisition problems are reported by the installation's monitor instead. A fresh installation with VRM unreachable therefore sends only "monitoring degraded". From its first sample on (remembered in the rule's stored state, so across restarts too), a rule reports stale data when its newest sample is older than `stale_after_minutes`, and "data restored" when samples return.
 
+A rule with `stale_notify: false` still detects both, with the same event IDs and stored state, so its escalations, reminders and recoveries are unchanged, but nothing is sent: stale data is logged as a `relay.stale_suppressed` warning and its restoration as `relay.restored_suppressed` at INFO, each with the rule, installation and event ID. Both still count in the `relay.cycle` events, and the health document's `monitoring.stale_rules` counts the rule while its data is stale.
+
 **Shutdown:** SIGTERM or SIGINT lets the cycle in progress finish (its HTTP calls are bounded by timeouts), then the relay stops the health endpoint, writes pending state and closes the state store.
 
 ## Monitoring degraded and restored
 
-Each installation has a monitor. Its notifications go to `system_recipients` (or, when that is not set, to every recipient used by a rule):
+Each installation has a monitor. Its notifications go to `system_recipients` (or, when that is not set, to every recipient used by a rule; with `system_recipients: []` they are only logged, as `monitoring.degraded` errors and `monitoring.restored` warnings, and shown in health):
 
 - `VRM Alert Relay: monitoring of <installation> is degraded since <time>; alerts may be delayed or missed`
 - `VRM Alert Relay: monitoring of <installation> is restored (<time>)`
@@ -123,7 +125,8 @@ Enable it with `health.enabled: true`. It listens on `health.bind` (default `127
     "last_successful_poll_at": "2026-01-15T12:41:03+00:00",
     "installations": 1,
     "failing_installations": 0,
-    "degraded_installations": 0
+    "degraded_installations": 0,
+    "stale_rules": 0
   },
   "state_persistence": {
     "healthy": true,
@@ -153,6 +156,7 @@ Enable it with `health.enabled: true`. It listens on `health.bind` (default `127
 | `monitoring.last_successful_poll_at` | The last cycle in which every installation was fetched (measurement problems aside). |
 | `monitoring.failing_installations` | Installations whose last poll failed. |
 | `monitoring.degraded_installations` | Installations with an open outage. |
+| `monitoring.stale_rules` | Rules whose newest sample is older than their `stale_after_minutes`, whether or not they send stale notices. Stale data does not by itself make `status` degraded. |
 | `state_persistence.healthy` | False while storage fails, and for the rest of the run after corrupt state was found. |
 | `state_persistence.durable_accounting` | False in every ADR 0002 failure mode, when the cap is enforced in memory only. |
 | `state_persistence.error` | A short description of the latest storage problem, without file paths. |

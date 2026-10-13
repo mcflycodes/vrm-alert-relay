@@ -195,6 +195,19 @@ def test_check_config_of_an_unreadable_file_shows_no_summary(
     )
 
 
+def test_check_config_warns_that_empty_system_recipients_only_log(
+    harness: Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    harness.write_config(system=[])
+
+    assert main(["check-config", "--config", str(harness.config_path)]) == ExitCode.OK
+
+    out = capsys.readouterr().out
+    assert "system problems (monitoring degraded or restored" in out
+    assert "will only be logged\n" in out
+    assert "system recipients: none (system notifications are only logged)\n" in out
+
+
 def test_check_config_masks_phone_shaped_recipient_names(
     harness: Harness, capsys: pytest.CaptureFixture[str]
 ) -> None:
