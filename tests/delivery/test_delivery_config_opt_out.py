@@ -168,9 +168,11 @@ def test_queued_records_merged_once_state_is_readable_again(
     store.close()
 
 
-def test_a_legacy_database_is_migrated_and_its_deliveries_are_sent(
+def test_a_legacy_database_is_migrated_and_only_its_system_deliveries_follow_opt_outs(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """0.1.0 stored no origin: its summaries are system notifications, but a rule
+    event could be an alarm and is delivered once, whatever its text says."""
     with closing(sqlite3.connect(tmp_path / DB_FILENAME, autocommit=True)) as connection:
         assert migrate(connection, MIGRATIONS[:1]) == 1
         connection.executemany(
@@ -178,8 +180,9 @@ def test_a_legacy_database_is_migrated_and_its_deliveries_are_sent(
             "created_at, updated_at, next_attempt_at) "
             "VALUES (?, 'owner_sms', ?, ?, 'pending', ?, 0, ?, ?, ?)",
             [
-                (event_id(1), "freezer", "event", "old stale", *[BASE.isoformat()] * 3),
+                (event_id(1), "freezer", "event", "Stale data: old", *[BASE.isoformat()] * 3),
                 (event_id(2), None, "summary", "old summary", *[BASE.isoformat()] * 3),
+                (event_id(3), None, "event", "old monitoring", *[BASE.isoformat()] * 3),
             ],
         )
     clock = FakeClock()
@@ -187,15 +190,91 @@ def test_a_legacy_database_is_migrated_and_its_deliveries_are_sent(
     with caplog.at_level(logging.INFO):
         engine, provider = restart_quiet(StateStore(tmp_path), clock)
 
-    assert sorted(provider.texts()) == ["old stale", "old summary"]
-    assert not suppressed(caplog)
+    assert sorted(provider.texts()) == ["Stale data: old", "old monitoring"]
+    (dropped,) = suppressed(caplog)
+    assert getattr(dropped, "event_id", None) == event_id(2)
+    assert getattr(dropped, "origin", None) == "system"
     record = engine.record(event_id(1), "owner_sms")
     assert record is not None
     assert record.origin is None
+    assert record.status is DeliveryStatus.DELIVERED
     engine._store.close()
     with closing(sqlite3.connect(tmp_path / DB_FILENAME)) as connection:
         assert connection.execute("PRAGMA user_version").fetchone() == (len(MIGRATIONS),)
         assert connection.execute("SELECT DISTINCT origin FROM delivery").fetchall() == [(None,)]
+
+
+def test_a_legacy_summary_is_still_sent_without_opt_outs(tmp_path: Path) -> None:
+    with closing(sqlite3.connect(tmp_path / DB_FILENAME, autocommit=True)) as connection:
+        assert migrate(connection, MIGRATIONS[:1]) == 1
+        connection.execute(
+            "INSERT INTO delivery (event_id, recipient, rule_id, kind, status, text, attempts, "
+            "created_at, updated_at, next_attempt_at) "
+            "VALUES (?, 'owner_sms', NULL, 'summary', 'pending', 'old summary', 0, ?, ?, ?)",
+            (event_id(2), *[BASE.isoformat()] * 3),
+        )
+    provider = FakeProvider()
+    engine = make_engine(StateStore(tmp_path), clock=FakeClock(), voipms=provider)
+    engine.run_due()
+    assert provider.texts() == ["old summary"]
+    engine._store.close()
+
+
+class _BrokenHandler(logging.Handler):
+    """Fails on the opt-out record, past logging's own error handling."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if getattr(record, "event", None) == "delivery.suppressed_by_config":
+            raise RuntimeError
+
+    def handleError(self, record: logging.LogRecord) -> None:  # noqa: N802  # logging API
+        raise RuntimeError
+
+
+def test_a_failing_log_handler_does_not_stop_a_later_alarm(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    clock = FakeClock()
+    store = StateStore(tmp_path)
+    engine = make_engine(store, clock=clock)
+    engine.accept_cycle(rule_states={}, notifications=[notes()[3]])  # stale, due first
+    clock.advance(timedelta(seconds=1))
+    engine.accept_cycle(rule_states={}, notifications=[notes()[0]])  # the alarm, due after
+    store.close()
+    handler = _BrokenHandler()
+    engine_logger = logging.getLogger("vrm_alert_relay.delivery.engine")
+    provider = FakeProvider()
+    store = StateStore(tmp_path)
+    engine = make_engine(store, clock=clock, config=quiet(), voipms=provider)
+    engine_logger.addHandler(handler)
+    try:
+        with caplog.at_level(logging.INFO, logger=engine_logger.name):
+            engine.run_due()
+    finally:
+        engine_logger.removeHandler(handler)
+
+    assert provider.texts() == ["alarm"]
+    stale = engine.record(event_id(4), "owner_sms")
+    assert stale is not None
+    assert stale.status is DeliveryStatus.FAILED
+    store.close()
+
+
+def test_a_failing_opt_out_check_sends_the_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    queue_without_sending(StateStore(tmp_path), clock)
+
+    def broken(*_args: object) -> bool:
+        raise RuntimeError
+
+    monkeypatch.setattr(Routing, "opted_out", broken)
+    engine, provider = restart_quiet(StateStore(tmp_path), clock)
+
+    assert "stale" in provider.texts()
+    assert "alarm" in provider.texts()
+    engine._store.close()
 
 
 def test_new_deliveries_are_stored_with_their_origin(tmp_path: Path) -> None:
