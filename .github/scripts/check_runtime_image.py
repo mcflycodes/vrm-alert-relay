@@ -5,9 +5,10 @@ Runs with the image's own Python, because the image has no shell:
     docker run --rm --entrypoint /opt/venv/bin/python IMAGE /smoke/check_runtime_image.py
 
 Checks the standard-library modules the relay relies on, time zone data, the
-relay user's passwd entry, the working directory, the dynamic linker cache,
-and that no shell or package manager is present. Prints one line per check
-and exits non-zero listing every failure.
+relay user's passwd entry, the effective UID and GID, the working directory,
+the system CA bundle, the dynamic linker cache, and that no shell or package
+manager is present. Prints one line per check and exits non-zero listing every
+failure.
 """
 
 from __future__ import annotations
@@ -15,15 +16,31 @@ from __future__ import annotations
 import importlib
 import os
 import pwd
+import ssl
 import sys
 import zoneinfo
 from pathlib import Path
 
 RELAY_UID = 65532
+RELAY_GID = 65532
+# The relay verifies TLS against its bundled certifi list, so the system bundle
+# is hygiene: it must still exist and parse, because SSL_CERT_FILE names it.
+CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 WORKDIR = "/home/nonroot"
 MODULES = ("ssl", "sqlite3", "hashlib", "zoneinfo", "pwd")
 ABSENT = ("/bin/sh", "/bin/ash", "/bin/bash", "/bin/busybox", "/sbin/apk", "/usr/bin/apk")
 TIME_ZONE = "America/Denver"
+
+
+def ca_bundle_check(path: str) -> tuple[bool, str]:
+    """Return whether ``path`` parses as PEM and holds at least one CA, and why."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    try:
+        context.load_verify_locations(cafile=path)
+    except (OSError, ssl.SSLError) as error:
+        return False, f"CA bundle {path}: {error}"
+    count = context.cert_store_stats()["x509_ca"]
+    return count > 0, f"CA bundle {path} loads {count} CAs"
 
 
 def checks() -> tuple[list[str], list[str]]:
@@ -62,6 +79,8 @@ def checks() -> tuple[list[str], list[str]]:
     cwd = Path.cwd()
     record(ok=str(cwd) == WORKDIR, description=f"working directory {cwd}")
     record(ok=os.geteuid() == RELAY_UID, description=f"effective UID {os.geteuid()}")
+    record(ok=os.getegid() == RELAY_GID, description=f"effective GID {os.getegid()}")
+    record(*ca_bundle_check(CA_BUNDLE))
 
     cache = Path("/etc/ld.so.cache")
     size = cache.stat().st_size if cache.is_file() else 0
