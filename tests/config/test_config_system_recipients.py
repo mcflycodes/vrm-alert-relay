@@ -53,11 +53,39 @@ def test_names_are_checked_against_the_allowlist(
     assert caught.value.problems == (problem,)
 
 
-@pytest.mark.parametrize("value", [[], ["Not A Name"], "audit", [1]])
+@pytest.mark.parametrize("value", [["Not A Name"], "audit", [1]])
 def test_malformed_lists_are_rejected(config_data: Data, parse: Parse, value: Any) -> None:
     config_data["system_recipients"] = value
     with pytest.raises(ConfigError):
         parse(config_data)
+
+
+def test_empty_list_means_system_notifications_are_only_logged(
+    config_data: Data, parse: Parse
+) -> None:
+    config_data["system_recipients"] = []
+    config = parse(config_data)
+    assert config.system_recipients == ()
+    assert config.system_recipient_names() == ()
+    warnings = config_warnings(config)
+    assert (
+        "system_recipients: empty; system problems (monitoring degraded or restored, "
+        "rate-limit summaries, storage notices) will only be logged"
+    ) in warnings
+    assert not any(w.startswith("system_recipients: no system recipients") for w in warnings)
+
+
+def test_check_report_for_an_empty_list(
+    config_data: Data, write_config: Write, secret_file: SecretWriter
+) -> None:
+    secret_file("vrm_token")
+    config_data["system_recipients"] = []
+    report = check_config(write_config(config_data))
+    assert report.ok is True
+    assert report.system_recipients == ()
+    assert report.system_recipients_defaulted is False
+    assert SYSTEM_RECIPIENTS_DEFAULT_NOTE not in report.notes
+    assert any("will only be logged" in w for w in report.warnings)
 
 
 def test_recipient_used_only_as_system_recipient_is_not_unused(

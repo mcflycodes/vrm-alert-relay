@@ -14,10 +14,17 @@ reported to the installation's monitor as a measurement problem, so they
 count toward "monitoring degraded" and show in health: no sample is ever
 dropped silently.
 
+A rule with ``stale_notify: false`` still raises stale-data and data-restored
+events, with the same IDs and stored state, but they are logged
+(``relay.stale_suppressed`` and ``relay.restored_suppressed``) instead of being
+queued for delivery.
+
 A failure in one stage is contained so the rest of the cycle still alerts:
 an exception from the poll counts as a failed poll of every installation,
-and an exception while evaluating or rendering one rule is retried with
-fresh state or the default template rather than dropping the rule.
+an exception while evaluating or rendering one rule is retried with
+fresh state or the default template rather than dropping the rule, and an
+exception while evaluating the monitors skips them for that cycle (and
+shows in health) while the rules' notifications are still queued and sent.
 """
 
 from __future__ import annotations
@@ -31,7 +38,7 @@ from vrm_alert_relay.delivery import Notification
 from vrm_alert_relay.engine import EventKind, RuleState, evaluate, sample_is_usable
 from vrm_alert_relay.templates import fields_for_event, render_notification
 
-from ._quiet import log_info
+from ._quiet import log_info, log_warning
 from .monitoring import MonitoringTracker, PollHealth, assess, monitor_id, streak_id
 from .rules import RuleBinding, bind_rules, poll_targets
 
@@ -47,6 +54,8 @@ if TYPE_CHECKING:
 __all__ = ["CycleReport", "Poller", "Relay", "RelayStatus"]
 
 logger = logging.getLogger(__name__)
+
+_STALE_KINDS = frozenset({EventKind.STALE, EventKind.RESTORED})
 
 
 class Poller(Protocol):
@@ -81,7 +90,11 @@ class RelayStatus:
     installations: int = 0
     failing: int = 0
     degraded: int = 0
+    stale_rules: int = 0
+    """Rules whose data is stale, whether or not the rule sends stale notices."""
     events_total: int = 0
+    monitoring_failed: bool = False
+    """Whether the last cycle could not evaluate the installations' monitors."""
 
 
 @dataclass(slots=True)
@@ -128,7 +141,7 @@ class Relay:
         cycle = _CycleState()
         for binding in self._bindings:
             self._evaluate_rule(binding, outcomes.get(binding.rule.installation), now, cycle)
-        self._evaluate_monitors(outcomes, now, cycle)
+        monitoring_failed = not self._evaluate_monitors_safely(outcomes, now, cycle)
         queued = self._delivery.accept_cycle(
             rule_states=cycle.rule_states, notifications=cycle.notifications
         )
@@ -143,7 +156,11 @@ class Relay:
             installations=len(self._targets),
             failing=len(self._monitoring.failing),
             degraded=len(self._monitoring.degraded),
+            stale_rules=sum(
+                self._delivery.rule_state(binding.rule.id).stale for binding in self._bindings
+            ),
             events_total=self._status.events_total + cycle.events,
+            monitoring_failed=monitoring_failed,
         )
         log_info(
             logger,
@@ -225,13 +242,20 @@ class Relay:
         if not observed and not _observed(new_state):
             return  # The sample was unusable; the rule is still unobserved.
         cycle.rule_states[rule_id] = new_state
-        for event in events:
-            text = self._render(binding, event)
-            cycle.notifications.append(Notification.for_event(event, text))
-            cycle.events += 1
+        self._queue(binding, events, cycle)
         # Only after the rule's notifications are queued: reporting must never delay them.
         with contextlib.suppress(Exception):
             _report_hold(binding, state, new_state, events, cycle)
+
+    def _queue(self, binding: RuleBinding, events: Sequence[Event], cycle: _CycleState) -> None:
+        """Render and queue the rule's events; stale ones only if the rule sends them."""
+        for event in events:
+            cycle.events += 1
+            if event.kind in _STALE_KINDS and not binding.rule.stale_notify:
+                _log_stale_only(binding, event)
+                continue
+            text = self._render(binding, event)
+            cycle.notifications.append(Notification.for_event(event, text))
 
     @staticmethod
     def _report_problem(binding: RuleBinding, reason: str, cycle: _CycleState) -> None:
@@ -270,12 +294,34 @@ class Relay:
             return None
         return unit
 
+    def _evaluate_monitors_safely(
+        self,
+        outcomes: dict[str, InstallationOutcome | None],
+        now: datetime,
+        cycle: _CycleState,
+    ) -> bool:
+        """Evaluate the monitors; False, with nothing added to ``cycle``, if that raised."""
+        try:
+            states, notifications = self._evaluate_monitors(outcomes, now, cycle)
+        except Exception:
+            with contextlib.suppress(Exception):
+                logger.exception(
+                    "evaluating the monitors failed; the rules' alerts are still sent",
+                    extra={"event": "relay.monitoring_error"},
+                )
+            return False
+        cycle.rule_states.update(states)
+        cycle.notifications.extend(notifications)
+        cycle.events += len(notifications)
+        return True
+
     def _evaluate_monitors(
         self,
         outcomes: dict[str, InstallationOutcome | None],
         now: datetime,
         cycle: _CycleState,
-    ) -> None:
+    ) -> tuple[dict[str, RuleState], list[Notification]]:
+        """The monitors' new states and notifications; ``cycle`` is only read."""
         names = self._monitoring.installations
         health: dict[str, PollHealth] = {}
         for name in names:
@@ -290,11 +336,11 @@ class Relay:
             {name: self._delivery.rule_state(streak_id(name)) for name in names},
             now,
         )
+        states: dict[str, RuleState] = {}
         for name in names:
-            cycle.rule_states[monitor_id(name)] = result.states[name]
-            cycle.rule_states[streak_id(name)] = result.streaks[name]
-        cycle.notifications.extend(result.notifications)
-        cycle.events += len(result.notifications)
+            states[monitor_id(name)] = result.states[name]
+            states[streak_id(name)] = result.streaks[name]
+        return states, result.notifications
 
 
 def _report_hold(
@@ -345,6 +391,28 @@ def _report_hold(
             "notified": sent is not None,
         },
     )
+
+
+def _log_stale_only(binding: RuleBinding, event: Event) -> None:
+    """Log a stale-data or data-restored event that the rule does not send."""
+    extra = {
+        "rule_id": binding.rule.id,
+        "installation": binding.rule.installation,
+        "event_id": event.event_id,
+        "sample_time": None if event.sample_time is None else event.sample_time.isoformat(),
+    }
+    if event.kind is EventKind.STALE:
+        log_warning(
+            logger,
+            "stale data; not sent because the rule's stale_notify is false",
+            {"event": "relay.stale_suppressed", **extra},
+        )
+    else:
+        log_info(
+            logger,
+            "data restored; not sent because the rule's stale_notify is false",
+            {"event": "relay.restored_suppressed", **extra},
+        )
 
 
 def _rejection(sample: Sample, state: RuleState, now: datetime) -> str | None:

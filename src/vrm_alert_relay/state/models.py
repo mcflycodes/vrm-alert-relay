@@ -59,6 +59,30 @@ class DeliveryKind(StrEnum):
     NOTICE = "notice"
 
 
+class DeliveryOrigin(StrEnum):
+    """What a delivery reports, kept so a configuration opt-out applies after a restart.
+
+    Records written before it existed have no origin; they are always sent.
+    """
+
+    ALARM = "alarm"
+    REMINDER = "reminder"
+    RECOVERY = "recovery"
+    STALE = "stale"
+    RESTORED = "restored"
+    SYSTEM = "system"
+
+
+def origin_or_none(raw: object) -> DeliveryOrigin | None:
+    """Decode a stored origin; a missing or unreadable one is unknown, and always sent."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        return DeliveryOrigin(raw)
+    except ValueError:
+        return None
+
+
 def is_identifier(value: object) -> bool:
     """Whether ``value`` is a bounded identifier safe to store and log."""
     return (
@@ -119,7 +143,10 @@ RECORD_FIELDS: Final = (
     "provider_message_id",
     "covers",
     "recovered",
+    "origin",
 )
+_LEGACY_RECORD_FIELDS: Final = frozenset(RECORD_FIELDS) - {"origin"}
+"""A journal line written before ``origin`` existed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +170,8 @@ class DeliveryRecord:
     """For a summary, how many held-back deliveries it reports."""
     recovered: bool = False
     """Rebuilt from a corrupt row: owed one reconcile-then-retry whatever its attempt count."""
+    origin: DeliveryOrigin | None = None
+    """What the delivery reports; ``None`` when unknown (an older record)."""
 
     def __post_init__(self) -> None:  # noqa: C901, PLR0912  # flat validation checklist, deliberately not split
         if not is_identifier(self.event_id):
@@ -172,6 +201,8 @@ class DeliveryRecord:
             raise InvalidRecordError("covers is outside safe bounds")  # noqa: TRY003  # per-check validation message
         if not isinstance(self.recovered, bool):
             raise InvalidRecordError("recovered must be a bool")  # noqa: TRY003  # per-check validation message
+        if self.origin is not None and not isinstance(self.origin, DeliveryOrigin):
+            raise InvalidRecordError("origin must be a DeliveryOrigin or null")  # noqa: TRY003  # per-check validation message
 
     @property
     def key(self) -> tuple[str, str]:
@@ -211,11 +242,15 @@ class DeliveryRecord:
             "provider_message_id": self.provider_message_id,
             "covers": self.covers,
             "recovered": self.recovered,
+            "origin": None if self.origin is None else self.origin.value,
         }
 
     @classmethod
     def from_json(cls, data: object) -> DeliveryRecord:
-        if not isinstance(data, dict) or set(data) != set(RECORD_FIELDS):
+        if not isinstance(data, dict) or set(data) not in (
+            set(RECORD_FIELDS),
+            _LEGACY_RECORD_FIELDS,
+        ):
             raise InvalidRecordError("record must contain exactly the record fields")  # noqa: TRY003  # per-check validation message
         return cls(
             event_id=data["event_id"],
@@ -232,6 +267,7 @@ class DeliveryRecord:
             provider_message_id=data["provider_message_id"],
             covers=data["covers"],
             recovered=data["recovered"],
+            origin=origin_or_none(data.get("origin")),
         )
 
 

@@ -143,6 +143,7 @@ def test_service_health_binds_loopback_and_holds_no_secrets_or_recipients(
         "installations": 1,
         "failing_installations": 0,
         "degraded_installations": 0,
+        "stale_rules": 0,
     }
     assert document["state_persistence"] == {
         "healthy": True,

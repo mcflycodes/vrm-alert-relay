@@ -83,6 +83,7 @@ def health_document(  # noqa: PLR0913  # the document's inputs are explicit, not
             "installations": status.installations,
             "failing_installations": status.failing,
             "degraded_installations": status.degraded,
+            "stale_rules": status.stale_rules,
         },
         "state_persistence": {
             "healthy": delivery.persistence_healthy,

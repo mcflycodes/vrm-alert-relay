@@ -22,6 +22,7 @@ from app_helpers import (
     freezer_rule,
 )
 
+from vrm_alert_relay.app.monitoring import MonitoringTracker
 from vrm_alert_relay.delivery import STORAGE_NOTICE_TEXT
 from vrm_alert_relay.engine import FUTURE_TOLERANCE, RuleState
 from vrm_alert_relay.vrm import TimestampPolicy
@@ -282,6 +283,81 @@ def test_one_installation_down_degrades_only_that_installation(harness: Harness)
         )
     ]
     assert (status.failing, status.degraded, status.last_successful_poll_at) == (1, 1, None)
+
+
+class _BrokenHandler(logging.Handler):
+    """A log handler whose failures escape logging's own error handling."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        raise RuntimeError
+
+    def handleError(self, record: logging.LogRecord) -> None:  # noqa: N802  # logging API
+        raise RuntimeError
+
+
+def _cabin_alarm_while_barn_degrades(harness: Harness) -> None:
+    harness.write_config(
+        installations=[
+            {"id": "cabin", "site_id": CABIN_SITE},
+            {"id": "barn", "site_id": BARN_SITE},
+        ]
+    )
+    harness.vrm.set("tsT", 20, -20)
+    harness.vrm.fail(503, BARN_SITE)
+
+
+def test_a_failing_monitoring_log_handler_does_not_stop_a_real_alarm(harness: Harness) -> None:
+    _cabin_alarm_while_barn_degrades(harness)
+    monitoring_logger = logging.getLogger("vrm_alert_relay.app.monitoring")
+    handler = _BrokenHandler()
+    with harness.service() as service:
+        harness.cycle(service)  # the barn's first failed poll: not an outage yet
+        monitoring_logger.addHandler(handler)
+        try:
+            harness.vrm.set("tsT", 20, -10)  # the cabin's freezer crosses "warning"
+            harness.cycle(service)  # the barn's second failed poll: degraded, and logged
+        finally:
+            monitoring_logger.removeHandler(handler)
+        status = service.relay.status
+
+    texts = harness.voipms.texts()
+    assert texts[0].startswith("warning: freezer at cabin")
+    assert "monitoring of barn is degraded" in texts[1]
+    assert len(texts) == 2
+    assert status.degraded == 1
+    assert not status.monitoring_failed
+
+
+def test_a_monitoring_failure_still_sends_the_cycles_alarm_and_shows_in_health(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _cabin_alarm_while_barn_degrades(harness)
+
+    def broken_observe(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError
+
+    with harness.service() as service:
+        harness.cycle(service)
+        with monkeypatch.context() as patch:
+            patch.setattr(MonitoringTracker, "observe", broken_observe)
+            harness.vrm.set("tsT", 20, -10)
+            harness.cycle(service)
+        assert harness.voipms.texts() == [
+            "warning: freezer at cabin: Fictitious tsT is -10 (2035-01-01 00:01 UTC)"
+        ]
+        assert service.relay.status.monitoring_failed
+        service.publish_health()
+        failed = json.loads(service.health_state.body())
+        harness.cycle(service)  # monitoring works again and reports the outage
+        assert not service.relay.status.monitoring_failed
+        service.publish_health()
+        recovered = json.loads(service.health_state.body())
+
+    assert any(getattr(r, "event", None) == "relay.monitoring_error" for r in caplog.records)
+    assert failed["status"] == "degraded"
+    assert failed["monitoring"]["last_cycle_failed"] is True
+    assert recovered["monitoring"]["last_cycle_failed"] is False
+    assert "monitoring of barn is degraded" in harness.voipms.texts()[-1]
 
 
 def test_auth_failure_alerts_at_once_and_only_once(harness: Harness) -> None:

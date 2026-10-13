@@ -37,7 +37,7 @@ A flag wins over its environment variable. The container image runs `run` by def
 
 The relay reads its configuration only at startup, so restart it after every change. With Docker Compose, apply the change with `docker compose up -d --force-recreate`, not `docker compose restart`: a single-file bind mount of `config.yaml` follows the file's original inode, and editors, `sudoedit` and `sed -i` replace the file with a new one, so a restarted container can keep reading the old version ([deploy-docker.md](deploy-docker.md#applying-a-configuration-change)).
 
-`service.started` and the health document carry a `config_fingerprint`: the first 16 hex characters of a SHA-256 over every rule's alerting settings (installation, measurement, direction, levels and thresholds, hysteresis, `clear_after_samples`, `recovery_notify`, cooldown, reminders, `stale_after_minutes`, `display_unit` and recipient names) and which providers and sending are enabled. A recipient name with five or more digits counts only by its position (`[#3]`), as `check-config` shows it. Compare the fingerprint before and after a change to confirm the relay loaded the new file. It is derived from no phone number, DID, URL, secret or secret file. If it cannot be computed it reads `unavailable`; like every visibility record, it never stops the relay, and a log record that fails to write is dropped rather than delaying a cycle.
+`service.started` and the health document carry a `config_fingerprint`: the first 16 hex characters of a SHA-256 over every rule's alerting settings (installation, measurement, direction, levels and thresholds, hysteresis, `clear_after_samples`, `recovery_notify`, cooldown, reminders, `stale_after_minutes`, `stale_notify`, `display_unit` and recipient names) and which providers and sending are enabled. A recipient name with five or more digits counts only by its position (`[#3]`), as `check-config` shows it. Compare the fingerprint before and after a change to confirm the relay loaded the new file. It is derived from no phone number, DID, URL, secret or secret file. If it cannot be computed it reads `unavailable`; like every visibility record, it never stops the relay, and a log record that fails to write is dropped rather than delaying a cycle.
 - **`check-config`** validates the configuration and the secret files it references, without contacting any service, and prints a report. Recipient names that look like phone numbers (five or more digits) are shown by position, such as `[#3]`, everywhere the relay prints or logs a recipient name. `--structure-only` skips the secret files; its result is never "ready".
 - **`test-notification --recipient NAME`** sends one test message to one configured recipient and prints the outcome. It sends only when you run it, goes through the delivery engine like any alert (so the global cap, dry-run routing, attempt records and reconciliation all apply), and sends nothing else that is waiting. While sending is disabled for the recipient's provider, the message is only written to the log. It needs the state directory, so stop the relay first: a running relay holds the directory's lock.
 
@@ -46,6 +46,8 @@ The relay reads its configuration only at startup, so restart it after every cha
 The state directory must be on a local filesystem, owned by the relay user and writable by nobody else (ADR 0002). The image runs as UID and GID 65532 and ships `/var/lib/vrm-alert-relay` owned by `65532:65532` with mode `0700`. [deploy-docker.md](deploy-docker.md#5-the-state-volume) explains the named volume and the bind-mount alternative.
 
 A directory the relay cannot write leaves it running and alerting from memory, with `state_persistence.healthy` false and a storage notice to the system recipients. A directory that group or others can write draws a warning in the log.
+
+Release 0.1.1 upgrades the state database's format (schema version 2) the first time it starts; 0.1.0 cannot read the upgraded database. Take a backup before upgrading so that a [rollback](deploy-docker.md#rollback) is possible.
 
 ### Exit codes
 
@@ -75,15 +77,21 @@ Each cycle ends with a `relay.cycle` record counting installations fetched and f
 
 Cycles start the configured `vrm.poll_interval` apart, plus up to 10% random jitter, so never more often than the interval. A long cycle is followed by the next one at once. VRM backoff (on errors, 429 `Retry-After`, and the hourly retry after a 401 or 403) is per site and enforced by the VRM adapter: while a site backs off, cycles skip its request but still check staleness, monitoring and pending deliveries.
 
-A failure inside a cycle never stops the relay. An unexpected error from the poll counts as a failed poll of every installation; an error evaluating one rule is retried from fresh rule state (which may repeat an active alert, never lose one); an error rendering a level message falls back to the default text.
+A failure inside a cycle never stops the relay. An unexpected error from the poll counts as a failed poll of every installation; an error evaluating one rule is retried from fresh rule state (which may repeat an active alert, never lose one); an error rendering a level message falls back to the default text; an error evaluating the installations' monitors skips them for that cycle, logs `relay.monitoring_error`, and shows as `monitoring.last_cycle_failed` in health, while the rules' alerts from the same cycle are still queued and sent. A log handler that fails does not stop a cycle at the monitoring notices, the stale-data records of rules with `stale_notify: false`, the `delivery.suppressed_by_config` records, or the cycle's own summary records: those are dropped if they cannot be written.
 
 A rule that has never had a usable sample reports neither stale data nor its restoration: until its first sample it is not evaluated without one, and acquisition problems are reported by the installation's monitor instead. A fresh installation with VRM unreachable therefore sends only "monitoring degraded". From its first sample on (remembered in the rule's stored state, so across restarts too), a rule reports stale data when its newest sample is older than `stale_after_minutes`, and "data restored" when samples return.
+
+A rule with `stale_notify: false` still detects both, with the same event IDs and stored state, so its escalations, reminders and recoveries are unchanged, but nothing is sent: stale data is logged as a `relay.stale_suppressed` warning and its restoration as `relay.restored_suppressed` at INFO, each with the rule, installation and event ID. Both still count in the `relay.cycle` events, and the health document's `monitoring.stale_rules` counts the rule while its data is stale.
+
+Both opt-outs (`stale_notify: false` and `system_recipients: []`) also apply to messages queued before a restart. Each queued message is stored with what it reports (alarm, reminder, recovery, stale, restored or system). When it is due, a stale or restored message for a rule that now has `stale_notify: false`, or that is no longer configured, and a system message while `system_recipients` is empty, are logged as `delivery.suppressed_by_config` (with the event ID, recipient and what it reports) and not sent. Alarms, reminders and recoveries are never dropped this way. If the check itself fails, the message is sent.
+
+Messages queued by 0.1.0 did not store what they report. A queued rate-limit summary or storage notice is still recognised as a system message and follows `system_recipients`, but a queued rule message is not: it could be an alarm, and the relay does not guess from its text. This is an accepted upgrade limitation: rule messages queued by 0.1.0 and still pending at the upgrade are delivered once, even if they are stale or restored messages that the new configuration only logs. To avoid them, let the queue drain before you upgrade (health shows `delivery.queued: 0`), or keep sending disabled (`sending.enabled: false`) for the first cycle after the upgrade, which writes everything still queued to the log instead, alarms included.
 
 **Shutdown:** SIGTERM or SIGINT lets the cycle in progress finish (its HTTP calls are bounded by timeouts), then the relay stops the health endpoint, writes pending state and closes the state store.
 
 ## Monitoring degraded and restored
 
-Each installation has a monitor. Its notifications go to `system_recipients` (or, when that is not set, to every recipient used by a rule):
+Each installation has a monitor. Its notifications go to `system_recipients` (or, when that is not set, to every recipient used by a rule; with `system_recipients: []` they are only logged, as `monitoring.degraded` errors and `monitoring.restored` warnings, and shown in health):
 
 - `VRM Alert Relay: monitoring of <installation> is degraded since <time>; alerts may be delayed or missed`
 - `VRM Alert Relay: monitoring of <installation> is restored (<time>)`
@@ -111,7 +119,7 @@ Enable it with `health.enabled: true`. It listens on `health.bind` (default `127
 {
   "schema": 1,
   "status": "ok",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "dry_run": true,
   "config_fingerprint": "3f9a1c0b7d2e4a58",
   "started_at": "2026-01-15T12:00:00+00:00",
@@ -123,7 +131,8 @@ Enable it with `health.enabled: true`. It listens on `health.bind` (default `127
     "last_successful_poll_at": "2026-01-15T12:41:03+00:00",
     "installations": 1,
     "failing_installations": 0,
-    "degraded_installations": 0
+    "degraded_installations": 0,
+    "stale_rules": 0
   },
   "state_persistence": {
     "healthy": true,
@@ -147,12 +156,13 @@ Enable it with `health.enabled: true`. It listens on `health.bind` (default `127
 |---|---|
 | `status` | `degraded` when the latest cycle failed, any installation is degraded, or state persistence is not healthy and durable; otherwise `starting` until the first cycle completes, then `ok`. |
 | `monitoring.cycles` | Cycles completed since the relay started. |
-| `monitoring.last_cycle_failed` | Whether the latest cycle stopped with an unexpected error. |
+| `monitoring.last_cycle_failed` | Whether the latest cycle stopped with an unexpected error, or could not evaluate the installations' monitors. |
 | `dry_run` | `true` when no provider is live. |
 | `config_fingerprint` | Identifies the loaded configuration; see [Applying a configuration change](#applying-a-configuration-change). |
 | `monitoring.last_successful_poll_at` | The last cycle in which every installation was fetched (measurement problems aside). |
 | `monitoring.failing_installations` | Installations whose last poll failed. |
 | `monitoring.degraded_installations` | Installations with an open outage. |
+| `monitoring.stale_rules` | Rules whose newest sample is older than their `stale_after_minutes`, whether or not they send stale notices. Stale data does not by itself make `status` degraded. |
 | `state_persistence.healthy` | False while storage fails, and for the rest of the run after corrupt state was found. |
 | `state_persistence.durable_accounting` | False in every ADR 0002 failure mode, when the cap is enforced in memory only. |
 | `state_persistence.error` | A short description of the latest storage problem, without file paths. |

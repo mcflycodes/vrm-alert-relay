@@ -285,7 +285,7 @@ class Harness:
                 }
             },
             "rules": [freezer_rule()] if rules is None else rules,
-            "system_recipients": system or ["owner_sms"],
+            "system_recipients": ["owner_sms"] if system is None else system,
         }
         if health is not None:
             config["health"] = health

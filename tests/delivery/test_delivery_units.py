@@ -27,6 +27,7 @@ from vrm_alert_relay.delivery import (
     sanitize_text,
 )
 from vrm_alert_relay.engine import Event, EventKind
+from vrm_alert_relay.state import DeliveryOrigin
 
 # Rate limiter ---------------------------------------------------------------------
 
@@ -143,7 +144,9 @@ def test_notification_for_event_targets_the_rule() -> None:
         event_id="evt_" + "0" * 64,
     )
     note = Notification.for_event(event, "Freezer is critical")
-    assert note == Notification("evt_" + "0" * 64, "Freezer is critical", RuleTarget("freezer"))
+    assert note == Notification(
+        "evt_" + "0" * 64, "Freezer is critical", RuleTarget("freezer"), DeliveryOrigin.ALARM
+    )
 
 
 # Protocol helpers -------------------------------------------------------------------

@@ -89,6 +89,7 @@ def test_fingerprint_changes_when_only_one_threshold_changes(harness: Harness) -
         lambda data: data["rules"][0].update(reminder_max=1),
         lambda data: data["rules"][0].update(stale_after_minutes=90),
         lambda data: data["rules"][0].update(display_unit="degF"),
+        lambda data: data["rules"][0].update(stale_notify=False),
         lambda data: data["rules"][0].update(recipients=["owner_sms"]),
         lambda data: data["rules"][0]["levels"][0].update(name="watch"),
         lambda data: data["sending"].update(enabled=False),

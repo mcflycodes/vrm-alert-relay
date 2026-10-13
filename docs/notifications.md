@@ -69,7 +69,7 @@ Without a `message`, each kind uses a default:
 
 A level's `message` replaces the default for escalations into that level. Reminders for the level send `Reminder: ` followed by the level's message.
 
-System notifications (the rate-limit summary, the storage notice and the monitoring notices) go to `system_recipients`. [operations.md](operations.md) explains when monitoring is reported as degraded and restored. The `test-notification` command sends the fixed text `VRM Alert Relay: test notification. If you can read this, delivery to this recipient works.`
+Stale and restored go to the rule's recipients unless the rule sets `stale_notify: false`, in which case they are only logged. System notifications (the rate-limit summary, the storage notice and the monitoring notices) go to `system_recipients`; with `system_recipients: []` they are only logged. [configuration.md](configuration.md#alarms-only) shows an alarms-only setup and its trade-off. [operations.md](operations.md) explains when monitoring is reported as degraded and restored. The `test-notification` command sends the fixed text `VRM Alert Relay: test notification. If you can read this, delivery to this recipient works.`
 
 ## Providers
 

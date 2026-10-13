@@ -40,6 +40,7 @@ Windows and backoff use monotonic time. Wall-clock time is only stored; see
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import random
@@ -55,6 +56,7 @@ from vrm_alert_relay.state import (
     AttemptMark,
     Changes,
     DeliveryKind,
+    DeliveryOrigin,
     DeliveryRecord,
     DeliveryStatus,
     JournalEntry,
@@ -77,7 +79,7 @@ from .protocol import (
     delivery_id,
     sanitize_text,
 )
-from .routing import Notification, Route, Routing, RuleTarget, UnknownTargetError
+from .routing import Notification, Route, Routing, RuleTarget, SystemTarget, UnknownTargetError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -530,6 +532,9 @@ class DeliveryEngine:
             text = sanitize_text(notification.text)
             target = notification.target
             rule_id = target.rule_id if isinstance(target, RuleTarget) else None
+            origin = (
+                DeliveryOrigin.SYSTEM if isinstance(target, SystemTarget) else notification.origin
+            )
             for route in routes:
                 key = (notification.event_id, route.name)
                 if key in self._records:
@@ -551,6 +556,7 @@ class DeliveryEngine:
                     created_at=wall,
                     updated_at=wall,
                     next_attempt_at=None if status.terminal else wall,
+                    origin=origin,
                 )
                 self._put(record, mono)
                 if status is DeliveryStatus.SUPPRESSED:
@@ -678,6 +684,8 @@ class DeliveryEngine:
     def _process(  # one decision ladder per delivery
         self, record: DeliveryRecord, report: RunReport
     ) -> None:
+        if self._opted_out(record):
+            return
         route = self._routing.route(record.recipient)
         if route is None:
             self._finish(record, DeliveryStatus.FAILED)
@@ -720,6 +728,36 @@ class DeliveryEngine:
         self._apply(in_flight, result, report)
         if live:
             self._save()
+
+    def _opted_out(self, record: DeliveryRecord) -> bool:
+        """Finish a due record that the configuration now only logs; True if it did.
+
+        Such a record was queued before a restart under a configuration that
+        sent it. A summary or notice from before origins were stored is a
+        system notification. If the check itself fails, the record is sent,
+        and a record that cannot be logged is still finished.
+        """
+        origin = record.origin
+        if origin is None and record.kind is not DeliveryKind.EVENT:
+            origin = DeliveryOrigin.SYSTEM
+        try:
+            opted_out = self._routing.opted_out(origin, record.rule_id)
+        except Exception:  # noqa: BLE001  # failures favour alerting: send it
+            return False
+        if not opted_out:
+            return False
+        self._finish(record, DeliveryStatus.FAILED)
+        with contextlib.suppress(Exception):
+            logger.info(
+                "not sending a delivery that the configuration now only logs",
+                extra={
+                    "event": "delivery.suppressed_by_config",
+                    "origin": None if origin is None else origin.value,
+                    "rule_id": record.rule_id,
+                    **self._log_ids(record),
+                },
+            )
+        return True
 
     def _begin_attempt(
         self, record: DeliveryRecord, report: RunReport, *, live: bool
@@ -810,6 +848,7 @@ class DeliveryEngine:
                 attempts=0,
                 created_at=wall,
                 updated_at=wall,
+                origin=DeliveryOrigin.SYSTEM,
             )
             if not episode.started:
                 episode.started = True
@@ -1017,6 +1056,7 @@ class DeliveryEngine:
                     updated_at=wall,
                     next_attempt_at=wall,
                     covers=state.count,
+                    origin=DeliveryOrigin.SYSTEM,
                 ),
                 mono,
             )

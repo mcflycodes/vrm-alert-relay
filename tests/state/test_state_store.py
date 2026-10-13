@@ -26,6 +26,7 @@ from vrm_alert_relay.state import (
     AttemptMark,
     Changes,
     DeliveryKind,
+    DeliveryOrigin,
     DeliveryRecord,
     DeliveryStatus,
     JournalEntry,
@@ -122,10 +123,10 @@ def test_existing_permissive_files_are_tightened(tmp_path: Path) -> None:
 def test_migrate_runs_forward_and_rereads_the_version(tmp_path: Path) -> None:
     extended = (*MIGRATIONS, ("CREATE TABLE future_extra (x INTEGER) STRICT",))
     with closing(raw(tmp_path)) as connection:
-        assert migrate(connection) == 1
-        assert migrate(connection, extended) == 2
-        assert migrate(connection, extended) == 2
-        assert schema_version(connection) == 2
+        assert migrate(connection) == SCHEMA_VERSION
+        assert migrate(connection, extended) == SCHEMA_VERSION + 1
+        assert migrate(connection, extended) == SCHEMA_VERSION + 1
+        assert schema_version(connection) == SCHEMA_VERSION + 1
 
 
 def test_failed_migration_rolls_back(tmp_path: Path) -> None:
@@ -436,7 +437,7 @@ def test_unreadable_text_is_replaced_by_a_notice(tmp_path: Path) -> None:
             "CREATE TABLE delivery (event_id TEXT, recipient TEXT, rule_id TEXT, kind TEXT, "
             "status TEXT, text TEXT, attempts INTEGER, created_at TEXT, updated_at TEXT, "
             "next_attempt_at TEXT, last_attempt_at TEXT, provider_message_id TEXT, "
-            "covers INTEGER, recovered INTEGER, PRIMARY KEY (event_id, recipient))"
+            "covers INTEGER, recovered INTEGER, origin TEXT, PRIMARY KEY (event_id, recipient))"
         )
         _insert_delivery(connection, event_id="evt_t", text=None, attempts=True)
     store, snapshot = reopen(tmp_path)
@@ -867,3 +868,25 @@ def test_other_open_errors_are_storage_failures(
         store, _ = reopen(tmp_path)
         assert store.error == "OSError: No space left on device"
         store.close()
+
+
+def test_an_unknown_stored_origin_is_read_as_unknown(tmp_path: Path) -> None:
+    store, _ = reopen(tmp_path)
+    store.close()
+    with closing(raw(tmp_path)) as connection:
+        _insert_delivery(connection, event_id="evt_o", origin="future-kind")
+    store, snapshot = reopen(tmp_path)
+    assert snapshot.problems == 0
+    assert snapshot.deliveries[0].origin is None
+    store.close()
+
+
+def test_a_salvaged_row_keeps_its_origin(tmp_path: Path) -> None:
+    store, _ = reopen(tmp_path)
+    store.close()
+    with closing(raw(tmp_path)) as connection:
+        _insert_delivery(connection, event_id="evt_s", attempts=-5, origin="stale")
+    store, snapshot = reopen(tmp_path)
+    assert snapshot.problems == 1
+    assert snapshot.deliveries[0].origin is DeliveryOrigin.STALE
+    store.close()
