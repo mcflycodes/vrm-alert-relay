@@ -478,15 +478,18 @@ def test_for_display_converts_and_rounds(
     ("celsius", "text"),
     [
         (-3.5, "25.7°F"),
-        (-17.8, "0°F"),
-        (-17.79, "0°F"),
+        (-17.8, "0.0°F"),
+        (-17.79, "0.0°F"),
         (-18.0, "-0.4°F"),
         (-23.3, "-9.9°F"),
-        (4.44, "40°F"),
+        (4.44, "40.0°F"),
         (4.5, "40.1°F"),
+        (2.2, "36.0°F"),
+        (0.0, "32.0°F"),
+        (-40.0, "-40.0°F"),
     ],
 )
-def test_display_value_renders_with_one_decimal_at_most(celsius: float, text: str) -> None:
+def test_display_value_renders_with_exactly_one_decimal(celsius: float, text: str) -> None:
     fields = TemplateFields(kind=NotificationKind.ESCALATED, value=celsius)
     shown = for_display(fields, DisplayUnit.DEG_F, reported_unit="℃")
     assert shown is not None
@@ -501,11 +504,17 @@ def test_for_display_rounds_to_the_documented_decimals() -> None:
     assert Template("{value}").render(shown) == "1.2"
 
 
+@pytest.mark.parametrize(("value", "text"), [(21.0, "21.0"), (-0.04, "0.0"), (1e7, "1e+07")])
+def test_fixed_decimals_apply_to_plain_numbers_only(value: float, text: str) -> None:
+    fields = TemplateFields(kind=NotificationKind.ESCALATED, value=value, decimals=1)
+    assert Template("{value}").render(fields) == text
+
+
 def test_for_display_keeps_a_missing_value_missing() -> None:
     fields = TemplateFields(kind=NotificationKind.STALE, rule="freezer", time=WHEN)
     shown = for_display(fields, DisplayUnit.DEG_F, reported_unit="°C")
     assert shown == TemplateFields(
-        kind=NotificationKind.STALE, rule="freezer", time=WHEN, unit="°F"
+        kind=NotificationKind.STALE, rule="freezer", time=WHEN, unit="°F", decimals=DISPLAY_DECIMALS
     )
 
 

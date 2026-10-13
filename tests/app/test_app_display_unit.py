@@ -79,7 +79,7 @@ def test_rising_rule_shows_fahrenheit(kind: EventKind, level: str | None, text: 
 
 @pytest.mark.parametrize(
     ("value", "shown"),
-    [(4.0, "39.2°F"), (0.0, "32°F"), (-1.0, "30.2°F"), (-17.8, "0°F"), (-23.33, "-10°F")],
+    [(4.0, "39.2°F"), (0.0, "32.0°F"), (-1.0, "30.2°F"), (-17.8, "0.0°F"), (-23.33, "-10.0°F")],
 )
 def test_falling_rule_shows_fahrenheit_including_negative_values(value: float, shown: str) -> None:
     rule = binding(cold_rule(display_unit="degF"))
@@ -176,11 +176,11 @@ def test_vrm_celsius_reaches_sms_in_fahrenheit(harness: Harness) -> None:
             harness.cycle(service)
 
     assert harness.voipms.sent() == [
-        (OWNER_PHONE, "warning: freezer at cabin: Fictitious tsT is 14°F (2035-01-01 00:01 UTC)"),
+        (OWNER_PHONE, "warning: freezer at cabin: Fictitious tsT is 14.0°F (2035-01-01 00:01 UTC)"),
         (
             OWNER_PHONE,
             (
-                "Recovered: freezer at cabin is back to normal: Fictitious tsT is -22°F "
+                "Recovered: freezer at cabin is back to normal: Fictitious tsT is -22.0°F "
                 "(2035-01-01 00:02 UTC)"
             ),
         ),
@@ -240,7 +240,7 @@ def test_a_later_reading_without_a_celsius_unit_is_not_converted(
         harness.cycle(service)
 
     assert harness.voipms.texts() == [
-        "warning: freezer at cabin: Fictitious tsT is 14°F (2035-01-01 00:00 UTC)",
+        "warning: freezer at cabin: Fictitious tsT is 14.0°F (2035-01-01 00:00 UTC)",
         "alert: freezer at cabin: Fictitious tsT is -6 (2035-01-01 00:01 UTC)",
     ]
     assert fallbacks(caplog) == 1

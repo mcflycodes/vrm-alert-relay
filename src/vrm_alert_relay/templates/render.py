@@ -109,7 +109,7 @@ class DisplayUnit(StrEnum):
 
 
 DISPLAY_DECIMALS: Final = 1
-"""Decimals a value shown in a display unit is rounded to."""
+"""Decimals a value shown in a display unit is rounded to and always shown with."""
 
 _CELSIUS: Final = "°C"
 _DISPLAY_SYMBOLS: Final[Mapping[DisplayUnit, str]] = MappingProxyType(
@@ -133,6 +133,8 @@ class TemplateFields:
     """A display label from VRM data: untrusted, so links in it are neutralized."""
     time: datetime | None = None
     count: int | None = None
+    decimals: int | None = None
+    """Shows ``value`` with exactly this many decimals; ``None`` trims trailing zeros."""
 
 
 def sanitize_field(text: str, limit: int) -> str:
@@ -205,10 +207,13 @@ def sanitize_untrusted(text: str, limit: int) -> str:
 _UNTRUSTED_FIELDS: Final = frozenset({"label", "unit"})
 
 
-def _format_value(value: float) -> str:
+def _format_value(value: float, decimals: int | None = None) -> str:
     if isinstance(value, bool) or not math.isfinite(value):
         return MISSING
     if abs(value) < _PLAIN_NUMBER_LIMIT:
+        if decimals is not None:
+            text = f"{value:.{decimals}f}"
+            return text[1:] if text.startswith("-") and float(text) == 0 else text
         text = f"{value:.3f}".rstrip("0").rstrip(".")
         return "0" if text in ("-0", "") else text
     return f"{value:.6g}"
@@ -223,7 +228,7 @@ def _format_time(value: datetime) -> str:
 def _field_text(fields: TemplateFields, name: str) -> str:  # noqa: PLR0911  # one return per field
     match name:
         case "value":
-            return MISSING if fields.value is None else _format_value(fields.value)
+            return MISSING if fields.value is None else _format_value(fields.value, fields.decimals)
         case "time":
             return MISSING if fields.time is None else _format_time(fields.time)
         case "count":
@@ -391,8 +396,8 @@ def for_display(
 ) -> TemplateFields | None:
     """``fields`` with the value shown in ``display_unit``, or ``None``.
 
-    The value is converted from ``reported_unit`` and rounded to
-    :data:`DISPLAY_DECIMALS`, and ``{unit}`` becomes the display unit's
+    The value is converted from ``reported_unit`` and shown with exactly
+    :data:`DISPLAY_DECIMALS` decimals (``36.0``), and ``{unit}`` becomes the display unit's
     symbol. Only a temperature in degrees Celsius can be converted; for any
     other or unknown ``reported_unit`` this returns ``None`` and the caller
     shows the value as reported.
@@ -404,4 +409,6 @@ def for_display(
         if display_unit is DisplayUnit.DEG_F:
             value = value * 9 / 5 + 32
         value = round(value, DISPLAY_DECIMALS)
-    return replace(fields, value=value, unit=_DISPLAY_SYMBOLS[display_unit])
+    return replace(
+        fields, value=value, unit=_DISPLAY_SYMBOLS[display_unit], decimals=DISPLAY_DECIMALS
+    )
