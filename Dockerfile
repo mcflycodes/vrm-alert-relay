@@ -5,7 +5,7 @@
 # step, so the virtual environment matches the runtime's /usr/bin/python3.13. Wolfi packages
 # are not version-pinned, so rebuilds are not byte-identical; the SBOM records exact versions.
 
-FROM ghcr.io/astral-sh/uv:0.13.0@sha256:cdc6093146eb3ff6a40107b38f008b789e050e77ad87865e381d9917da55a168 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.7@sha256:96f40d3904aad8d0bd010539001d36c8e2188b981e1334471a90c4a1d93bb490 AS uv
 
 FROM cgr.dev/chainguard/wolfi-base:latest@sha256:256c88bb066424045021090932d50be93c8e3f2ce3586707702a401b146f3e43 AS build
 COPY --from=uv /uv /usr/local/bin/uv
