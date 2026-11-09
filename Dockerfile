@@ -7,7 +7,7 @@
 
 FROM ghcr.io/astral-sh/uv:0.13.0@sha256:cdc6093146eb3ff6a40107b38f008b789e050e77ad87865e381d9917da55a168 AS uv
 
-FROM cgr.dev/chainguard/wolfi-base:latest@sha256:256c88bb066424045021090932d50be93c8e3f2ce3586707702a401b146f3e43 AS build
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:24f549a7fcace88e69b9557941168c74645688ecc4acf7fb6d734a6b74e9019d AS build
 COPY --from=uv /uv /usr/local/bin/uv
 # The runtime root filesystem gets no shell and no package manager: apk installs into /rootfs
 # without itself, and its keys and repository list are removed afterwards. Package scripts are
